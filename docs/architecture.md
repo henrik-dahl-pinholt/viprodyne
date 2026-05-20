@@ -123,11 +123,29 @@ graphs. Its Bernoulli loading prior is derived during updates from promoter
 interval state probabilities and loading-rate moments:
 
 ```text
-P(tau_i = 1) = sum_s q_i(s) * (1 - exp(-E[r_s] * dt_i))
+P(tau_i = 1) = sum_s q_i(s) * E[1 - exp(-r_s * dt_i)]
 ```
 
-The initial value inside the node is only a placeholder until graph messages
-from `PromoterState` and `LoadingRate` are available.
+For a Gamma loading-rate node with shape `a_s` and rate `b_s`, the expectation
+uses the Laplace transform,
+
+```text
+E[1 - exp(-r_s * dt_i)] = 1 - (b_s / (b_s + dt_i)) ** a_s
+```
+
+The promoter update consumes the reverse message from `PolymeraseLoadings` as an
+interval state potential:
+
+```text
+q(tau_i) * E[log(1 - exp(-r_s * dt_i))]
+  + (1 - q(tau_i)) * (-E[r_s] * dt_i)
+```
+
+divided by `dt_i` before being added to the tilted CTMC potential. For Gamma
+rates, `E[log(1 - exp(-r_s * dt_i))]` is evaluated with the convergent
+log-survival series. The initial Pol2 prior inside the node is only a
+placeholder until graph messages from `PromoterState` and `LoadingRate` are
+available.
 
 Current limitation: the `PolymeraseLoadings` graph node assumes one trajectory
 plate at a time. Batched transfer likelihoods exist at the core-kernel level,

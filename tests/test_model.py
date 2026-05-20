@@ -338,6 +338,36 @@ def test_model_derives_pol2_prior_from_promoter_and_loading_rates():
     np.testing.assert_allclose(polymerase.prior_probabilities, expected_prior, rtol=2e-6)
 
 
+def test_model_derives_pol2_prior_from_gamma_rate_laplace_moments():
+    model = ViprodyneModel(
+        datasets=(make_dataset("d0"),),
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+            loading_prior_shape=np.float32(2.0),
+            loading_prior_rate=np.float32(3.0),
+        ),
+    )
+    model.graph.nodes["d0:r0"].pin(np.float32(0.5))
+    model.graph.moments.publish("d0:r0", model.graph.nodes["d0:r0"].moments())
+
+    model.run_schedule(["d0:s", "d0:tau"])
+
+    promoter_moments = model.graph.moments.get("d0:s")
+    state_probabilities = promoter_moments["interval_state_probabilities"][0]
+    dt = promoter_moments["interval_durations"]
+    p0 = 1.0 - np.exp(-np.float32(0.5) * dt)
+    p1 = 1.0 - (np.float32(3.0) / (np.float32(3.0) + dt)) ** np.float32(2.0)
+    expected = np.sum(
+        state_probabilities * np.stack([p0, p1], axis=-1),
+        axis=-1,
+        dtype=np.float32,
+    )
+    polymerase = model.graph.nodes["d0:tau"]
+
+    np.testing.assert_allclose(polymerase.prior_probabilities, expected, rtol=3e-6)
+
+
 def test_model_accepts_dataset_specific_time_grids():
     d0 = MS2Dataset(
         name="d0",

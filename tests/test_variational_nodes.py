@@ -298,6 +298,77 @@ def test_promoter_state_uses_expected_log_rates_and_exit_potentials():
     np.testing.assert_allclose(potentials[:, 1], 0.0, atol=2e-7)
 
 
+def test_promoter_state_uses_pol2_loading_child_message():
+    graph = VariationalGraph()
+    pi = InitialStateProb(
+        name="pi",
+        prior_concentration=np.ones(2, dtype=np.float32),
+        pinned_value=np.array([0.5, 0.5], dtype=np.float32),
+    )
+    kon = TransitionRate(
+        name="kon",
+        prior_shape=1.0,
+        prior_rate=1.0,
+        pinned_value=np.float32(0.1),
+        n_states=2,
+        to_state=1,
+        from_state=0,
+    )
+    koff = TransitionRate(
+        name="koff",
+        prior_shape=1.0,
+        prior_rate=1.0,
+        pinned_value=np.float32(0.1),
+        n_states=2,
+        to_state=0,
+        from_state=1,
+    )
+    r0 = LoadingRate(
+        name="r0",
+        prior_shape=1.0,
+        prior_rate=1.0,
+        pinned_value=np.float32(0.4),
+        state_index=0,
+    )
+    r1 = LoadingRate(
+        name="r1",
+        prior_shape=1.0,
+        prior_rate=1.0,
+        pinned_value=np.float32(2.0),
+        state_index=1,
+    )
+    tau = StatsNode("tau", {"load_probabilities": np.array([0.25, 0.75], dtype=np.float32)})
+    promoter = PromoterState(
+        name="s",
+        time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+        n_states=2,
+        rate_edges=(kon.edge, koff.edge),
+        initial_probability_node="pi",
+    )
+    for node in [pi, kon, koff, r0, r1, tau, promoter]:
+        graph.add_node(node)
+    graph.add_edge("pi", "s")
+    graph.add_edge("kon", "s")
+    graph.add_edge("koff", "s")
+    graph.add_edge("s", "tau")
+    graph.add_edge("r0", "tau")
+    graph.add_edge("r1", "tau")
+
+    graph.run_schedule(["s"])
+
+    dt = np.array([0.5, 0.5], dtype=np.float32)
+    load_probabilities = np.array([0.25, 0.75], dtype=np.float32)
+    rates = np.array([0.4, 2.0], dtype=np.float32)
+    log_load = np.log(-np.expm1(-dt[:, None] * rates[None, :]))
+    log_no_load = -dt[:, None] * rates[None, :]
+    expected_potentials = (
+        load_probabilities[:, None] * log_load
+        + (1.0 - load_probabilities[:, None]) * log_no_load
+    ) / dt[:, None]
+
+    np.testing.assert_allclose(promoter.tilt_potentials, expected_potentials, rtol=2e-6)
+
+
 def test_promoter_state_applies_contact_drive_and_emits_survival_stats():
     graph = VariationalGraph()
     pi = InitialStateProb(

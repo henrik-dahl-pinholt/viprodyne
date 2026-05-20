@@ -19,8 +19,12 @@ def test_gamma_node_moments_entropy_and_prior_term():
     assert node.prior_rate.dtype == np.float32
     assert moments["mean"].dtype == np.float32
     assert moments["expected_log"].dtype == np.float32
+    assert moments["shape"].dtype == np.float32
+    assert moments["rate"].dtype == np.float32
     assert moments["mean"] == pytest.approx(5.0 / 7.0)
     assert moments["expected_log"] == pytest.approx(float(digamma(5.0) - np.log(7.0)))
+    assert moments["shape"] == pytest.approx(5.0)
+    assert moments["rate"] == pytest.approx(7.0)
 
     entropy = 5.0 - np.log(7.0) + gammaln(5.0) + (1.0 - 5.0) * digamma(5.0)
     expected_log_prior = (

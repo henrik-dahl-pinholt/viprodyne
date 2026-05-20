@@ -102,7 +102,12 @@ class GammaNode(VariationalNode):
             digamma(jnp.asarray(shape)) - jnp.log(jnp.asarray(rate)),
             dtype=FLOAT_DTYPE,
         )
-        return {"mean": (shape / rate).astype(FLOAT_DTYPE), "expected_log": expected_log}
+        return {
+            "mean": (shape / rate).astype(FLOAT_DTYPE),
+            "expected_log": expected_log,
+            "shape": shape,
+            "rate": rate,
+        }
 
     def entropy(self) -> float:
         if self.is_pinned:

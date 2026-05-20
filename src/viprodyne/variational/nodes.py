@@ -36,6 +36,15 @@ class _LoadingPriorStats:
     per_state_load_probabilities: np.ndarray
 
 
+@dataclass(frozen=True)
+class _LoadingRateMoments:
+    names: tuple[str, ...]
+    means: np.ndarray
+    shapes: np.ndarray | None = None
+    rates: np.ndarray | None = None
+    gamma_mask: np.ndarray | None = None
+
+
 @dataclass
 class InitialStateProb(DirichletNode):
     """Dirichlet node for per-dataset promoter initial-state probabilities."""
@@ -258,6 +267,14 @@ class PromoterState(VariationalNode):
         parent_moments = context.parent_moments()
         initial = self._initial_probabilities_from_parents(parent_moments)
         generator, potentials = self._generator_and_potentials_from_parent_rates(parent_moments)
+        child_potentials = _promoter_loading_child_potentials(
+            child_moments=context.child_moments(),
+            blanket_moments=context.blanket_moments(),
+            time_grid=self.time_grid,
+            n_states=self.n_states,
+        )
+        if child_potentials is not None:
+            potentials = _add_user_potentials(potentials, child_potentials)
         if self.potentials is not None:
             potentials = _add_user_potentials(potentials, self.potentials)
         self.tilted_generator = np.asarray(generator, dtype=FLOAT_DTYPE)
@@ -742,10 +759,9 @@ def _load_prior_stats_from_parents(
     )
     if promoter is None:
         return None
-    loading_rate_info = _state_loading_rates_from_parent_moments(parent_moments)
-    if loading_rate_info is None:
+    loading_rate_moments = _state_loading_rate_moments_from_moments(parent_moments)
+    if loading_rate_moments is None:
         return None
-    rate_names, loading_rates = loading_rate_info
     state_probabilities = np.asarray(
         promoter["interval_state_probabilities"],
         dtype=FLOAT_DTYPE,
@@ -755,14 +771,15 @@ def _load_prior_stats_from_parents(
         if state_probabilities.shape[0] != 1:
             raise NotImplementedError("batched Pol2 loading priors are not implemented yet.")
         state_probabilities = state_probabilities[0]
-    if state_probabilities.shape[-1] != loading_rates.size:
+    if state_probabilities.shape[-1] != loading_rate_moments.means.size:
         raise ValueError("number of loading-rate parents must match promoter states.")
     if state_probabilities.shape[0] < n_loadings:
         raise ValueError("promoter interval grid is shorter than the Pol2 loading grid.")
     state_probabilities = state_probabilities[:n_loadings]
     interval_durations = interval_durations[:n_loadings]
-    per_state_load_probability = 1.0 - np.exp(
-        -interval_durations[:, None] * loading_rates[None, :]
+    per_state_load_probability = _expected_load_probability(
+        loading_rate_moments,
+        interval_durations,
     )
     probabilities = np.sum(
         state_probabilities * per_state_load_probability,
@@ -771,44 +788,150 @@ def _load_prior_stats_from_parents(
     )
     return _LoadingPriorStats(
         probabilities=np.clip(probabilities, 1e-7, 1.0 - 1e-7).astype(FLOAT_DTYPE),
-        rate_names=rate_names,
+        rate_names=loading_rate_moments.names,
         state_probabilities=state_probabilities.astype(FLOAT_DTYPE),
         interval_durations=interval_durations.astype(FLOAT_DTYPE),
         per_state_load_probabilities=per_state_load_probability.astype(FLOAT_DTYPE),
     )
 
 
-def _state_loading_rates_from_parent_moments(
-    parent_moments: dict[str, MomentDict],
-) -> tuple[tuple[str, ...], np.ndarray] | None:
-    rates: list[tuple[int, str, np.ndarray]] = []
-    fallback: list[tuple[str, np.ndarray]] = []
-    for name, moments in parent_moments.items():
+def _state_loading_rate_moments_from_moments(
+    moment_map: dict[str, MomentDict],
+) -> _LoadingRateMoments | None:
+    rates: list[tuple[int, str, np.ndarray, np.ndarray | None, np.ndarray | None]] = []
+    fallback: list[tuple[str, np.ndarray, np.ndarray | None, np.ndarray | None]] = []
+    for name, moments in moment_map.items():
         if "mean" not in moments:
             continue
+        mean = np.asarray(moments["mean"], dtype=FLOAT_DTYPE)
+        shape = np.asarray(moments["shape"], dtype=FLOAT_DTYPE) if "shape" in moments else None
+        rate = np.asarray(moments["rate"], dtype=FLOAT_DTYPE) if "rate" in moments else None
         if "state_index" in moments:
             rates.append(
                 (
                     int(np.asarray(moments["state_index"])),
                     name,
-                    np.asarray(moments["mean"], dtype=FLOAT_DTYPE),
+                    mean,
+                    shape,
+                    rate,
                 )
             )
         elif name.rsplit(":", 1)[-1].startswith("r"):
-            fallback.append((name, np.asarray(moments["mean"], dtype=FLOAT_DTYPE)))
+            fallback.append((name, mean, shape, rate))
     if rates:
         rates.sort(key=lambda item: item[0])
-        names = tuple(name for _, name, _ in rates)
-        values = [value for _, _, value in rates]
+        names = tuple(name for _, name, _, _, _ in rates)
+        means = [mean for _, _, mean, _, _ in rates]
+        shapes = [shape for _, _, _, shape, _ in rates]
+        gamma_rates = [rate for _, _, _, _, rate in rates]
     elif fallback:
-        names = tuple(name for name, _ in fallback)
-        values = [value for _, value in fallback]
+        names = tuple(name for name, _, _, _ in fallback)
+        means = [mean for _, mean, _, _ in fallback]
+        shapes = [shape for _, _, shape, _ in fallback]
+        gamma_rates = [rate for _, _, _, rate in fallback]
     else:
         return None
-    rate_array = np.asarray(values, dtype=FLOAT_DTYPE)
-    if rate_array.ndim != 1:
+    mean_array = np.asarray(means, dtype=FLOAT_DTYPE)
+    if mean_array.ndim != 1:
         raise NotImplementedError("plated loading-rate priors are not implemented yet.")
-    return names, rate_array
+    has_gamma = tuple(
+        shape is not None and rate is not None for shape, rate in zip(shapes, gamma_rates)
+    )
+    if any(has_gamma):
+        shape_array = np.asarray(
+            [shape if shape is not None else np.nan for shape in shapes],
+            dtype=FLOAT_DTYPE,
+        )
+        rate_array = np.asarray(
+            [rate if rate is not None else np.nan for rate in gamma_rates],
+            dtype=FLOAT_DTYPE,
+        )
+        if shape_array.ndim != 1 or rate_array.ndim != 1:
+            raise NotImplementedError("plated loading-rate priors are not implemented yet.")
+        return _LoadingRateMoments(
+            names=names,
+            means=mean_array,
+            shapes=shape_array,
+            rates=rate_array,
+            gamma_mask=np.asarray(has_gamma, dtype=bool),
+        )
+    return _LoadingRateMoments(names=names, means=mean_array)
+
+
+def _expected_load_probability(
+    loading_rate_moments: _LoadingRateMoments,
+    interval_durations: np.ndarray,
+) -> np.ndarray:
+    dt = np.asarray(interval_durations, dtype=FLOAT_DTYPE)
+    means = np.asarray(loading_rate_moments.means, dtype=FLOAT_DTYPE)
+    probability = 1.0 - np.exp(-dt[:, None] * means[None, :])
+    if loading_rate_moments.shapes is not None and loading_rate_moments.rates is not None:
+        shapes = np.asarray(loading_rate_moments.shapes, dtype=FLOAT_DTYPE)
+        rates = np.asarray(loading_rate_moments.rates, dtype=FLOAT_DTYPE)
+        survival = (rates[None, :] / (rates[None, :] + dt[:, None])) ** shapes[None, :]
+        gamma_probability = 1.0 - survival
+        gamma_mask = np.asarray(loading_rate_moments.gamma_mask, dtype=bool)
+        probability = np.where(gamma_mask[None, :], gamma_probability, probability)
+    return np.clip(probability, 1e-7, 1.0 - 1e-7).astype(FLOAT_DTYPE)
+
+
+def _promoter_loading_child_potentials(
+    child_moments: dict[str, MomentDict],
+    blanket_moments: dict[str, MomentDict],
+    time_grid: np.ndarray,
+    n_states: int,
+) -> np.ndarray | None:
+    loading_rate_moments = _state_loading_rate_moments_from_moments(blanket_moments)
+    if loading_rate_moments is None:
+        return None
+    if loading_rate_moments.means.size != n_states:
+        raise ValueError("number of loading-rate blanket nodes must match promoter states.")
+    interval_durations = np.diff(np.asarray(time_grid, dtype=FLOAT_DTYPE))
+    potentials = np.zeros((interval_durations.size, n_states), dtype=FLOAT_DTYPE)
+    found = False
+    for moments in child_moments.values():
+        if "load_probabilities" not in moments:
+            continue
+        found = True
+        load_probabilities = np.asarray(moments["load_probabilities"], dtype=FLOAT_DTYPE)
+        if load_probabilities.ndim != 1:
+            raise NotImplementedError("batched Pol2-to-promoter messages are not implemented yet.")
+        if load_probabilities.size > interval_durations.size:
+            raise ValueError("Pol2 loading posterior is longer than the promoter interval grid.")
+        n_loadings = load_probabilities.size
+        q_load = np.clip(load_probabilities, 0.0, 1.0)
+        dt = interval_durations[:n_loadings]
+        log_load = _expected_log_load_probability(loading_rate_moments, dt)
+        log_no_load = -dt[:, None] * loading_rate_moments.means[None, :]
+        interval_log_potential = (
+            q_load[:, None] * log_load + (1.0 - q_load[:, None]) * log_no_load
+        )
+        potentials[:n_loadings] += (interval_log_potential / dt[:, None]).astype(FLOAT_DTYPE)
+    if not found:
+        return None
+    return potentials.astype(FLOAT_DTYPE)
+
+
+def _expected_log_load_probability(
+    loading_rate_moments: _LoadingRateMoments,
+    interval_durations: np.ndarray,
+) -> np.ndarray:
+    dt = np.asarray(interval_durations, dtype=FLOAT_DTYPE)
+    means = np.asarray(loading_rate_moments.means, dtype=FLOAT_DTYPE)
+    x = np.maximum(dt[:, None] * means[None, :], np.float32(1e-20))
+    expected_log = np.log(-np.expm1(-x)).astype(FLOAT_DTYPE)
+    if loading_rate_moments.shapes is None or loading_rate_moments.rates is None:
+        return expected_log
+
+    shapes = np.asarray(loading_rate_moments.shapes, dtype=FLOAT_DTYPE)
+    rates = np.asarray(loading_rate_moments.rates, dtype=FLOAT_DTYPE)
+    terms = np.arange(1, 257, dtype=FLOAT_DTYPE)
+    scaled = rates[None, None, :] / (
+        rates[None, None, :] + terms[:, None, None] * dt[None, :, None]
+    )
+    series = np.sum((scaled**shapes[None, None, :]) / terms[:, None, None], axis=0)
+    gamma_mask = np.asarray(loading_rate_moments.gamma_mask, dtype=bool)
+    return np.where(gamma_mask[None, :], -series, expected_log).astype(FLOAT_DTYPE)
 
 
 def _broadcast_parameter_over_intervals(
