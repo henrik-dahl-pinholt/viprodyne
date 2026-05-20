@@ -98,7 +98,9 @@ profile = profile_contact_threshold(
 print(profile.best_value, profile.elbos)
 ```
 
-A small runnable version is in `examples/contact_threshold_profile.py`.
+A rendered notebook with visible output is in
+`examples/contact_threshold_profile.ipynb`; the same workflow is also available
+as a small script in `examples/contact_threshold_profile.py`.
 
 Install locally for development:
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 
 from viprodyne import CAVIConfig, MS2Dataset, ModelConfig, profile_contact_threshold
-from viprodyne.core.ms2_kernels import ProximalKernel, build_ms2_observation_model
+from viprodyne.core.ms2_kernels import ProximalKernel
 
 
 def main() -> None:
@@ -28,17 +28,17 @@ def main() -> None:
         contact_probability=contact_probability,
         dt=dt,
     )
-    observation_model = build_ms2_observation_model(
-        time_grid=time_grid,
-        n_observations=n_observations,
-        kernel=ProximalKernel(
-            t_rise=np.float32(0.5),
-            t_plateau=np.float32(0.5),
-            rna_intensity=np.float32(1.0),
-        ),
-        mode="exact",
+    kernel = ProximalKernel(
+        t_rise=np.float32(0.5),
+        t_plateau=np.float32(0.5),
+        rna_intensity=np.float32(1.0),
     )
-    clean_signal = observation_model.design_matrix @ loading_probability
+    clean_signal = _expected_ms2_signal(
+        sampling_times=time_grid[:-1],
+        loading_times=time_grid[:-1],
+        loading_probability=loading_probability,
+        kernel=kernel,
+    )
     observed = clean_signal[None, :] + rng.normal(
         0.0,
         0.08,
@@ -95,6 +95,23 @@ def _expected_loading_probability(contact_probability: np.ndarray, dt: np.float3
         )
         state = state / np.sum(state)
     return np.asarray(loading_probability, dtype=np.float32)
+
+
+def _expected_ms2_signal(
+    *,
+    sampling_times: np.ndarray,
+    loading_times: np.ndarray,
+    loading_probability: np.ndarray,
+    kernel: ProximalKernel,
+) -> np.ndarray:
+    weights = np.asarray(
+        kernel(
+            np.asarray(sampling_times, dtype=np.float32)[:, None]
+            - np.asarray(loading_times, dtype=np.float32)[None, :]
+        ),
+        dtype=np.float32,
+    )
+    return np.asarray(weights @ loading_probability.astype(np.float32), dtype=np.float32)
 
 
 if __name__ == "__main__":

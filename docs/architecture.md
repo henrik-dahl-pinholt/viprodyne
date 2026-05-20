@@ -425,7 +425,9 @@ This helper creates a fresh `ViprodyneModel` for each candidate, injects the
 candidate-specific `MS2Dataset.contact_probability`, runs
 `model.run_inference(...)`, and returns the ELBO profile. It is intended as the
 package-native version of the ad hoc profile loop used in the
-`1_kon_rc_toy_identify.ipynb` notebook.
+`1_kon_rc_toy_identify.ipynb` notebook. A rendered package example lives at
+`examples/contact_threshold_profile.ipynb`, with the same workflow mirrored in
+`examples/contact_threshold_profile.py`.
 
 ## Current Gaps
 
