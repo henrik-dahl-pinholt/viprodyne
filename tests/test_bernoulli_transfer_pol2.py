@@ -12,10 +12,28 @@ from viprodyne.core.bernoulli_transfer_pol2 import (
     exact_bernoulli_posterior,
     mean_field_bernoulli_elbo,
 )
+from viprodyne.core.mf_pol2_finder import fit_mean_field_bernoulli
 
 
 def gaussian_logpdf(value, mean, noise):
     return -0.5 * (np.log(2.0 * np.pi * noise**2) + (value - mean) ** 2 / noise**2)
+
+
+def independent_loading_theory(observed, prior, loading_weight, noise):
+    observed = np.asarray(observed, dtype=np.float32)
+    prior = np.asarray(prior, dtype=np.float32)
+    loading_weight = np.broadcast_to(np.asarray(loading_weight, dtype=np.float32), prior.shape)
+    noise = np.broadcast_to(np.asarray(noise, dtype=np.float32), observed.shape)
+    finite_mask = np.isfinite(observed)
+    safe_observed = np.where(finite_mask, observed, 0.0)
+
+    logp0 = np.log1p(-prior) + gaussian_logpdf(safe_observed, 0.0, noise)
+    logp1 = np.log(prior) + gaussian_logpdf(safe_observed, loading_weight, noise)
+    local_logz = np.logaddexp(logp0, logp1)
+    posterior = np.exp(logp1 - local_logz)
+    posterior = np.where(finite_mask, posterior, prior).astype(np.float32)
+    logz = np.sum(np.where(finite_mask, local_logz, 0.0), axis=-1)
+    return np.asarray(logz, dtype=np.float32), posterior
 
 
 def run_exact(observed, prior, design, noise):
@@ -257,3 +275,133 @@ def test_transfer_log_likelihood_batch_matches_single_trajectory_calls():
 
     assert batch_logz.dtype == jnp.float32
     np.testing.assert_allclose(np.asarray(batch_logz), np.asarray(single_logz), rtol=1e-6)
+
+
+def test_noninteracting_kernel_matches_analytic_theory_for_posteriors_and_elbo():
+    sampling_times = jnp.asarray([0.0, 1.0, 2.0, 3.0], dtype=jnp.float32)
+    loading_grid = sampling_times
+    loading_weight = np.float32(1.7)
+    design = build_ms2_design_matrix(
+        sampling_times=sampling_times,
+        loading_grid=loading_grid,
+        kernel=lambda t: jnp.where((t >= 0.0) & (t < 0.4), loading_weight, 0.0),
+    )
+    observed = np.array([0.15, 1.9, 0.7, 1.35], dtype=np.float32)
+    prior = np.array([0.2, 0.45, 0.7, 0.35], dtype=np.float32)
+    noise = np.float32(0.55)
+    finite_mask = np.isfinite(observed)
+    configs = enumerate_binary_configurations(len(prior))
+
+    np.testing.assert_allclose(
+        np.asarray(design),
+        loading_weight * np.eye(len(prior), dtype=np.float32),
+    )
+    expected_logz, expected_posterior = independent_loading_theory(
+        observed,
+        prior,
+        loading_weight,
+        noise,
+    )
+    expected_pairwise = np.outer(expected_posterior, expected_posterior).astype(np.float32)
+    np.fill_diagonal(expected_pairwise, expected_posterior)
+
+    exact_logz, marginals, pairwise, predicted, _ = exact_bernoulli_posterior(
+        jnp.asarray(observed),
+        jnp.asarray(prior),
+        design,
+        jnp.asarray(noise),
+        jnp.asarray(finite_mask),
+        configs,
+    )
+    marginals = np.asarray(marginals).copy()
+    pairwise = np.asarray(pairwise).copy()
+    predicted = np.asarray(predicted).copy()
+    elbo = mean_field_bernoulli_elbo(
+        jnp.asarray(expected_posterior),
+        jnp.asarray(observed),
+        jnp.asarray(prior),
+        design,
+        jnp.asarray(noise),
+        jnp.asarray(finite_mask),
+    )
+    transfer_logz = bernoulli_transfer_log_likelihood(
+        jnp.asarray(observed),
+        jnp.asarray(prior),
+        jnp.asarray([loading_weight], dtype=jnp.float32),
+        jnp.arange(len(prior), dtype=jnp.int32),
+        jnp.asarray(noise),
+        jnp.asarray(finite_mask),
+    )
+
+    assert float(exact_logz) == pytest.approx(float(expected_logz), rel=1e-6, abs=1e-6)
+    assert float(elbo) == pytest.approx(float(expected_logz), rel=1e-6, abs=1e-6)
+    assert float(transfer_logz) == pytest.approx(float(expected_logz), rel=1e-6, abs=1e-6)
+    np.testing.assert_allclose(marginals, expected_posterior, rtol=1e-6)
+    np.testing.assert_allclose(pairwise, expected_pairwise, rtol=1e-6)
+    np.testing.assert_allclose(
+        predicted,
+        loading_weight * expected_posterior,
+        rtol=1e-6,
+    )
+
+    mean_field_result = fit_mean_field_bernoulli(observed, prior, np.asarray(design), noise)
+    assert mean_field_result.elbo == pytest.approx(float(expected_logz), rel=5e-6, abs=5e-6)
+    np.testing.assert_allclose(
+        mean_field_result.load_probabilities,
+        expected_posterior,
+        rtol=5e-5,
+        atol=5e-6,
+    )
+
+
+def test_large_noninteracting_batch_runs_without_materializing_state_space():
+    n_tracks = 200
+    n_timepoints = 1000
+    rng = np.random.default_rng(20260520)
+    loading_weight = np.float32(1.25)
+    prior = rng.uniform(0.05, 0.95, size=(n_tracks, n_timepoints)).astype(np.float32)
+    observed = rng.normal(
+        loc=loading_weight * (prior > 0.5),
+        scale=0.35,
+        size=(n_tracks, n_timepoints),
+    ).astype(np.float32)
+    observed[:, ::137] = np.nan
+    noise = np.linspace(0.45, 0.75, n_tracks, dtype=np.float32)
+    finite_mask = np.isfinite(observed)
+    starts = jnp.arange(n_timepoints, dtype=jnp.int32)
+
+    expected_logz, posterior = independent_loading_theory(
+        observed,
+        prior,
+        loading_weight,
+        noise[:, None],
+    )
+    transfer_logz = bernoulli_transfer_log_likelihood_batch(
+        jnp.asarray(observed),
+        jnp.asarray(prior),
+        jnp.asarray([loading_weight], dtype=jnp.float32),
+        starts,
+        jnp.asarray(noise),
+        jnp.asarray(finite_mask),
+    )
+    shared_design = jnp.eye(n_timepoints, dtype=jnp.float32) * loading_weight
+    batch_elbo = jax.jit(
+        jax.vmap(mean_field_bernoulli_elbo, in_axes=(0, 0, 0, None, 0, 0))
+    )
+    elbo = batch_elbo(
+        jnp.asarray(posterior),
+        jnp.asarray(observed),
+        jnp.asarray(prior),
+        shared_design,
+        jnp.asarray(noise),
+        jnp.asarray(finite_mask),
+    )
+
+    assert transfer_logz.shape == (n_tracks,)
+    assert transfer_logz.dtype == jnp.float32
+    assert elbo.shape == (n_tracks,)
+    assert elbo.dtype == jnp.float32
+    assert np.all(np.isfinite(np.asarray(transfer_logz)))
+    assert np.all(np.isfinite(np.asarray(elbo)))
+    np.testing.assert_allclose(np.asarray(transfer_logz), expected_logz, rtol=2e-5, atol=2e-3)
+    np.testing.assert_allclose(np.asarray(elbo), expected_logz, rtol=2e-5, atol=2e-3)

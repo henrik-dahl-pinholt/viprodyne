@@ -7,6 +7,8 @@ from typing import Callable
 import jax
 import jax.numpy as jnp
 
+MATMUL_PRECISION = jax.lax.Precision.HIGHEST
+
 
 def build_ms2_design_matrix(
     sampling_times: jnp.ndarray,
@@ -159,7 +161,7 @@ def exact_bernoulli_posterior(
 
     log_prior = configurations @ jnp.log(prior)
     log_prior = log_prior + (1.0 - configurations) @ jnp.log1p(-prior)
-    means = configurations @ design_matrix.T
+    means = jnp.matmul(configurations, design_matrix.T, precision=MATMUL_PRECISION)
     safe_observed = jnp.where(finite_mask, observed, 0.0)
     residuals = safe_observed[None, :] - means
     obs_terms = -0.5 * (
@@ -169,14 +171,21 @@ def exact_bernoulli_posterior(
     log_joint = log_prior + log_likelihood
     log_evidence = jax.scipy.special.logsumexp(log_joint)
     posterior_probabilities = jnp.exp(log_joint - log_evidence)
-    marginal_probabilities = posterior_probabilities @ configurations
-    pairwise_probabilities = jnp.einsum(
-        "c,ci,cj->ij",
+    marginal_probabilities = jnp.matmul(
         posterior_probabilities,
         configurations,
-        configurations,
+        precision=MATMUL_PRECISION,
     )
-    predicted_signal = design_matrix @ marginal_probabilities
+    pairwise_probabilities = jnp.matmul(
+        (configurations * posterior_probabilities[:, None]).T,
+        configurations,
+        precision=MATMUL_PRECISION,
+    )
+    predicted_signal = jnp.matmul(
+        design_matrix,
+        marginal_probabilities,
+        precision=MATMUL_PRECISION,
+    )
     return (
         log_evidence,
         marginal_probabilities,
@@ -203,8 +212,12 @@ def mean_field_bernoulli_elbo(
     noise_std = jnp.asarray(noise_std, dtype=jnp.float32)
     finite_mask = jnp.asarray(finite_mask, dtype=bool)
 
-    mean_signal = design_matrix @ q
-    variance_signal = (design_matrix * design_matrix) @ (q * (1.0 - q))
+    mean_signal = jnp.matmul(design_matrix, q, precision=MATMUL_PRECISION)
+    variance_signal = jnp.matmul(
+        design_matrix * design_matrix,
+        q * (1.0 - q),
+        precision=MATMUL_PRECISION,
+    )
     residual = observed - mean_signal
     obs_terms = -0.5 * (
         jnp.log(2.0 * jnp.pi * noise_std**2)

@@ -26,9 +26,10 @@ def test_two_state_forward_matches_analytic_solution():
     expected_off = 1.0 - expected_on
     expected = np.stack([expected_off, expected_on], axis=-1)
 
-    assert solution.log_partition[0] == pytest.approx(0.0)
-    np.testing.assert_allclose(solution.alpha[0], expected, rtol=1e-12, atol=1e-12)
-    np.testing.assert_allclose(solution.posterior[0], expected, rtol=1e-12, atol=1e-12)
+    assert solution.alpha.dtype == np.float32
+    assert solution.log_partition[0] == pytest.approx(0.0, abs=2e-7)
+    np.testing.assert_allclose(solution.alpha[0], expected, rtol=3e-6, atol=3e-7)
+    np.testing.assert_allclose(solution.posterior[0], expected, rtol=3e-6, atol=3e-7)
 
 
 def test_two_state_expected_occupancy_and_jumps_match_analytic_integrals():
@@ -49,9 +50,9 @@ def test_two_state_expected_occupancy_and_jumps_match_analytic_integrals():
     occupancy = solution.expected_occupancy()[0, 0]
     jumps = solution.expected_jumps()[0, 0]
 
-    np.testing.assert_allclose(occupancy, [off_integral, on_integral], rtol=1e-11)
-    assert jumps[1, 0] == pytest.approx(kon * off_integral, rel=1e-11)
-    assert jumps[0, 1] == pytest.approx(koff * on_integral, rel=1e-11)
+    np.testing.assert_allclose(occupancy, [off_integral, on_integral], rtol=3e-6)
+    assert jumps[1, 0] == pytest.approx(kon * off_integral, rel=3e-6)
+    assert jumps[0, 1] == pytest.approx(koff * on_integral, rel=3e-6)
     assert jumps[0, 0] == 0.0
     assert jumps[1, 1] == 0.0
 
@@ -71,12 +72,12 @@ def test_constant_potential_partition_matches_matrix_exponential():
     tilted = generator + np.diag(potential)
     expected_z = np.sum(expm(tilted * duration) @ initial)
 
-    assert solution.log_partition[0] == pytest.approx(np.log(expected_z), rel=1e-12)
+    assert solution.log_partition[0] == pytest.approx(np.log(expected_z), rel=3e-6)
     np.testing.assert_allclose(
         solution.marginal_at(0.0),
         solution.posterior[:, 0],
-        rtol=1e-12,
-        atol=1e-12,
+        rtol=3e-6,
+        atol=3e-7,
     )
 
 
@@ -97,4 +98,4 @@ def test_piecewise_batch_shapes_and_transition_columns():
     assert solution.expected_occupancy().shape == (2, 2, 2)
     assert solution.expected_jumps().shape == (2, 2, 2, 2)
     transitions = solution.posterior_grid_transition_matrices()
-    np.testing.assert_allclose(np.sum(transitions, axis=2), np.ones((2, 2, 2)))
+    np.testing.assert_allclose(np.sum(transitions, axis=2), np.ones((2, 2, 2)), rtol=3e-6)

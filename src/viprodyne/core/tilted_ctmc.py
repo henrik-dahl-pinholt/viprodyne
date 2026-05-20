@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import jax
+import jax.numpy as jnp
 import numpy as np
-from scipy.linalg import expm, expm_frechet
 
 from viprodyne.core.rate_edges import validate_column_generator
 
@@ -14,103 +15,76 @@ from viprodyne.core.rate_edges import validate_column_generator
 class TiltedCTMCSolution:
     """Forward-backward quantities for a tilted CTMC."""
 
-    time_grid: np.ndarray
-    generators: np.ndarray
-    potentials: np.ndarray
-    initial_probabilities: np.ndarray
-    transition_matrices: np.ndarray
-    alpha: np.ndarray
-    beta: np.ndarray
-    log_partition: np.ndarray
+    time_grid: jax.Array
+    generators: jax.Array
+    potentials: jax.Array
+    initial_probabilities: jax.Array
+    transition_matrices: jax.Array
+    alpha: jax.Array
+    beta: jax.Array
+    log_partition: jax.Array
 
     @property
-    def posterior(self) -> np.ndarray:
+    def posterior(self) -> jax.Array:
         """State posterior on grid points, shape ``(batch, n_times, n_states)``."""
-        z = np.exp(self.log_partition)[:, None, None]
+        z = jnp.exp(self.log_partition)[:, None, None]
         return self.alpha * self.beta / z
 
-    def marginal_at(self, time: float) -> np.ndarray:
+    def marginal_at(self, time: float) -> jax.Array:
         """Interpolate the state posterior at a single time."""
-        interval = _interval_index(self.time_grid, float(time))
+        interval = _interval_index(np.asarray(self.time_grid), float(time))
         left = self.time_grid[interval]
         right = self.time_grid[interval + 1]
-        dt_left = float(time - left)
-        dt_right = float(right - time)
-        out = []
-        z = np.exp(self.log_partition)
-        for batch in range(self.generators.shape[0]):
-            generator = self.generators[batch, interval]
-            potential = self.potentials[batch, interval]
-            tilted = generator + np.diag(potential)
-            alpha_mid = expm(tilted * dt_left) @ self.alpha[batch, interval]
-            beta_mid = expm(tilted.T * dt_right) @ self.beta[batch, interval + 1]
-            out.append(alpha_mid * beta_mid / z[batch])
-        return np.asarray(out)
+        dt_left = jnp.asarray(float(time), dtype=jnp.float32) - left
+        dt_right = right - jnp.asarray(float(time), dtype=jnp.float32)
+        tilted = _tilted_generators(self.generators[:, interval], self.potentials[:, interval])
 
-    def expected_occupancy(self) -> np.ndarray:
+        def propagate_left(matrix, alpha_left):
+            return jax.scipy.linalg.expm(matrix * dt_left) @ alpha_left
+
+        def propagate_right(matrix, beta_right):
+            return jax.scipy.linalg.expm(matrix.T * dt_right) @ beta_right
+
+        alpha_mid = jax.vmap(propagate_left)(tilted, self.alpha[:, interval])
+        beta_mid = jax.vmap(propagate_right)(tilted, self.beta[:, interval + 1])
+        return alpha_mid * beta_mid / jnp.exp(self.log_partition)[:, None]
+
+    def expected_occupancy(self) -> jax.Array:
         """Expected time spent in each state per interval.
 
         Returns an array with shape ``(batch, n_intervals, n_states)`` and units of
         time. This is exact for piecewise-constant generators and potentials.
         """
-        batch_size, n_intervals, n_states, _ = self.generators.shape
-        out = np.zeros((batch_size, n_intervals, n_states), dtype=float)
-        z = np.exp(self.log_partition)
-        for batch in range(batch_size):
-            for interval in range(n_intervals):
-                dt = self.time_grid[interval + 1] - self.time_grid[interval]
-                tilted = self.generators[batch, interval] + np.diag(
-                    self.potentials[batch, interval]
-                )
-                matrix = tilted * dt
-                for state in range(n_states):
-                    direction = np.zeros_like(tilted)
-                    direction[state, state] = dt
-                    frechet = expm_frechet(matrix, direction, compute_expm=False)
-                    out[batch, interval, state] = (
-                        self.beta[batch, interval + 1]
-                        @ frechet
-                        @ self.alpha[batch, interval]
-                        / z[batch]
-                    )
-        return out
+        return _expected_occupancy_kernel(
+            self.generators,
+            self.potentials,
+            self.alpha,
+            self.beta,
+            self.log_partition,
+            self.time_grid,
+        )
 
-    def expected_jumps(self) -> np.ndarray:
+    def expected_jumps(self) -> jax.Array:
         """Expected transition counts per interval for ``Q[to_state, from_state]``.
 
         The diagonal entries are always zero. The returned counts are integrated
         over each interval rather than multiplied by a downstream quadrature rule.
         """
-        batch_size, n_intervals, n_states, _ = self.generators.shape
-        out = np.zeros((batch_size, n_intervals, n_states, n_states), dtype=float)
-        z = np.exp(self.log_partition)
-        for batch in range(batch_size):
-            for interval in range(n_intervals):
-                dt = self.time_grid[interval + 1] - self.time_grid[interval]
-                generator = self.generators[batch, interval]
-                tilted = generator + np.diag(self.potentials[batch, interval])
-                matrix = tilted * dt
-                for to_state in range(n_states):
-                    for from_state in range(n_states):
-                        if to_state == from_state or generator[to_state, from_state] == 0.0:
-                            continue
-                        direction = np.zeros_like(tilted)
-                        direction[to_state, from_state] = generator[to_state, from_state] * dt
-                        frechet = expm_frechet(matrix, direction, compute_expm=False)
-                        out[batch, interval, to_state, from_state] = (
-                            self.beta[batch, interval + 1]
-                            @ frechet
-                            @ self.alpha[batch, interval]
-                            / z[batch]
-                        )
-        return out
+        return _expected_jumps_kernel(
+            self.generators,
+            self.potentials,
+            self.alpha,
+            self.beta,
+            self.log_partition,
+            self.time_grid,
+        )
 
-    def expected_jump_density(self) -> np.ndarray:
+    def expected_jump_density(self) -> jax.Array:
         """Expected jump counts divided by interval durations."""
-        dt = np.diff(self.time_grid)[None, :, None, None]
+        dt = jnp.diff(self.time_grid)[None, :, None, None]
         return self.expected_jumps() / dt
 
-    def posterior_grid_transition_matrices(self) -> np.ndarray:
+    def posterior_grid_transition_matrices(self) -> jax.Array:
         """Return posterior transitions between grid points.
 
         Entry ``P[to_state, from_state]`` is the probability of the next grid
@@ -118,9 +92,8 @@ class TiltedCTMCSolution:
         """
         numerator = self.transition_matrices * self.beta[:, 1:, :, None]
         denominator = self.beta[:, :-1, None, :]
-        with np.errstate(divide="ignore", invalid="ignore"):
-            transitions = numerator / denominator
-        return np.nan_to_num(transitions, nan=0.0, posinf=0.0, neginf=0.0)
+        transitions = numerator / denominator
+        return jnp.nan_to_num(transitions, nan=0.0, posinf=0.0, neginf=0.0)
 
     def sample_grid_paths(
         self,
@@ -135,8 +108,8 @@ class TiltedCTMCSolution:
             raise ValueError("n_samples must be positive.")
         rng = np.random.default_rng() if rng is None else rng
         batch_size, n_intervals, n_states, _ = self.generators.shape
-        transitions = self.posterior_grid_transition_matrices()
-        initial = self.posterior[:, 0]
+        transitions = np.asarray(self.posterior_grid_transition_matrices())
+        initial = np.asarray(self.posterior[:, 0])
         samples = np.zeros((batch_size, n_samples, n_intervals + 1), dtype=int)
         for batch in range(batch_size):
             samples[batch, :, 0] = rng.choice(n_states, size=n_samples, p=initial[batch])
@@ -165,51 +138,45 @@ class TiltedCTMC:
         initial_probabilities: np.ndarray,
         potentials: np.ndarray | None = None,
     ) -> None:
-        self.time_grid = _validate_time_grid(time_grid)
-        self.n_intervals = self.time_grid.size - 1
+        time_grid = _validate_time_grid(time_grid)
+        n_intervals = time_grid.size - 1
         initial = _normalize_initial_probabilities(initial_probabilities)
         n_states = initial.shape[-1]
-        generators = _normalize_generators(generator, self.n_intervals, n_states)
-        potentials = _normalize_potentials(potentials, self.n_intervals, n_states)
+        generators = _normalize_generators(generator, n_intervals, n_states)
+        potentials = _normalize_potentials(potentials, n_intervals, n_states)
         batch_size = max(initial.shape[0], generators.shape[0], potentials.shape[0])
-        self.initial_probabilities = np.broadcast_to(initial, (batch_size, n_states)).copy()
-        self.generators = np.broadcast_to(
-            generators,
-            (batch_size, self.n_intervals, n_states, n_states),
-        ).copy()
-        self.potentials = np.broadcast_to(
-            potentials,
-            (batch_size, self.n_intervals, n_states),
-        ).copy()
+
+        self.time_grid = jnp.asarray(time_grid, dtype=jnp.float32)
+        self.n_intervals = n_intervals
+        self.initial_probabilities = jnp.asarray(
+            np.broadcast_to(initial, (batch_size, n_states)).copy(),
+            dtype=jnp.float32,
+        )
+        self.generators = jnp.asarray(
+            np.broadcast_to(
+                generators,
+                (batch_size, n_intervals, n_states, n_states),
+            ).copy(),
+            dtype=jnp.float32,
+        )
+        self.potentials = jnp.asarray(
+            np.broadcast_to(
+                potentials,
+                (batch_size, n_intervals, n_states),
+            ).copy(),
+            dtype=jnp.float32,
+        )
 
     def solve(self) -> TiltedCTMCSolution:
         """Run forward-backward recursions."""
-        batch_size, n_intervals, n_states, _ = self.generators.shape
-        transition_matrices = np.zeros_like(self.generators)
-        alpha = np.zeros((batch_size, n_intervals + 1, n_states), dtype=float)
-        beta = np.zeros_like(alpha)
-        alpha[:, 0] = self.initial_probabilities
-        beta[:, -1] = 1.0
-
-        for interval in range(n_intervals):
-            dt = self.time_grid[interval + 1] - self.time_grid[interval]
-            for batch in range(batch_size):
-                tilted = self.generators[batch, interval] + np.diag(
-                    self.potentials[batch, interval]
-                )
-                transition_matrices[batch, interval] = expm(tilted * dt)
-                alpha[batch, interval + 1] = (
-                    transition_matrices[batch, interval] @ alpha[batch, interval]
-                )
-
-        for interval in range(n_intervals - 1, -1, -1):
-            for batch in range(batch_size):
-                beta[batch, interval] = (
-                    transition_matrices[batch, interval].T @ beta[batch, interval + 1]
-                )
-
-        partition = np.sum(alpha[:, -1], axis=-1)
-        if np.any(partition <= 0) or np.any(~np.isfinite(partition)):
+        transition_matrices, alpha, beta, log_partition = _solve_forward_backward(
+            self.generators,
+            self.potentials,
+            self.initial_probabilities,
+            self.time_grid,
+        )
+        log_partition_host = np.asarray(log_partition)
+        if np.any(~np.isfinite(log_partition_host)):
             raise FloatingPointError("CTMC partition function is not positive and finite.")
         return TiltedCTMCSolution(
             time_grid=self.time_grid,
@@ -219,12 +186,138 @@ class TiltedCTMC:
             transition_matrices=transition_matrices,
             alpha=alpha,
             beta=beta,
-            log_partition=np.log(partition),
+            log_partition=log_partition,
         )
 
 
+@jax.jit
+def _solve_forward_backward(
+    generators: jax.Array,
+    potentials: jax.Array,
+    initial_probabilities: jax.Array,
+    time_grid: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    dt = jnp.diff(time_grid)
+
+    def interval_transition(generator, potential, interval_dt):
+        tilted = _tilted_generator(generator, potential)
+        return jax.scipy.linalg.expm(tilted * interval_dt)
+
+    def batch_transitions(batch_generators, batch_potentials):
+        return jax.vmap(interval_transition)(batch_generators, batch_potentials, dt)
+
+    transition_matrices = jax.vmap(batch_transitions)(generators, potentials)
+
+    def solve_batch(transitions, initial):
+        def forward_step(alpha_t, transition):
+            next_alpha = transition @ alpha_t
+            return next_alpha, next_alpha
+
+        _, alpha_tail = jax.lax.scan(forward_step, initial, transitions)
+        alpha = jnp.concatenate([initial[None, :], alpha_tail], axis=0)
+
+        terminal_beta = jnp.ones_like(initial)
+
+        def backward_step(beta_t, transition):
+            next_beta = transition.T @ beta_t
+            return next_beta, next_beta
+
+        _, beta_tail_reversed = jax.lax.scan(backward_step, terminal_beta, transitions[::-1])
+        beta = jnp.concatenate([beta_tail_reversed[::-1], terminal_beta[None, :]], axis=0)
+        return alpha, beta
+
+    alpha, beta = jax.vmap(solve_batch)(transition_matrices, initial_probabilities)
+    log_partition = jnp.log(jnp.sum(alpha[:, -1], axis=-1))
+    return transition_matrices, alpha, beta, log_partition
+
+
+@jax.jit
+def _expected_occupancy_kernel(
+    generators: jax.Array,
+    potentials: jax.Array,
+    alpha: jax.Array,
+    beta: jax.Array,
+    log_partition: jax.Array,
+    time_grid: jax.Array,
+) -> jax.Array:
+    dt = jnp.diff(time_grid)
+    n_states = generators.shape[-1]
+    state_basis = jnp.eye(n_states, dtype=jnp.float32)
+
+    def interval_occupancy(generator, potential, alpha_left, beta_right, interval_dt, log_z):
+        matrix = _tilted_generator(generator, potential) * interval_dt
+
+        def one_state(direction_diag):
+            direction = jnp.diag(direction_diag) * interval_dt
+            frechet = jax.scipy.linalg.expm_frechet(matrix, direction, compute_expm=False)
+            return beta_right @ frechet @ alpha_left * jnp.exp(-log_z)
+
+        return jax.vmap(one_state)(state_basis)
+
+    def batch_occupancy(batch_generators, batch_potentials, batch_alpha, batch_beta, log_z):
+        return jax.vmap(interval_occupancy, in_axes=(0, 0, 0, 0, 0, None))(
+            batch_generators,
+            batch_potentials,
+            batch_alpha[:-1],
+            batch_beta[1:],
+            dt,
+            log_z,
+        )
+
+    return jax.vmap(batch_occupancy)(generators, potentials, alpha, beta, log_partition)
+
+
+@jax.jit
+def _expected_jumps_kernel(
+    generators: jax.Array,
+    potentials: jax.Array,
+    alpha: jax.Array,
+    beta: jax.Array,
+    log_partition: jax.Array,
+    time_grid: jax.Array,
+) -> jax.Array:
+    dt = jnp.diff(time_grid)
+    n_states = generators.shape[-1]
+    edge_basis = jnp.eye(n_states * n_states, dtype=jnp.float32).reshape(
+        (n_states * n_states, n_states, n_states)
+    )
+    offdiag_mask = (1.0 - jnp.eye(n_states, dtype=jnp.float32)).reshape((n_states * n_states,))
+
+    def interval_jumps(generator, potential, alpha_left, beta_right, interval_dt, log_z):
+        matrix = _tilted_generator(generator, potential) * interval_dt
+
+        def one_edge(basis_matrix, is_offdiag):
+            direction = basis_matrix * generator * interval_dt
+            frechet = jax.scipy.linalg.expm_frechet(matrix, direction, compute_expm=False)
+            return is_offdiag * (beta_right @ frechet @ alpha_left) * jnp.exp(-log_z)
+
+        return jax.vmap(one_edge)(edge_basis, offdiag_mask).reshape((n_states, n_states))
+
+    def batch_jumps(batch_generators, batch_potentials, batch_alpha, batch_beta, log_z):
+        return jax.vmap(interval_jumps, in_axes=(0, 0, 0, 0, 0, None))(
+            batch_generators,
+            batch_potentials,
+            batch_alpha[:-1],
+            batch_beta[1:],
+            dt,
+            log_z,
+        )
+
+    return jax.vmap(batch_jumps)(generators, potentials, alpha, beta, log_partition)
+
+
+def _tilted_generators(generators: jax.Array, potentials: jax.Array) -> jax.Array:
+    eye = jnp.eye(generators.shape[-1], dtype=jnp.float32)
+    return generators + eye[None, :, :] * potentials[:, None, :]
+
+
+def _tilted_generator(generator: jax.Array, potential: jax.Array) -> jax.Array:
+    eye = jnp.eye(generator.shape[-1], dtype=jnp.float32)
+    return generator + eye * potential
+
+
 def _validate_time_grid(time_grid: np.ndarray) -> np.ndarray:
-    time_grid = np.asarray(time_grid, dtype=float)
+    time_grid = np.asarray(time_grid, dtype=np.float32)
     if time_grid.ndim != 1 or time_grid.size < 2:
         raise ValueError("time_grid must be one-dimensional with at least two points.")
     if np.any(np.diff(time_grid) <= 0):
@@ -233,7 +326,7 @@ def _validate_time_grid(time_grid: np.ndarray) -> np.ndarray:
 
 
 def _normalize_initial_probabilities(initial_probabilities: np.ndarray) -> np.ndarray:
-    initial = np.asarray(initial_probabilities, dtype=float)
+    initial = np.asarray(initial_probabilities, dtype=np.float32)
     if initial.ndim == 1:
         initial = initial[None, :]
     if initial.ndim != 2:
@@ -251,7 +344,7 @@ def _normalize_generators(
     n_intervals: int,
     n_states: int,
 ) -> np.ndarray:
-    generator = np.asarray(generator, dtype=float)
+    generator = np.asarray(generator, dtype=np.float32)
     if generator.shape[-2:] != (n_states, n_states):
         raise ValueError("generator state dimensions do not match initial_probabilities.")
     if generator.ndim == 2:
@@ -268,8 +361,8 @@ def _normalize_generators(
             (generator.shape[0], n_intervals, n_states, n_states),
         )
     for matrix in generator.reshape((-1, n_states, n_states)):
-        validate_column_generator(matrix)
-    return generator
+        validate_column_generator(matrix, atol=1e-6)
+    return generator.astype(np.float32)
 
 
 def _normalize_potentials(
@@ -278,8 +371,8 @@ def _normalize_potentials(
     n_states: int,
 ) -> np.ndarray:
     if potentials is None:
-        return np.zeros((1, n_intervals, n_states), dtype=float)
-    potentials = np.asarray(potentials, dtype=float)
+        return np.zeros((1, n_intervals, n_states), dtype=np.float32)
+    potentials = np.asarray(potentials, dtype=np.float32)
     if potentials.shape[-1] != n_states:
         raise ValueError("potential state dimension does not match initial_probabilities.")
     if potentials.ndim == 1:
@@ -295,7 +388,7 @@ def _normalize_potentials(
         raise ValueError("potential interval dimension must be 1 or len(time_grid) - 1.")
     if potentials.shape[1] == 1:
         potentials = np.broadcast_to(potentials, (potentials.shape[0], n_intervals, n_states))
-    return potentials
+    return potentials.astype(np.float32)
 
 
 def _interval_index(time_grid: np.ndarray, time: float) -> int:
