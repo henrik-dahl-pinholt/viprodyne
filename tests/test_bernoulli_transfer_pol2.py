@@ -7,6 +7,7 @@ from scipy.special import logsumexp
 from viprodyne.core.bernoulli_transfer_pol2 import (
     bernoulli_transfer_log_likelihood,
     bernoulli_transfer_log_likelihood_batch,
+    bernoulli_transfer_posterior,
     build_ms2_design_matrix,
     enumerate_binary_configurations,
     exact_bernoulli_posterior,
@@ -340,6 +341,72 @@ def test_transfer_log_likelihood_matches_exact_with_gaps_and_missing_data():
     assert float(transfer_logz) == pytest.approx(float(exact_logz), rel=1e-6, abs=1e-6)
 
 
+def test_transfer_posterior_marginals_and_entropy_match_exact_enumeration():
+    prior = np.array([0.35, 0.2, 0.6, 0.45, 0.7], dtype=np.float32)
+    window_weights = np.array([1.2, 0.4], dtype=np.float32)
+    starts = np.array([0, 2, 3], dtype=np.int32)
+    observed = np.array([0.9, np.nan, 0.55], dtype=np.float32)
+    noise = np.array([0.7, 0.9, 0.6], dtype=np.float32)
+    finite_mask = np.isfinite(observed)
+    design = design_from_windows(len(prior), window_weights, starts)
+
+    configs = enumerate_binary_configurations(len(prior))
+    exact_logz, exact_marginals, _, exact_predicted, exact_weights = exact_bernoulli_posterior(
+        jnp.asarray(observed),
+        jnp.asarray(prior),
+        jnp.asarray(design),
+        jnp.asarray(noise),
+        jnp.asarray(finite_mask),
+        configs,
+    )
+    exact_entropy = -jnp.sum(
+        jnp.where(exact_weights > 0.0, exact_weights * jnp.log(exact_weights), 0.0)
+    )
+    exact_log_prior = jnp.sum(
+        exact_marginals * jnp.log(jnp.asarray(prior))
+        + (1.0 - exact_marginals) * jnp.log1p(-jnp.asarray(prior))
+    )
+    (
+        transfer_logz,
+        transfer_marginals,
+        transfer_predicted,
+        transfer_entropy,
+        transfer_log_prior,
+        transfer_log_likelihood,
+    ) = bernoulli_transfer_posterior(
+        jnp.asarray(observed),
+        jnp.asarray(prior),
+        jnp.asarray(window_weights),
+        jnp.asarray(starts),
+        jnp.asarray(noise),
+        jnp.asarray(finite_mask),
+    )
+
+    assert transfer_logz.dtype == jnp.float32
+    assert transfer_marginals.dtype == jnp.float32
+    assert transfer_entropy.dtype == jnp.float32
+    assert float(transfer_logz) == pytest.approx(float(exact_logz), rel=2e-5, abs=2e-5)
+    np.testing.assert_allclose(
+        np.asarray(transfer_marginals),
+        np.asarray(exact_marginals),
+        rtol=2e-4,
+        atol=2e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(transfer_predicted),
+        np.asarray(exact_predicted),
+        rtol=2e-4,
+        atol=2e-5,
+    )
+    assert float(transfer_entropy) == pytest.approx(float(exact_entropy), rel=2e-4, abs=2e-5)
+    assert float(transfer_log_prior) == pytest.approx(float(exact_log_prior), rel=2e-4, abs=2e-5)
+    assert float(transfer_log_likelihood) == pytest.approx(
+        float(exact_logz - exact_entropy - exact_log_prior),
+        rel=2e-4,
+        abs=2e-5,
+    )
+
+
 def test_transfer_log_likelihood_batch_matches_single_trajectory_calls():
     window_weights = np.array([0.6, 1.1, 0.2], dtype=np.float32)
     starts = np.array([0, 2], dtype=np.int32)
@@ -452,6 +519,19 @@ def test_noninteracting_kernel_matches_analytic_theory_for_posteriors_and_elbo()
     assert float(exact_logz) == pytest.approx(float(expected_logz), rel=1e-6, abs=1e-6)
     assert float(elbo) == pytest.approx(float(expected_logz), rel=1e-6, abs=1e-6)
     assert float(transfer_logz) == pytest.approx(float(expected_logz), rel=1e-6, abs=1e-6)
+    _, transfer_posterior, _, transfer_entropy, _, _ = bernoulli_transfer_posterior(
+        jnp.asarray(observed),
+        jnp.asarray(prior),
+        jnp.asarray([loading_weight], dtype=jnp.float32),
+        jnp.arange(len(prior), dtype=jnp.int32),
+        jnp.asarray(noise),
+        jnp.asarray(finite_mask),
+    )
+    np.testing.assert_allclose(np.asarray(transfer_posterior), expected_posterior, rtol=2e-4)
+    assert float(transfer_entropy) == pytest.approx(
+        float(-np.sum(expected_posterior * np.log(expected_posterior) + (1.0 - expected_posterior) * np.log1p(-expected_posterior))),
+        rel=2e-4,
+    )
     np.testing.assert_allclose(marginals, expected_posterior, rtol=1e-6)
     np.testing.assert_allclose(pairwise, expected_pairwise, rtol=1e-6)
     np.testing.assert_allclose(

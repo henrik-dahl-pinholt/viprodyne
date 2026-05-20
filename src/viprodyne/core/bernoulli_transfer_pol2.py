@@ -50,6 +50,27 @@ def bernoulli_transfer_log_likelihood(
     ``observation_starts[t]`` is the loading-grid index of the first bit in the
     window for observation ``t``. Starts must be monotone outside this JIT kernel.
     """
+    return _bernoulli_transfer_log_likelihood_from_probabilities(
+        observed,
+        prior_probabilities,
+        window_weights,
+        observation_starts,
+        noise_std,
+        finite_mask,
+        jnp.asarray(1.0, dtype=jnp.float32),
+    )
+
+
+def _bernoulli_transfer_log_likelihood_from_probabilities(
+    observed: jnp.ndarray,
+    prior_probabilities: jnp.ndarray,
+    window_weights: jnp.ndarray,
+    observation_starts: jnp.ndarray,
+    noise_std: jnp.ndarray,
+    finite_mask: jnp.ndarray,
+    likelihood_scale: jnp.ndarray,
+) -> jnp.ndarray:
+    """Transfer log likelihood with a scale on observation log potentials."""
     observed = jnp.asarray(observed, dtype=jnp.float32)
     prior = jnp.clip(jnp.asarray(prior_probabilities, dtype=jnp.float32), 1e-7, 1.0 - 1e-7)
     window_weights = jnp.asarray(window_weights, dtype=jnp.float32)
@@ -100,7 +121,7 @@ def bernoulli_transfer_log_likelihood(
         residual = y_t - emission_means
         obs_logp = -0.5 * (
             jnp.log(2.0 * jnp.pi * noise_t**2) + residual * residual / noise_t**2
-        )
+        ) * likelihood_scale
         joint_logp = jnp.log(jnp.maximum(alpha_t, jnp.finfo(jnp.float32).tiny)) + obs_logp
         local_loglik = jax.scipy.special.logsumexp(joint_logp)
         updated = jnp.exp(joint_logp - local_loglik)
@@ -114,6 +135,79 @@ def bernoulli_transfer_log_likelihood(
         (safe_observed, finite_mask, shifts, starts, noise_by_observation),
     )
     return loglik
+
+
+@jax.jit
+def bernoulli_transfer_posterior(
+    observed: jnp.ndarray,
+    prior_probabilities: jnp.ndarray,
+    window_weights: jnp.ndarray,
+    observation_starts: jnp.ndarray,
+    noise_std: jnp.ndarray,
+    finite_mask: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Transfer log partition, loading marginals, predicted signal, and entropy.
+
+    Marginals are obtained from ``d log_Z / d logit(prior_i) = E[x_i] - prior_i``.
+    Entropy uses ``H(q) = log_Z - E_q[log prior] - E_q[log likelihood]``, with
+    ``E_q[log likelihood]`` from a derivative of ``log_Z`` with respect to a
+    scalar likelihood-temperature parameter. This avoids materializing the joint
+    posterior and remains exact for the transfer distribution.
+    """
+    prior = jnp.clip(jnp.asarray(prior_probabilities, dtype=jnp.float32), 1e-7, 1.0 - 1e-7)
+    logits = jnp.log(prior) - jnp.log1p(-prior)
+    starts = jnp.asarray(observation_starts, dtype=jnp.int32)
+    window_weights = jnp.asarray(window_weights, dtype=jnp.float32)
+
+    def log_z_from_logits(logits_arg: jnp.ndarray) -> jnp.ndarray:
+        probabilities = jax.nn.sigmoid(logits_arg)
+        return _bernoulli_transfer_log_likelihood_from_probabilities(
+            observed,
+            probabilities,
+            window_weights,
+            starts,
+            noise_std,
+            finite_mask,
+            jnp.asarray(1.0, dtype=jnp.float32),
+        )
+
+    log_z = log_z_from_logits(logits)
+    dlog_z_dlogits = jax.jacfwd(log_z_from_logits)(logits)
+    marginals = jnp.clip(prior + dlog_z_dlogits, 0.0, 1.0)
+
+    expected_log_prior = jnp.sum(
+        marginals * jnp.log(prior) + (1.0 - marginals) * jnp.log1p(-prior)
+    )
+
+    def log_z_from_likelihood_scale(scale: jnp.ndarray) -> jnp.ndarray:
+        return _bernoulli_transfer_log_likelihood_from_probabilities(
+            observed,
+            prior,
+            window_weights,
+            starts,
+            noise_std,
+            finite_mask,
+            scale,
+        )
+
+    expected_log_likelihood = jax.jacfwd(log_z_from_likelihood_scale)(
+        jnp.asarray(1.0, dtype=jnp.float32)
+    )
+    entropy = log_z - expected_log_prior - expected_log_likelihood
+
+    def predict_one(start: jnp.ndarray) -> jnp.ndarray:
+        active = jax.lax.dynamic_slice(marginals, (start,), (window_weights.shape[0],))
+        return jnp.dot(active, window_weights)
+
+    predicted_signal = jax.vmap(predict_one)(starts)
+    return (
+        log_z,
+        marginals.astype(jnp.float32),
+        predicted_signal.astype(jnp.float32),
+        entropy.astype(jnp.float32),
+        expected_log_prior.astype(jnp.float32),
+        expected_log_likelihood.astype(jnp.float32),
+    )
 
 
 @jax.jit

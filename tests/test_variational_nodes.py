@@ -262,11 +262,18 @@ def test_polymerase_loadings_exact_and_mean_field_match_independent_theory():
     expected_entropy = bernoulli_entropy(expected_posterior)
     assert exact.entropy() == pytest.approx(float(expected_entropy), rel=1e-6)
     assert mean_field.entropy() == pytest.approx(float(expected_entropy), rel=5e-5)
+    assert transfer.entropy() == pytest.approx(float(expected_entropy), rel=2e-4)
     assert exact.moments()["entropy"].dtype == np.float32
     assert mean_field.moments()["entropy"].dtype == np.float32
-    assert "load_probabilities" not in transfer.moments()
-    with pytest.raises(NotImplementedError, match="entropy"):
-        transfer.entropy()
+    assert transfer.moments()["entropy"].dtype == np.float32
+    np.testing.assert_allclose(
+        transfer.moments()["load_probabilities"],
+        expected_posterior,
+        rtol=2e-4,
+        atol=2e-5,
+    )
+    with pytest.raises(NotImplementedError, match="joint samples"):
+        transfer.sample()
     assert exact.elbo_contribution() == pytest.approx(float(expected_logz), rel=1e-6)
     assert mean_field.elbo_contribution() == pytest.approx(float(expected_logz), rel=5e-6)
     assert transfer.elbo_contribution() == pytest.approx(float(expected_logz), rel=1e-6)

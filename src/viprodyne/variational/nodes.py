@@ -10,7 +10,7 @@ import numpy as np
 from scipy.optimize import minimize_scalar
 
 from viprodyne.core.bernoulli_transfer_pol2 import (
-    bernoulli_transfer_log_likelihood,
+    bernoulli_transfer_posterior,
     enumerate_binary_configurations,
     exact_bernoulli_posterior,
 )
@@ -402,6 +402,8 @@ class PolymeraseLoadings(VariationalNode):
                 p=self.posterior_probabilities,
             )
             return self.configurations[indices].astype(np.int32)
+        if self.mode == "transfer":
+            raise NotImplementedError("transfer mode currently exposes marginals but not joint samples.")
         if self.load_probabilities is None:
             raise NotImplementedError("Pol2 loading samples require posterior probabilities.")
         probabilities = np.asarray(self.load_probabilities, dtype=FLOAT_DTYPE)
@@ -433,7 +435,7 @@ class PolymeraseLoadings(VariationalNode):
     def _update_transfer(self) -> None:
         if self.window_weights is None or self.observation_starts is None:
             raise ValueError("window_weights and observation_starts are required for transfer mode.")
-        log_z = bernoulli_transfer_log_likelihood(
+        log_z, marginals, predicted, entropy, _, _ = bernoulli_transfer_posterior(
             jnp.asarray(self.observed),
             jnp.asarray(self.prior_probabilities),
             jnp.asarray(self.window_weights),
@@ -442,11 +444,11 @@ class PolymeraseLoadings(VariationalNode):
             jnp.asarray(self.finite_mask),
         )
         self.objective_value = np.asarray(log_z, dtype=FLOAT_DTYPE)
-        self.load_probabilities = None
-        self.predicted_signal = None
+        self.load_probabilities = np.asarray(marginals, dtype=FLOAT_DTYPE)
+        self.predicted_signal = np.asarray(predicted, dtype=FLOAT_DTYPE)
         self.posterior_probabilities = None
         self.configurations = None
-        self.entropy_value = None
+        self.entropy_value = np.asarray(entropy, dtype=FLOAT_DTYPE)
 
     def _update_mean_field(self) -> None:
         if self.design_matrix is None:
