@@ -397,14 +397,45 @@ Driven transition rates can be scoped as track, dataset, or global rates. The
 contact-drive node remains per track/dataset plate, so a shared driven-rate node
 can still receive different contact probabilities from different traces.
 
+## Contact-Threshold Profiles
+
+Notebook-style `rc` profiles, where an external score is thresholded into a
+contact probability, are supported by `profile_contact_threshold(...)`:
+
+```python
+from viprodyne import CAVIConfig, profile_contact_threshold
+
+profile = profile_contact_threshold(
+    datasets=(dataset,),
+    config=ModelConfig(
+        n_states=2,
+        driven_transition_indices=(1,),
+        ms2_kernel="proximal",
+    ),
+    contact_scores=contact_score,
+    candidate_values=np.linspace(0.25, 2.0, 10, dtype=np.float32),
+    fit_config=CAVIConfig(max_iterations=100),
+)
+
+best_fit = profile.best_fit
+best_threshold = profile.best_value
+```
+
+This helper creates a fresh `ViprodyneModel` for each candidate, injects the
+candidate-specific `MS2Dataset.contact_probability`, runs
+`model.run_inference(...)`, and returns the ELBO profile. It is intended as the
+package-native version of the ad hoc profile loop used in the
+`1_kon_rc_toy_identify.ipynb` notebook.
+
 ## Current Gaps
 
 - Dense mean-field/exact Pol2 modes remain available internally, but should not
   be used for large regular MS2 traces because dense memory scales as
   `O(n_observations * n_loadings)`.
 - Driven `RcNode` currently supports pinned contact probabilities or an injected
-  objective function. Full profile-likelihood rc updates from GPR/contact data
-  still need a production data adapter.
+  objective function. The threshold-profile helper covers grid-search profiles,
+  but a direct production data adapter for optimizing `rc` inside `RcNode` is
+  still pending.
 
 ## Verification Strategy
 
@@ -423,6 +454,7 @@ Tests cover:
 - large Pol2 batches with 200 tracks and 1000 timepoints;
 - Gamma/Dirichlet parameter entropy and pinned-node behavior;
 - driven contact-survival MAP profiles and driven promoter tilts;
+- contact-threshold profile plumbing;
 - graph Markov-blanket wiring;
 - top-level graph construction with shared, scoped, and driven parameter nodes;
 - CAVI convergence monitoring without per-iteration ELBO evaluation.

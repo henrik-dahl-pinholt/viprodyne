@@ -76,6 +76,30 @@ factors.
 `pol2_mode="auto"` uses the memory-efficient transfer backend. The continuous
 Pol2 sampler is available with `pol2_mode="sampler"` for proximal MS2 kernels.
 
+Notebook-style contact-threshold profiles can be run with
+`profile_contact_threshold(...)`. This fits one model per candidate threshold
+and returns the ELBO profile plus the best structured fit:
+
+```python
+from viprodyne import CAVIConfig, profile_contact_threshold
+
+profile = profile_contact_threshold(
+    datasets=(dataset,),
+    config=ModelConfig(
+        n_states=2,
+        driven_transition_indices=(1,),
+        ms2_kernel="proximal",
+    ),
+    contact_scores=contact_score,
+    candidate_values=np.linspace(0.25, 2.0, 10, dtype=np.float32),
+    fit_config=CAVIConfig(max_iterations=100),
+)
+
+print(profile.best_value, profile.elbos)
+```
+
+A small runnable version is in `examples/contact_threshold_profile.py`.
+
 Install locally for development:
 
 ```bash

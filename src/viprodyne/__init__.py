@@ -9,6 +9,7 @@ from viprodyne.model import (
     ModelInferenceResult,
     ViprodyneModel,
 )
+from viprodyne.profile import ContactThresholdProfileResult, profile_contact_threshold
 from viprodyne.variational.distributions import DeltaNode, DirichletNode, GammaNode
 from viprodyne.variational.nodes import (
     DrivenRateMap,
@@ -26,6 +27,7 @@ __all__ = [
     "CAVIConfig",
     "CAVIIteration",
     "CAVIResult",
+    "ContactThresholdProfileResult",
     "DirichletNode",
     "DrivenRateMap",
     "DatasetInferenceResult",
@@ -42,5 +44,6 @@ __all__ = [
     "RcNode",
     "TransitionRate",
     "ViprodyneModel",
+    "profile_contact_threshold",
     "run_cavi",
 ]
