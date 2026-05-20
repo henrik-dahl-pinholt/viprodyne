@@ -34,6 +34,109 @@ def enumerate_binary_configurations(n_variables: int) -> jnp.ndarray:
 
 
 @jax.jit
+def bernoulli_transfer_log_likelihood(
+    observed: jnp.ndarray,
+    prior_probabilities: jnp.ndarray,
+    window_weights: jnp.ndarray,
+    observation_starts: jnp.ndarray,
+    noise_std: jnp.ndarray,
+    finite_mask: jnp.ndarray,
+) -> jnp.ndarray:
+    """Exact Bernoulli loading log likelihood by sliding-window transfer.
+
+    ``window_weights`` maps the active binary loading window to the MS2 signal.
+    ``observation_starts[t]`` is the loading-grid index of the first bit in the
+    window for observation ``t``. Starts must be monotone outside this JIT kernel.
+    """
+    observed = jnp.asarray(observed, dtype=jnp.float32)
+    prior = jnp.clip(jnp.asarray(prior_probabilities, dtype=jnp.float32), 1e-7, 1.0 - 1e-7)
+    window_weights = jnp.asarray(window_weights, dtype=jnp.float32)
+    starts = jnp.asarray(observation_starts, dtype=jnp.int32)
+    noise_by_observation = jnp.broadcast_to(
+        jnp.asarray(noise_std, dtype=jnp.float32),
+        observed.shape,
+    )
+    finite_mask = jnp.asarray(finite_mask, dtype=bool)
+
+    window_size = window_weights.shape[0]
+    n_states = 1 << window_size
+    bits = enumerate_binary_configurations(window_size)
+    emission_means = bits @ window_weights
+    shifts = starts - jnp.concatenate([starts[:1], starts[:-1]])
+    max_shift = jnp.max(shifts)
+
+    initial_window = jax.lax.dynamic_slice(prior, (starts[0],), (window_size,))
+    initial_logp = bits @ jnp.log(initial_window)
+    initial_logp = initial_logp + (1.0 - bits) @ jnp.log1p(-initial_window)
+    initial_logp = initial_logp - jax.scipy.special.logsumexp(initial_logp)
+    alpha = jnp.exp(initial_logp)
+
+    def append_state(alpha_t: jnp.ndarray, p_new: jnp.ndarray) -> jnp.ndarray:
+        if window_size == 1:
+            return jnp.asarray([1.0 - p_new, p_new], dtype=jnp.float32)
+        collapsed = alpha_t.reshape((2, 1 << (window_size - 1))).sum(axis=0)
+        return jnp.stack([collapsed * (1.0 - p_new), collapsed * p_new], axis=1).reshape(
+            (n_states,)
+        )
+
+    def step(carry, inputs):
+        alpha_t, loglik = carry
+        y_t, is_finite_t, shift_t, start_t, noise_t = inputs
+
+        def append_one(i, alpha_inner):
+            append_ind = start_t + window_size - shift_t + i
+            p_new = prior[append_ind]
+            return jax.lax.cond(
+                i < shift_t,
+                lambda a: append_state(a, p_new),
+                lambda a: a,
+                alpha_inner,
+            )
+
+        alpha_t = jax.lax.fori_loop(0, max_shift, append_one, alpha_t)
+        residual = y_t - emission_means
+        obs_logp = -0.5 * (
+            jnp.log(2.0 * jnp.pi * noise_t**2) + residual * residual / noise_t**2
+        )
+        joint_logp = jnp.log(jnp.maximum(alpha_t, jnp.finfo(jnp.float32).tiny)) + obs_logp
+        local_loglik = jax.scipy.special.logsumexp(joint_logp)
+        updated = jnp.exp(joint_logp - local_loglik)
+        alpha_t = jnp.where(is_finite_t, updated, alpha_t)
+        loglik = loglik + jnp.where(is_finite_t, local_loglik, 0.0)
+        return (alpha_t, loglik), None
+
+    (_, loglik), _ = jax.lax.scan(
+        step,
+        (alpha, jnp.asarray(0.0, dtype=jnp.float32)),
+        (observed, finite_mask, shifts, starts, noise_by_observation),
+    )
+    return loglik
+
+
+@jax.jit
+def bernoulli_transfer_log_likelihood_batch(
+    observed: jnp.ndarray,
+    prior_probabilities: jnp.ndarray,
+    window_weights: jnp.ndarray,
+    observation_starts: jnp.ndarray,
+    noise_std: jnp.ndarray,
+    finite_mask: jnp.ndarray,
+) -> jnp.ndarray:
+    """Batch ``bernoulli_transfer_log_likelihood`` over trajectories."""
+    return jax.vmap(
+        bernoulli_transfer_log_likelihood,
+        in_axes=(0, 0, None, None, 0, 0),
+    )(
+        observed,
+        prior_probabilities,
+        window_weights,
+        observation_starts,
+        noise_std,
+        finite_mask,
+    )
+
+
+@jax.jit
 def exact_bernoulli_posterior(
     observed: jnp.ndarray,
     prior_probabilities: jnp.ndarray,

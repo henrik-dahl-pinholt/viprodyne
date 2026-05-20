@@ -1,6 +1,8 @@
 """Core mathematical kernels used by viprodyne variational nodes."""
 
 from viprodyne.core.bernoulli_transfer_pol2 import (
+    bernoulli_transfer_log_likelihood,
+    bernoulli_transfer_log_likelihood_batch,
     build_ms2_design_matrix,
     enumerate_binary_configurations,
     exact_bernoulli_posterior,
@@ -45,6 +47,8 @@ __all__ = [
     "RateEdge",
     "TiltedCTMC",
     "TiltedCTMCSolution",
+    "bernoulli_transfer_log_likelihood",
+    "bernoulli_transfer_log_likelihood_batch",
     "build_ms2_design_matrix",
     "contact_survival_log_profile",
     "enumerate_binary_configurations",
