@@ -212,7 +212,10 @@ class DirichletNode(VariationalNode):
     def moments(self) -> MomentDict:
         if self.is_pinned:
             probs = np.asarray(self.pinned_value, dtype=FLOAT_DTYPE)
-            return {"mean": probs, "expected_log": np.log(probs).astype(FLOAT_DTYPE)}
+            expected_log = np.full_like(probs, -np.inf, dtype=FLOAT_DTYPE)
+            positive = probs > 0.0
+            expected_log[positive] = np.log(probs[positive]).astype(FLOAT_DTYPE)
+            return {"mean": probs, "expected_log": expected_log}
         concentration = np.asarray(self.concentration, dtype=FLOAT_DTYPE)
         total = np.sum(concentration, axis=-1, keepdims=True)
         expected_log = np.asarray(
