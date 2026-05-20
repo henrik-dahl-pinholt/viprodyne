@@ -7,6 +7,7 @@ from viprodyne.core.bernoulli_transfer_pol2 import (
     enumerate_binary_configurations,
     exact_bernoulli_posterior,
     mean_field_bernoulli_elbo,
+    mean_field_bernoulli_elbo_terms,
 )
 from viprodyne.core.contact_survival import (
     ContactSurvivalStats,
@@ -56,6 +57,7 @@ __all__ = [
     "fit_mean_field_bernoulli",
     "generate_ms2_signal",
     "mean_field_bernoulli_elbo",
+    "mean_field_bernoulli_elbo_terms",
     "mean_field_bernoulli_elbo_and_gradient",
     "mean_field_bernoulli_elbo_from_logits",
     "optimize_contact_survival_rate_map",

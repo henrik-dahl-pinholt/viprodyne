@@ -42,6 +42,11 @@ def analytic_independent_posterior(observed, prior, weight, noise):
     return np.exp(logp1 - logz).astype(np.float32), np.sum(logz, dtype=np.float32)
 
 
+def bernoulli_entropy(probabilities):
+    q = np.clip(np.asarray(probabilities, dtype=np.float32), 1e-7, 1.0 - 1e-7)
+    return -np.sum(q * np.log(q) + (1.0 - q) * np.log1p(-q))
+
+
 def test_observed_intensity_emits_float32_data_and_mask():
     node = ObservedIntensity(
         name="I",
@@ -254,6 +259,40 @@ def test_polymerase_loadings_exact_and_mean_field_match_independent_theory():
         rtol=5e-5,
         atol=2e-5,
     )
+    expected_entropy = bernoulli_entropy(expected_posterior)
+    assert exact.entropy() == pytest.approx(float(expected_entropy), rel=1e-6)
+    assert mean_field.entropy() == pytest.approx(float(expected_entropy), rel=5e-5)
+    assert exact.moments()["entropy"].dtype == np.float32
+    assert mean_field.moments()["entropy"].dtype == np.float32
+    assert "load_probabilities" not in transfer.moments()
+    with pytest.raises(NotImplementedError, match="entropy"):
+        transfer.entropy()
     assert exact.elbo_contribution() == pytest.approx(float(expected_logz), rel=1e-6)
     assert mean_field.elbo_contribution() == pytest.approx(float(expected_logz), rel=5e-6)
     assert transfer.elbo_contribution() == pytest.approx(float(expected_logz), rel=1e-6)
+
+
+def test_exact_polymerase_entropy_matches_log_partition_identity():
+    observed = np.array([1.1], dtype=np.float32)
+    prior = np.array([0.35, 0.65], dtype=np.float32)
+    design = np.array([[1.0, 0.7]], dtype=np.float32)
+    noise = np.float32(0.5)
+    node = PolymeraseLoadings(
+        name="tau_exact_interacting",
+        observed=observed,
+        prior_probabilities=prior,
+        design_matrix=design,
+        noise_std=noise,
+        mode="exact",
+    )
+    configs = np.array([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]], dtype=np.float32)
+    means = configs @ design[0]
+    log_prior = configs @ np.log(prior) + (1.0 - configs) @ np.log1p(-prior)
+    log_likelihood = -0.5 * (
+        np.log(np.float32(2.0 * np.pi) * noise**2) + (observed[0] - means) ** 2 / noise**2
+    )
+    log_psi = log_prior + log_likelihood
+    weights = np.asarray(node.posterior_probabilities, dtype=np.float32)
+    entropy_from_logz = float(node.elbo_contribution() - np.sum(weights * log_psi))
+
+    assert node.entropy() == pytest.approx(entropy_from_logz, rel=2e-6)

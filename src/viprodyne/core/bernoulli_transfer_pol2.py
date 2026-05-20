@@ -197,21 +197,27 @@ def exact_bernoulli_posterior(
 
 
 @jax.jit
-def mean_field_bernoulli_elbo(
+def mean_field_bernoulli_elbo_terms(
     load_probabilities: jnp.ndarray,
     observed: jnp.ndarray,
     prior_probabilities: jnp.ndarray,
     design_matrix: jnp.ndarray,
     noise_std: jnp.ndarray,
     finite_mask: jnp.ndarray,
-) -> jnp.ndarray:
-    """Independent-Bernoulli variational ELBO for one trajectory."""
+    prior_mask: jnp.ndarray,
+) -> dict[str, jnp.ndarray]:
+    """Independent-Bernoulli Pol2 ELBO terms.
+
+    This follows the legacy MS2Posterior convention:
+    ``data + variance + normalization + prior + entropy``.
+    """
     q = jnp.clip(jnp.asarray(load_probabilities, dtype=jnp.float32), 1e-7, 1.0 - 1e-7)
     observed = jnp.asarray(observed, dtype=jnp.float32)
     prior = jnp.clip(jnp.asarray(prior_probabilities, dtype=jnp.float32), 1e-7, 1.0 - 1e-7)
     design_matrix = jnp.asarray(design_matrix, dtype=jnp.float32)
     noise_std = jnp.asarray(noise_std, dtype=jnp.float32)
     finite_mask = jnp.asarray(finite_mask, dtype=bool)
+    prior_mask = jnp.asarray(prior_mask, dtype=bool)
     safe_observed = jnp.where(finite_mask, observed, 0.0)
 
     mean_signal = jnp.matmul(design_matrix, q, precision=MATMUL_PRECISION)
@@ -221,11 +227,44 @@ def mean_field_bernoulli_elbo(
         precision=MATMUL_PRECISION,
     )
     residual = safe_observed - mean_signal
-    obs_terms = -0.5 * (
-        jnp.log(2.0 * jnp.pi * noise_std**2)
-        + (residual * residual + variance_signal) / noise_std**2
+    data_terms = -0.5 * residual * residual / noise_std**2
+    variance_terms = -0.5 * variance_signal / noise_std**2
+    normalization_terms = -0.5 * jnp.log(2.0 * jnp.pi * noise_std**2)
+    data_term = jnp.sum(jnp.where(finite_mask, data_terms, 0.0))
+    variance_term = jnp.sum(jnp.where(finite_mask, variance_terms, 0.0))
+    normalization_term = jnp.sum(jnp.where(finite_mask, normalization_terms, 0.0))
+    prior_contrib = q * jnp.log(prior) + (1.0 - q) * jnp.log1p(-prior)
+    prior_term = jnp.sum(jnp.where(prior_mask, prior_contrib, 0.0))
+    entropy_contrib = -(q * jnp.log(q) + (1.0 - q) * jnp.log1p(-q))
+    entropy = jnp.sum(jnp.where(prior_mask, entropy_contrib, 0.0))
+    total = data_term + variance_term + normalization_term + prior_term + entropy
+    return {
+        "data": data_term,
+        "variance": variance_term,
+        "normalization": normalization_term,
+        "prior": prior_term,
+        "entropy": entropy,
+        "total": total,
+    }
+
+
+@jax.jit
+def mean_field_bernoulli_elbo(
+    load_probabilities: jnp.ndarray,
+    observed: jnp.ndarray,
+    prior_probabilities: jnp.ndarray,
+    design_matrix: jnp.ndarray,
+    noise_std: jnp.ndarray,
+    finite_mask: jnp.ndarray,
+) -> jnp.ndarray:
+    """Independent-Bernoulli variational ELBO for one trajectory."""
+    terms = mean_field_bernoulli_elbo_terms(
+        load_probabilities,
+        observed,
+        prior_probabilities,
+        design_matrix,
+        noise_std,
+        finite_mask,
+        jnp.ones_like(load_probabilities, dtype=bool),
     )
-    obs_term = jnp.sum(jnp.where(finite_mask, obs_terms, 0.0))
-    prior_term = jnp.sum(q * jnp.log(prior) + (1.0 - q) * jnp.log1p(-prior))
-    entropy = -jnp.sum(q * jnp.log(q) + (1.0 - q) * jnp.log1p(-q))
-    return obs_term + prior_term + entropy
+    return terms["total"]

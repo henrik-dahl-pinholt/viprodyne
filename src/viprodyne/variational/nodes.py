@@ -326,6 +326,9 @@ class PolymeraseLoadings(VariationalNode):
     load_probabilities: np.ndarray | None = field(default=None, init=False)
     predicted_signal: np.ndarray | None = field(default=None, init=False)
     objective_value: np.float32 = field(default=np.float32(0.0), init=False)
+    entropy_value: np.float32 | None = field(default=None, init=False)
+    posterior_probabilities: np.ndarray | None = field(default=None, init=False)
+    configurations: np.ndarray | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         VariationalNode.__init__(self, self.name)
@@ -366,24 +369,41 @@ class PolymeraseLoadings(VariationalNode):
 
     def moments(self) -> MomentDict:
         moments: MomentDict = {
-            "load_probabilities": np.asarray(self.load_probabilities, dtype=FLOAT_DTYPE),
             "elbo": np.asarray(self.objective_value, dtype=FLOAT_DTYPE),
+            "local_elbo": np.asarray(self.objective_value, dtype=FLOAT_DTYPE),
         }
+        if self.load_probabilities is not None:
+            moments["load_probabilities"] = np.asarray(self.load_probabilities, dtype=FLOAT_DTYPE)
         if self.predicted_signal is not None:
             moments["predicted_signal"] = np.asarray(self.predicted_signal, dtype=FLOAT_DTYPE)
+        if self.entropy_value is not None:
+            moments["entropy"] = np.asarray(self.entropy_value, dtype=FLOAT_DTYPE)
+        if self.mode in {"exact", "transfer"}:
+            moments["log_partition"] = np.asarray(self.objective_value, dtype=FLOAT_DTYPE)
         return moments
 
     def entropy(self) -> float:
-        if self.load_probabilities is None:
-            return 0.0
-        q = np.clip(np.asarray(self.load_probabilities, dtype=FLOAT_DTYPE), 1e-7, 1.0 - 1e-7)
-        return float(-np.sum(q * np.log(q) + (1.0 - q) * np.log1p(-q)))
+        if self.entropy_value is None:
+            raise NotImplementedError(
+                "Pol2 loading entropy is not available for this mode without posterior "
+                "sufficient statistics."
+            )
+        return float(self.entropy_value)
 
     def elbo_contribution(self) -> float:
         return float(self.objective_value)
 
     def sample(self, rng: np.random.Generator | None = None, size=None):
         rng = np.random.default_rng() if rng is None else rng
+        if self.posterior_probabilities is not None and self.configurations is not None:
+            indices = rng.choice(
+                self.posterior_probabilities.size,
+                size=size,
+                p=self.posterior_probabilities,
+            )
+            return self.configurations[indices].astype(np.int32)
+        if self.load_probabilities is None:
+            raise NotImplementedError("Pol2 loading samples require posterior probabilities.")
         probabilities = np.asarray(self.load_probabilities, dtype=FLOAT_DTYPE)
         sample_size = probabilities.shape if size is None else (size,) + probabilities.shape
         return rng.binomial(1, probabilities, size=sample_size).astype(np.int32)
@@ -392,7 +412,7 @@ class PolymeraseLoadings(VariationalNode):
         if self.design_matrix is None:
             raise ValueError("design_matrix is required for exact Pol2 loading updates.")
         configurations = enumerate_binary_configurations(self.prior_probabilities.size)
-        log_z, marginals, _, predicted, _ = exact_bernoulli_posterior(
+        log_z, marginals, _, predicted, posterior_probabilities = exact_bernoulli_posterior(
             jnp.asarray(self.observed),
             jnp.asarray(self.prior_probabilities),
             jnp.asarray(self.design_matrix),
@@ -403,6 +423,12 @@ class PolymeraseLoadings(VariationalNode):
         self.objective_value = np.asarray(log_z, dtype=FLOAT_DTYPE)
         self.load_probabilities = np.asarray(marginals, dtype=FLOAT_DTYPE)
         self.predicted_signal = np.asarray(predicted, dtype=FLOAT_DTYPE)
+        self.posterior_probabilities = np.asarray(posterior_probabilities, dtype=FLOAT_DTYPE)
+        self.configurations = np.asarray(configurations, dtype=FLOAT_DTYPE)
+        self.entropy_value = np.asarray(
+            _categorical_entropy(self.posterior_probabilities),
+            dtype=FLOAT_DTYPE,
+        )
 
     def _update_transfer(self) -> None:
         if self.window_weights is None or self.observation_starts is None:
@@ -416,8 +442,11 @@ class PolymeraseLoadings(VariationalNode):
             jnp.asarray(self.finite_mask),
         )
         self.objective_value = np.asarray(log_z, dtype=FLOAT_DTYPE)
-        self.load_probabilities = self.prior_probabilities.copy()
+        self.load_probabilities = None
         self.predicted_signal = None
+        self.posterior_probabilities = None
+        self.configurations = None
+        self.entropy_value = None
 
     def _update_mean_field(self) -> None:
         if self.design_matrix is None:
@@ -432,6 +461,12 @@ class PolymeraseLoadings(VariationalNode):
         self.load_probabilities = result.load_probabilities
         self.predicted_signal = result.predicted_signal
         self.objective_value = np.asarray(result.elbo, dtype=FLOAT_DTYPE)
+        self.posterior_probabilities = None
+        self.configurations = None
+        self.entropy_value = np.asarray(
+            _bernoulli_entropy(self.load_probabilities),
+            dtype=FLOAT_DTYPE,
+        )
 
 
 @dataclass
@@ -583,3 +618,14 @@ def _deterministic_sample(value: np.ndarray, size=None) -> np.ndarray:
         return value.copy()
     size = (size,) if isinstance(size, int) else tuple(size)
     return np.broadcast_to(value, size + value.shape).astype(FLOAT_DTYPE, copy=True)
+
+
+def _bernoulli_entropy(probabilities: np.ndarray) -> np.float32:
+    q = np.clip(np.asarray(probabilities, dtype=FLOAT_DTYPE), 1e-7, 1.0 - 1e-7)
+    return np.asarray(-np.sum(q * np.log(q) + (1.0 - q) * np.log1p(-q)), dtype=FLOAT_DTYPE)
+
+
+def _categorical_entropy(probabilities: np.ndarray) -> np.float32:
+    p = np.asarray(probabilities, dtype=FLOAT_DTYPE)
+    positive = p > 0.0
+    return np.asarray(-np.sum(p[positive] * np.log(p[positive])), dtype=FLOAT_DTYPE)

@@ -11,6 +11,7 @@ from viprodyne.core.bernoulli_transfer_pol2 import (
     enumerate_binary_configurations,
     exact_bernoulli_posterior,
     mean_field_bernoulli_elbo,
+    mean_field_bernoulli_elbo_terms,
 )
 from viprodyne.core.mf_pol2_finder import fit_mean_field_bernoulli
 
@@ -206,6 +207,75 @@ def test_missing_observations_do_not_create_nan_values_or_gradients():
 
     assert jnp.isfinite(log_likelihood)
     assert jnp.all(jnp.isfinite(transfer_gradient))
+
+
+def test_mean_field_elbo_terms_match_legacy_ms2posterior_fixture():
+    # Generated from /net/levsha/share/hdp/git_reps/MS2Posterior/MF_Pol2_finder.py
+    # using its ELBO term convention with jax_enable_x64=False.
+    q = jnp.asarray([0.2, 0.55, 0.7, 0.35, 0.8], dtype=jnp.float32)
+    observed = jnp.asarray([0.4, jnp.nan, 1.3], dtype=jnp.float32)
+    finite_mask = jnp.asarray([True, False, True])
+    prior = jnp.asarray([0.3, 0.5, 0.4, 0.65, 0.25], dtype=jnp.float32)
+    prior_mask = jnp.asarray([True, True, True, True, True])
+    ms2_int = np.float32(1.7)
+    kgrid = np.array([0.8, 0.2], dtype=np.float32)
+    j0 = np.array([0, 1, 2], dtype=np.int32)
+    design = np.zeros((3, 5), dtype=np.float32)
+    for row, start in enumerate(j0):
+        design[row, start : start + kgrid.size] = ms2_int * kgrid
+
+    terms = mean_field_bernoulli_elbo_terms(
+        q,
+        observed,
+        prior,
+        jnp.asarray(design),
+        jnp.asarray(0.6, dtype=jnp.float32),
+        finite_mask,
+        prior_mask,
+    )
+
+    expected = {
+        "data": -0.0776694193482399,
+        "variance": -1.0267529487609863,
+        "normalization": -0.8162258863449097,
+        "prior": -4.013663291931152,
+        "entropy": 2.9472544193267822,
+        "total": -2.987056255340576,
+    }
+    for key, value in expected.items():
+        assert terms[key].dtype == jnp.float32
+        assert float(terms[key]) == pytest.approx(value, rel=2e-6, abs=2e-6)
+
+    collapsed = mean_field_bernoulli_elbo(
+        q,
+        observed,
+        prior,
+        jnp.asarray(design),
+        jnp.asarray(0.6, dtype=jnp.float32),
+        finite_mask,
+    )
+    assert float(collapsed) == pytest.approx(expected["total"], rel=2e-6, abs=2e-6)
+
+
+def test_mean_field_prior_mask_matches_legacy_ms2posterior_fixture():
+    q = jnp.asarray([0.5, 0.6, 0.7], dtype=jnp.float32)
+    prior = jnp.asarray([0.2, 0.3, 0.4], dtype=jnp.float32)
+    terms = mean_field_bernoulli_elbo_terms(
+        q,
+        jnp.asarray([jnp.nan], dtype=jnp.float32),
+        prior,
+        jnp.ones((1, 3), dtype=jnp.float32),
+        jnp.asarray(1.0, dtype=jnp.float32),
+        jnp.asarray([False]),
+        jnp.asarray([True, False, True]),
+    )
+    # Same case as old MS2Posterior test_pol2_prior_mask_excludes_invalid_elbo_terms.
+    expected = -0.40693044662475586
+
+    assert float(terms["data"]) == 0.0
+    assert float(terms["variance"]) == 0.0
+    assert float(terms["normalization"]) == 0.0
+    assert float(terms["total"]) == pytest.approx(expected, rel=2e-6, abs=2e-6)
 
 
 def test_transfer_log_likelihood_matches_exact_contiguous_windows():
