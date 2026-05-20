@@ -33,22 +33,26 @@ Q_tilde + diag(potential)
 where `Q_tilde` carries jump log-rates through its off-diagonal entries and the
 diagonal potential carries local Feynman-Kac corrections.
 
-`viprodyne.core.bernoulli_transfer_pol2` contains the Pol2 loading kernels:
+`viprodyne.core.bernoulli_transfer_pol2` contains the fixed-grid Bernoulli Pol2
+loading kernels:
 
 - `mean_field_bernoulli_elbo_terms` and `mean_field_bernoulli_elbo` implement
   the legacy MS2Posterior ELBO term convention.
 - `exact_bernoulli_posterior` enumerates all binary loading configurations for
   small systems and tests.
-- `bernoulli_transfer_log_likelihood` computes exact loading log evidence with
-  a sliding-window transfer algorithm.
+- `bernoulli_transfer_log_likelihood` computes exact loading log evidence with a
+  sliding-window transfer algorithm and does not materialize a dense
+  observation-by-loading matrix.
+- `bernoulli_transfer_log_likelihood_batch` vmaps that exact transfer pass over
+  independent trajectories for large same-grid trace sets.
 - `bernoulli_transfer_posterior` computes exact transfer marginals and entropy
   from `log_Z` derivative identities. It avoids a materialized joint posterior,
   but it is more expensive than the log-likelihood-only transfer pass.
 
 `viprodyne.core.pol2_sampler` contains the continuous-time reversible-jump Pol2
-loading sampler and thermodynamic-integration log-partition estimator. This is
-the sampler-style backend for continuous loading events rather than binary
-loading variables on a fixed observation grid.
+loading sampler and thermodynamic-integration log-partition estimator. The core
+module is implemented and tested; it is not yet exposed as a
+`PolymeraseLoadings` node mode in the graph builder.
 
 The dense `design_matrix` representation is the linear map from loading
 variables to expected MS2 intensity, `I_mean = design_matrix @ tau`. It is useful
@@ -97,7 +101,8 @@ Domain nodes:
 - `ObservedIntensity`: deterministic observed MS2 intensity node.
 - `PromoterState`: tilted CTMC node for `q(s_t)`.
 - `PolymeraseLoadings`: Pol2 loading node with `mean_field`, `exact`, and
-  `transfer` modes.
+  `transfer` modes. `mean_field` and `exact` use a dense `design_matrix`.
+  `transfer` uses `window_weights` and `observation_starts`.
 
 Pinned parameter nodes emit deterministic moments and have zero entropy.
 
@@ -111,6 +116,11 @@ P(tau_i = 1) = sum_s q_i(s) * (1 - exp(-E[r_s] * dt_i))
 
 The initial value inside the node is only a placeholder until graph messages
 from `PromoterState` and `LoadingRate` are available.
+
+Current limitation: the `PolymeraseLoadings` graph node assumes one trajectory
+plate at a time. Batched transfer likelihoods exist at the core-kernel level,
+but batched/plated loading-rate priors and sampler-mode graph integration still
+need explicit node-level interfaces.
 
 ## Promoter-State Construction
 
@@ -141,8 +151,18 @@ transition.
 
 ## Top-Level Model Builder
 
-Create one `MS2Dataset` per dataset plate and pass them to `ViprodyneModel`
-with a `ModelConfig`.
+Create one `MS2Dataset` per dataset plate and pass them to `ViprodyneModel` with
+a `ModelConfig`.
+
+`MS2Dataset` contains observed intensities, noise, optional per-dataset
+`time_grid`, optional missing-data mask, and one Pol2 observation representation:
+
+- transfer representation: `window_weights` plus `observation_starts`;
+- dense representation: `design_matrix`, intended for tests and small generic
+  mean-field/exact cases.
+
+`MS2Dataset` does not contain `prior_load_probabilities`. In model-built graphs,
+those are derived from `PromoterState` and `LoadingRate` parents.
 
 ```python
 import numpy as np
@@ -153,26 +173,56 @@ dataset = MS2Dataset(
     name="condition_0",
     observed=np.array([0.1, np.nan, 0.8], dtype=np.float32),
     noise_std=np.float32(0.5),
-    design_matrix=np.eye(3, dtype=np.float32),
+    time_grid=np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
+    window_weights=np.array([1.0], dtype=np.float32),
+    observation_starts=np.array([0, 1, 2], dtype=np.int32),
 )
 
 model = ViprodyneModel(
     datasets=(dataset,),
     config=ModelConfig(
         n_states=2,
-        time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
         shared_transition_rates=False,
         shared_loading_rates=False,
+        pol2_mode="auto",
     ),
 )
 
 model.run_schedule(model.default_schedule())
-posterior_state = model.graph.moments.get("condition_0:s")["posterior"]
+state_posterior = model.graph.moments.get("condition_0:s")["posterior"]
+loading_posterior = model.graph.moments.get("condition_0:tau")["load_probabilities"]
 ```
 
 Datasets can either inherit `ModelConfig.time_grid` or provide their own
 `MS2Dataset.time_grid`. Per-dataset grids are the right representation when
 conditions have different frame timing or different trace lengths.
+
+`ModelConfig.pol2_mode="auto"` chooses `transfer` when transfer-window inputs
+are present and falls back to `mean_field` when only a dense `design_matrix` is
+provided. `pol2_mode="transfer"` also falls back to `mean_field` if transfer
+inputs are absent.
+
+Example with heterogeneous grids:
+
+```python
+d0 = MS2Dataset(
+    name="d0",
+    observed=np.array([0.1, 0.8], dtype=np.float32),
+    noise_std=np.float32(0.5),
+    time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+    window_weights=np.array([1.0], dtype=np.float32),
+    observation_starts=np.array([0, 1], dtype=np.int32),
+)
+d1 = MS2Dataset(
+    name="d1",
+    observed=np.array([0.2, 0.5, 0.9], dtype=np.float32),
+    noise_std=np.float32(0.5),
+    time_grid=np.array([0.0, 0.25, 0.75, 1.5], dtype=np.float32),
+    window_weights=np.array([1.0], dtype=np.float32),
+    observation_starts=np.array([0, 1, 2], dtype=np.int32),
+)
+model = ViprodyneModel(datasets=(d0, d1), config=ModelConfig(n_states=2))
+```
 
 Driven transitions are selected by transition index. For a two-state model,
 index `1` is `0 -> 1`.
@@ -182,6 +232,7 @@ dataset = MS2Dataset(
     name="condition_0",
     observed=np.array([0.1, 0.8], dtype=np.float32),
     noise_std=np.float32(0.5),
+    time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
     contact_probability=np.array([0.25, 0.75], dtype=np.float32),
 )
 
@@ -189,7 +240,6 @@ model = ViprodyneModel(
     datasets=(dataset,),
     config=ModelConfig(
         n_states=2,
-        time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
         driven_transition_indices=(1,),
         driven_rate_initial=np.float32(0.8),
         driven_rate_bounds=(1e-4, 10.0),
@@ -200,6 +250,19 @@ model = ViprodyneModel(
 Shared rate nodes are enabled with `shared_transition_rates=True` or
 `shared_loading_rates=True`. Driven transition rates can be shared across
 datasets while the contact-drive node remains per dataset.
+
+## Current Gaps
+
+- The continuous Pol2 sampler is implemented as a core kernel, but it still needs
+  a `PolymeraseLoadings(mode="sampler")` adapter and model-builder inputs for
+  `fine_grid`, sampler iterations, repeats, and thermodynamic-integration
+  settings.
+- Dense mean-field/exact Pol2 modes remain available, but should not be used for
+  large regular MS2 traces because `design_matrix` memory scales as
+  `O(n_observations * n_loadings)`.
+- Driven `RcNode` currently supports pinned contact probabilities or an injected
+  objective function. Full profile-likelihood rc updates from GPR/contact data
+  still need a production data adapter.
 
 ## Verification Strategy
 
