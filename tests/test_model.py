@@ -13,6 +13,15 @@ def make_dataset(name, offset=0.0):
     )
 
 
+def variational_load_prior(state_probabilities, log_load_by_state, no_load_by_state):
+    expected_log_load = np.sum(state_probabilities * log_load_by_state, axis=-1)
+    expected_log_no_load = np.sum(state_probabilities * no_load_by_state, axis=-1)
+    max_log = np.maximum(expected_log_load, expected_log_no_load)
+    load_weight = np.exp(expected_log_load - max_log)
+    no_load_weight = np.exp(expected_log_no_load - max_log)
+    return (load_weight / (load_weight + no_load_weight)).astype(np.float32)
+
+
 def test_model_builds_dataset_plates_with_shared_parameter_nodes():
     model = ViprodyneModel(
         datasets=(make_dataset("d0"), make_dataset("d1", offset=0.2)),
@@ -405,9 +414,12 @@ def test_model_derives_pol2_prior_from_promoter_and_loading_rates():
         ],
         dtype=np.float32,
     )
-    expected_prior = np.sum(
-        state_probabilities * (1.0 - np.exp(-dt[:, None] * loading_rates[None, :])),
-        axis=-1,
+    log_load_by_state = np.log(-np.expm1(-dt[:, None] * loading_rates[None, :]))
+    log_no_load_by_state = -dt[:, None] * loading_rates[None, :]
+    expected_prior = variational_load_prior(
+        state_probabilities,
+        log_load_by_state,
+        log_no_load_by_state,
     )
     polymerase = model.graph.nodes["d0:tau"]
 
@@ -432,12 +444,26 @@ def test_model_derives_pol2_prior_from_gamma_rate_laplace_moments():
     promoter_moments = model.graph.moments.get("d0:s")
     state_probabilities = promoter_moments["interval_state_probabilities"][0]
     dt = promoter_moments["interval_durations"]
-    p0 = 1.0 - np.exp(-np.float32(0.5) * dt)
-    p1 = 1.0 - (np.float32(3.0) / (np.float32(3.0) + dt)) ** np.float32(2.0)
-    expected = np.sum(
-        state_probabilities * np.stack([p0, p1], axis=-1),
+    log_load0 = np.log(-np.expm1(-np.float32(0.5) * dt))
+    terms = np.arange(1, 257, dtype=np.float32)
+    log_load1 = -np.sum(
+        (np.float32(3.0) / (np.float32(3.0) + terms[:, None] * dt[None, :]))
+        ** np.float32(2.0)
+        / terms[:, None],
+        axis=0,
+    )
+    log_load_by_state = np.stack([log_load0, log_load1], axis=-1)
+    log_no_load_by_state = np.stack(
+        [
+            -np.float32(0.5) * dt,
+            -(np.float32(2.0) / np.float32(3.0)) * dt,
+        ],
         axis=-1,
-        dtype=np.float32,
+    )
+    expected = variational_load_prior(
+        state_probabilities,
+        log_load_by_state,
+        log_no_load_by_state,
     )
     polymerase = model.graph.nodes["d0:tau"]
 

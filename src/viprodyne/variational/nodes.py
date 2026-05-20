@@ -39,9 +39,9 @@ class _LoadingPriorStats:
     probabilities: np.ndarray
     rate_names: tuple[str, ...]
     rate_means: np.ndarray
+    rate_intensity: np.ndarray
     state_probabilities: np.ndarray
     interval_durations: np.ndarray
-    per_state_load_probabilities: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -259,6 +259,12 @@ class PromoterState(VariationalNode):
     tilted_generator: np.ndarray | None = field(default=None, init=False)
     tilt_potentials: np.ndarray | None = field(default=None, init=False)
     drive_probabilities: dict[str, np.ndarray] = field(default_factory=dict, init=False)
+    initial_log_normalizer: np.ndarray = field(
+        default_factory=lambda: np.asarray(0.0, dtype=FLOAT_DTYPE),
+        init=False,
+    )
+    child_tilt_potentials: np.ndarray | None = field(default=None, init=False)
+    elbo_value: np.float32 = field(default=np.float32(0.0), init=False)
 
     def __post_init__(self) -> None:
         VariationalNode.__init__(self, self.name)
@@ -283,6 +289,10 @@ class PromoterState(VariationalNode):
             blanket_moments=context.blanket_moments(),
             time_grid=self.time_grid,
             n_states=self.n_states,
+        )
+        self.child_tilt_potentials = None if child_potentials is None else np.asarray(
+            child_potentials,
+            dtype=FLOAT_DTYPE,
         )
         if child_potentials is not None:
             potentials = _add_user_potentials(potentials, child_potentials)
@@ -325,10 +335,21 @@ class PromoterState(VariationalNode):
         stats_by_rate = self._contact_survival_stats(occupancy, jumps)
         if stats_by_rate:
             moments["contact_survival_stats_by_rate"] = stats_by_rate
+        self.elbo_value = _promoter_path_entropy_contribution(
+            solution=self.solution,
+            occupancy=occupancy,
+            initial_log_normalizer=self.initial_log_normalizer,
+            child_potentials=self.child_tilt_potentials,
+        )
+        moments["elbo"] = np.asarray(self.elbo_value, dtype=FLOAT_DTYPE)
+        moments["local_elbo"] = np.asarray(self.elbo_value, dtype=FLOAT_DTYPE)
         return moments
 
     def entropy(self) -> float:
         return 0.0
+
+    def elbo_contribution(self) -> float:
+        return float(self.elbo_value)
 
     def sample(self, rng: np.random.Generator | None = None, size=None):
         if self.solution is None:
@@ -341,16 +362,26 @@ class PromoterState(VariationalNode):
 
     def _initial_probabilities_from_parents(self, parent_moments: dict[str, MomentDict]) -> np.ndarray:
         if self.initial_probability_node is None:
+            self.initial_log_normalizer = np.asarray(0.0, dtype=FLOAT_DTYPE)
             return np.asarray(self.initial_probabilities, dtype=FLOAT_DTYPE)
         try:
-            return np.asarray(
-                parent_moments[self.initial_probability_node]["mean"],
-                dtype=FLOAT_DTYPE,
-            )
+            moments = parent_moments[self.initial_probability_node]
         except KeyError as exc:
             raise KeyError(
                 f"initial_probability_node {self.initial_probability_node!r} is not a parent."
             ) from exc
+        if "expected_log" not in moments:
+            self.initial_log_normalizer = np.asarray(0.0, dtype=FLOAT_DTYPE)
+            return np.asarray(moments["mean"], dtype=FLOAT_DTYPE)
+        expected_log = np.asarray(moments["expected_log"], dtype=FLOAT_DTYPE)
+        max_log = np.max(expected_log, axis=-1, keepdims=True)
+        weights = np.exp(expected_log - max_log).astype(FLOAT_DTYPE)
+        normalizer = np.sum(weights, axis=-1, keepdims=True, dtype=FLOAT_DTYPE)
+        self.initial_log_normalizer = np.squeeze(
+            max_log + np.log(normalizer).astype(FLOAT_DTYPE),
+            axis=-1,
+        ).astype(FLOAT_DTYPE)
+        return (weights / normalizer).astype(FLOAT_DTYPE)
 
     def _generator_and_potentials_from_parent_rates(
         self,
@@ -795,26 +826,8 @@ class PolymeraseLoadings(VariationalNode):
             self.loading_exposure_by_rate = {}
             return
         load_counts = np.asarray(counts_source, dtype=FLOAT_DTYPE)
-        if self.expected_loading_counts is not None:
-            intensity = (
-                prior_stats.state_probabilities
-                * np.asarray(prior_stats.rate_means, dtype=FLOAT_DTYPE)[..., None, :]
-            )
-            total_intensity = np.clip(
-                np.sum(intensity, axis=-1, keepdims=True, dtype=FLOAT_DTYPE),
-                1e-7,
-                None,
-            )
-            responsibilities = intensity / total_intensity
-        else:
-            prior = np.clip(prior_stats.probabilities, 1e-7, 1.0).astype(FLOAT_DTYPE)
-            responsibilities = (
-                prior_stats.state_probabilities
-                * prior_stats.per_state_load_probabilities
-                / prior[..., :, None]
-            )
         counts_by_state = np.sum(
-            load_counts[..., :, None] * responsibilities,
+            load_counts[..., :, None] * prior_stats.state_probabilities,
             axis=-2,
             dtype=FLOAT_DTYPE,
         )
@@ -955,22 +968,39 @@ def _load_prior_stats_from_parents(
         raise ValueError("promoter interval grid is shorter than the Pol2 loading grid.")
     state_probabilities = state_probabilities[..., :n_loadings, :]
     interval_durations = interval_durations[:n_loadings]
-    per_state_load_probability = _expected_load_probability(
+    per_state_log_load_probability = _expected_log_load_probability(
         loading_rate_moments,
         interval_durations,
     )
-    probabilities = np.sum(
-        state_probabilities * per_state_load_probability,
+    per_state_log_no_load_probability = _expected_log_no_load_probability(
+        loading_rate_moments,
+        interval_durations,
+    )
+    expected_log_load = np.sum(
+        state_probabilities * per_state_log_load_probability,
         axis=-1,
         dtype=FLOAT_DTYPE,
     )
+    expected_log_no_load = np.sum(
+        state_probabilities * per_state_log_no_load_probability,
+        axis=-1,
+        dtype=FLOAT_DTYPE,
+    )
+    expected_rate_logs = loading_rate_moments.expected_logs
+    if expected_rate_logs is None:
+        expected_rate_logs = np.log(np.clip(loading_rate_moments.means, 1e-20, None))
+    rate_intensity = _expected_loading_intensity_from_state_logs(
+        state_probabilities,
+        expected_rate_logs,
+    )
+    probabilities = _load_probability_from_log_terms(expected_log_load, expected_log_no_load)
     return _LoadingPriorStats(
         probabilities=np.clip(probabilities, 1e-7, 1.0 - 1e-7).astype(FLOAT_DTYPE),
         rate_names=loading_rate_moments.names,
         rate_means=loading_rate_moments.means.astype(FLOAT_DTYPE),
+        rate_intensity=rate_intensity.astype(FLOAT_DTYPE),
         state_probabilities=state_probabilities.astype(FLOAT_DTYPE),
         interval_durations=interval_durations.astype(FLOAT_DTYPE),
-        per_state_load_probabilities=per_state_load_probability.astype(FLOAT_DTYPE),
     )
 
 
@@ -1066,32 +1096,61 @@ def _state_loading_rate_moments_from_moments(
 
 
 def _loading_intensity_from_prior_stats(prior_stats: _LoadingPriorStats) -> np.ndarray:
-    intensity = np.sum(
-        prior_stats.state_probabilities * prior_stats.rate_means[..., None, :],
-        axis=-1,
-        dtype=FLOAT_DTYPE,
-    )
-    return np.clip(intensity, 0.0, None).astype(FLOAT_DTYPE)
+    return np.clip(prior_stats.rate_intensity, 0.0, None).astype(FLOAT_DTYPE)
 
 
-def _expected_load_probability(
+def _expected_loading_intensity_from_state_logs(
+    state_probabilities: np.ndarray,
+    expected_rate_logs: np.ndarray,
+) -> np.ndarray:
+    states = np.asarray(state_probabilities, dtype=FLOAT_DTYPE)
+    logs = np.asarray(expected_rate_logs, dtype=FLOAT_DTYPE)
+    batch_shape = np.broadcast_shapes(states.shape[:-2], logs.shape[:-1])
+    states = np.broadcast_to(states, batch_shape + states.shape[-2:]).astype(FLOAT_DTYPE)
+    logs = np.broadcast_to(logs, batch_shape + logs.shape[-1:]).astype(FLOAT_DTYPE)
+    expected_log_rate = np.sum(states * logs[..., None, :], axis=-1, dtype=FLOAT_DTYPE)
+    return np.exp(expected_log_rate).astype(FLOAT_DTYPE)
+
+
+def _expected_log_no_load_probability(
     loading_rate_moments: _LoadingRateMoments,
     interval_durations: np.ndarray,
 ) -> np.ndarray:
     dt = np.asarray(interval_durations, dtype=FLOAT_DTYPE)
     means = np.asarray(loading_rate_moments.means, dtype=FLOAT_DTYPE)
     dt_view = dt.reshape((1,) * (means.ndim - 1) + (dt.size, 1))
-    probability = 1.0 - np.exp(-dt_view * means[..., None, :])
-    if loading_rate_moments.shapes is not None and loading_rate_moments.rates is not None:
-        shapes = np.asarray(loading_rate_moments.shapes, dtype=FLOAT_DTYPE)
-        rates = np.asarray(loading_rate_moments.rates, dtype=FLOAT_DTYPE)
-        survival = (rates[..., None, :] / (rates[..., None, :] + dt_view)) ** shapes[
-            ..., None, :
-        ]
-        gamma_probability = 1.0 - survival
-        gamma_mask = np.asarray(loading_rate_moments.gamma_mask, dtype=bool)
-        probability = np.where(gamma_mask.reshape((1,) * (probability.ndim - 1) + (-1,)), gamma_probability, probability)
-    return np.clip(probability, 1e-7, 1.0 - 1e-7).astype(FLOAT_DTYPE)
+    return (-dt_view * means[..., None, :]).astype(FLOAT_DTYPE)
+
+
+def _load_probability_from_log_terms(
+    expected_log_load: np.ndarray,
+    expected_log_no_load: np.ndarray,
+) -> np.ndarray:
+    log_load = np.asarray(expected_log_load, dtype=FLOAT_DTYPE)
+    log_no_load = np.asarray(expected_log_no_load, dtype=FLOAT_DTYPE)
+    max_log = np.maximum(log_load, log_no_load)
+    load_weight = np.exp(log_load - max_log)
+    no_load_weight = np.exp(log_no_load - max_log)
+    return (load_weight / (load_weight + no_load_weight)).astype(FLOAT_DTYPE)
+
+
+def _promoter_path_entropy_contribution(
+    solution: TiltedCTMCSolution,
+    occupancy: np.ndarray,
+    initial_log_normalizer: np.ndarray,
+    child_potentials: np.ndarray | None,
+) -> np.float32:
+    log_partition = np.asarray(solution.log_partition, dtype=FLOAT_DTYPE)
+    initial_normalizer = np.asarray(initial_log_normalizer, dtype=FLOAT_DTYPE)
+    total = np.sum(log_partition + np.broadcast_to(initial_normalizer, log_partition.shape))
+    if child_potentials is None:
+        return np.asarray(total, dtype=FLOAT_DTYPE)
+    child = np.asarray(child_potentials, dtype=FLOAT_DTYPE)
+    if child.ndim == 2:
+        child = child[None, :, :]
+    child = np.broadcast_to(child, np.asarray(occupancy).shape)
+    child_expectation = np.sum(np.asarray(occupancy, dtype=FLOAT_DTYPE) * child, dtype=FLOAT_DTYPE)
+    return np.asarray(total - child_expectation, dtype=FLOAT_DTYPE)
 
 
 def _promoter_loading_child_potentials(

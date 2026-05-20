@@ -54,7 +54,9 @@ single-trace datasets as `(1, n_timepoints)`. Use `MS2Dataset.rate_group` plus
 `transition_rate_scope` and `loading_rate_scope` to choose per-track,
 per-dataset, or global rate nodes. Run coordinate-ascent VI with
 `model.fit_cavi(...)`; convergence is monitored by parameter changes and the
-ELBO is computed only after the final sweep.
+ELBO is computed only after the final sweep. Promoter and Pol2 updates use
+natural expected-log messages, including `E[log pi]` for initial state weights
+and expected log load/no-load terms for Pol2 priors.
 
 `pol2_mode="auto"` uses the memory-efficient transfer backend. The continuous
 Pol2 sampler is available with `pol2_mode="sampler"` for proximal MS2 kernels.

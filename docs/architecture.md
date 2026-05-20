@@ -121,18 +121,19 @@ Pinned parameter nodes emit deterministic moments and have zero entropy.
 
 `PolymeraseLoadings` does not take a dataset-level Pol2 prior in model-built
 graphs. Its Bernoulli loading prior is derived during updates from promoter
-interval state probabilities and loading-rate moments:
+interval state probabilities and loading-rate moments using the same natural
+CAVI terms as the reverse promoter message:
 
 ```text
-P(tau_i = 1) = sum_s q_i(s) * E[1 - exp(-r_s * dt_i)]
+log p_i^* = sum_s q_i(s) * E[log(1 - exp(-r_s * dt_i))]
+log (1 - p_i^*) = sum_s q_i(s) * (-E[r_s] * dt_i)
+P(tau_i = 1) = softmax(log p_i^*, log (1 - p_i^*))
 ```
 
-For a Gamma loading-rate node with shape `a_s` and rate `b_s`, the expectation
-uses the Laplace transform,
-
-```text
-E[1 - exp(-r_s * dt_i)] = 1 - (b_s / (b_s + dt_i)) ** a_s
-```
+For Gamma loading-rate nodes, `E[log(1 - exp(-r_s * dt_i))]` is evaluated with
+the convergent log-survival series. This is intentionally not the arithmetic
+expectation `E[1 - exp(-r_s * dt_i)]`, because the coordinate update depends on
+expected log factors.
 
 The promoter update consumes the reverse message from `PolymeraseLoadings` as an
 interval state potential:
@@ -142,11 +143,18 @@ q(tau_i) * E[log(1 - exp(-r_s * dt_i))]
   + (1 - q(tau_i)) * (-E[r_s] * dt_i)
 ```
 
-divided by `dt_i` before being added to the tilted CTMC potential. For Gamma
-rates, `E[log(1 - exp(-r_s * dt_i))]` is evaluated with the convergent
-log-survival series. The initial Pol2 prior inside the node is only a
-placeholder until graph messages from `PromoterState` and `LoadingRate` are
-available.
+divided by `dt_i` before being added to the tilted CTMC potential. Loading-rate
+sufficient statistics use the mean-field product `q(tau_i) * q_i(s)`.
+
+The promoter initial condition uses `E[log pi]`, normalized into a valid initial
+probability vector for the CTMC solver:
+
+```text
+q(s_0) proportional to exp(E[log pi])
+```
+
+The initial Pol2 prior inside the node is only a placeholder until graph
+messages from `PromoterState` and `LoadingRate` are available.
 
 For sampler mode, `PolymeraseLoadings` emits a posterior loading rate and
 expected loading counts on the sampler fine grid. Its promoter-state reverse
@@ -156,7 +164,9 @@ message uses the Poisson point-process form,
 E[n_i] * E[log r_s] - E[r_s] * dt_i
 ```
 
-divided by `dt_i` before being added to the tilted CTMC potential.
+divided by `dt_i` before being added to the tilted CTMC potential. The sampler
+prior intensity is `exp(sum_s q_i(s) * E[log r_s])`, matching the natural CAVI
+message rather than the arithmetic rate average.
 
 Current limitation: batched traces within a dataset plate must share the same
 time grid, sampling times, and MS2 kernel representation. Heterogeneous trace
@@ -259,6 +269,13 @@ The default CAVI schedule updates hidden promoter/Pol2 nodes first, then
 parameter nodes. Convergence is monitored from the maximum relative change in
 parameter-node values, and the model ELBO is computed only once after the final
 sweep because Pol2 ELBO terms can be expensive.
+
+Final ELBO accounting is factor-based. Gamma and Dirichlet parameter nodes
+contribute expected log prior plus entropy, `PolymeraseLoadings` contributes its
+loading/data log partition, and `PromoterState` contributes the promoter path
+factor plus path entropy. The promoter node subtracts its Pol2 child potential
+from the tilted CTMC log partition so the Pol2 loading factor is not counted
+twice.
 
 ```python
 result = model.fit_cavi(max_iterations=100, tolerance=1e-4, compute_elbo=True)

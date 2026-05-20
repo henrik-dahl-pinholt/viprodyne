@@ -256,6 +256,7 @@ def test_promoter_state_uses_parent_rates_and_emits_sufficient_statistics():
     assert moments["posterior"][0, -1, 1] == pytest.approx(expected_on, rel=3e-6)
     assert moments["transition_counts"].shape == (1, 2, 2)
     assert moments["transition_exposure"].shape == (1, 2)
+    assert moments["elbo"] == pytest.approx(0.0, abs=2e-6)
 
 
 def test_promoter_state_uses_expected_log_rates_and_exit_potentials():
@@ -308,6 +309,59 @@ def test_promoter_state_uses_expected_log_rates_and_exit_potentials():
     np.testing.assert_allclose(np.sum(generator, axis=-2), np.zeros((2, 2)), atol=2e-7)
     np.testing.assert_allclose(potentials[:, 0], kon_tilde - kon_mean, rtol=2e-6)
     np.testing.assert_allclose(potentials[:, 1], 0.0, atol=2e-7)
+
+
+def test_promoter_state_uses_expected_log_initial_probabilities():
+    graph = VariationalGraph()
+    pi = InitialStateProb(
+        name="pi",
+        prior_concentration=np.ones(2, dtype=np.float32),
+        concentration=np.array([2.0, 8.0], dtype=np.float32),
+    )
+    kon = TransitionRate(
+        name="kon",
+        prior_shape=1.0,
+        prior_rate=1.0,
+        pinned_value=np.float32(0.1),
+        n_states=2,
+        to_state=1,
+        from_state=0,
+    )
+    koff = TransitionRate(
+        name="koff",
+        prior_shape=1.0,
+        prior_rate=1.0,
+        pinned_value=np.float32(0.1),
+        n_states=2,
+        to_state=0,
+        from_state=1,
+    )
+    promoter = PromoterState(
+        name="s",
+        time_grid=np.array([0.0, 0.5], dtype=np.float32),
+        n_states=2,
+        rate_edges=(kon.edge, koff.edge),
+        initial_probability_node="pi",
+    )
+    for node in [pi, kon, koff, promoter]:
+        graph.add_node(node)
+    graph.add_edge("pi", "s")
+    graph.add_edge("kon", "s")
+    graph.add_edge("koff", "s")
+
+    graph.run_schedule(["s"])
+
+    expected_log = graph.moments.get("pi")["expected_log"]
+    weights = np.exp(expected_log - np.max(expected_log))
+    expected = weights / np.sum(weights)
+    mean = graph.moments.get("pi")["mean"]
+
+    np.testing.assert_allclose(
+        graph.moments.get("s")["posterior"][0, 0],
+        expected,
+        rtol=2e-6,
+    )
+    assert not np.allclose(expected, mean)
 
 
 def test_promoter_state_uses_pol2_loading_child_message():
@@ -379,6 +433,12 @@ def test_promoter_state_uses_pol2_loading_child_message():
     ) / dt[:, None]
 
     np.testing.assert_allclose(promoter.tilt_potentials, expected_potentials, rtol=2e-6)
+    expected_child = np.sum(
+        graph.moments.get("s")["expected_occupancy"][0] * expected_potentials,
+        dtype=np.float32,
+    )
+    expected_elbo = float(np.asarray(promoter.solution.log_partition)[0] - expected_child)
+    assert graph.moments.get("s")["elbo"] == pytest.approx(expected_elbo, rel=2e-6)
 
 
 def test_promoter_state_uses_sampler_expected_count_child_message():
@@ -490,6 +550,122 @@ def test_polymerase_loadings_requires_trace_time_matrix():
             noise_std=np.float32(0.5),
             mode="exact",
         )
+
+
+def test_polymerase_loadings_uses_natural_prior_and_state_product_stats():
+    graph = VariationalGraph()
+    state_probabilities = np.array([[[0.8, 0.2], [0.25, 0.75]]], dtype=np.float32)
+    promoter = StatsNode(
+        "s",
+        {
+            "interval_state_probabilities": state_probabilities,
+            "interval_durations": np.array([0.5, 0.5], dtype=np.float32),
+        },
+    )
+    r0 = LoadingRate(
+        name="r0",
+        prior_shape=1.0,
+        prior_rate=1.0,
+        pinned_value=np.float32(0.4),
+        state_index=0,
+    )
+    r1 = LoadingRate(
+        name="r1",
+        prior_shape=1.0,
+        prior_rate=1.0,
+        pinned_value=np.float32(2.0),
+        state_index=1,
+    )
+    tau = PolymeraseLoadings(
+        name="tau",
+        observed=np.array([[np.nan, np.nan]], dtype=np.float32),
+        design_matrix=np.eye(2, dtype=np.float32),
+        noise_std=np.float32(0.5),
+        mode="exact",
+    )
+    for node in [promoter, r0, r1, tau]:
+        graph.add_node(node)
+    graph.add_edge("s", "tau")
+    graph.add_edge("r0", "tau")
+    graph.add_edge("r1", "tau")
+
+    graph.run_schedule(["tau"])
+
+    dt = np.array([0.5, 0.5], dtype=np.float32)
+    rates = np.array([0.4, 2.0], dtype=np.float32)
+    log_load = np.log(-np.expm1(-dt[:, None] * rates[None, :]))
+    log_no_load = -dt[:, None] * rates[None, :]
+    expected_log_load = np.sum(state_probabilities[0] * log_load, axis=-1)
+    expected_log_no_load = np.sum(state_probabilities[0] * log_no_load, axis=-1)
+    load_weight = np.exp(expected_log_load - np.maximum(expected_log_load, expected_log_no_load))
+    no_load_weight = np.exp(
+        expected_log_no_load - np.maximum(expected_log_load, expected_log_no_load)
+    )
+    expected_prior = load_weight / (load_weight + no_load_weight)
+    moments = graph.moments.get("tau")
+
+    np.testing.assert_allclose(tau.prior_probabilities, expected_prior[None, :], rtol=2e-6)
+    np.testing.assert_allclose(moments["load_probabilities"], expected_prior[None, :], rtol=2e-6)
+    np.testing.assert_allclose(
+        moments["loading_counts_by_rate"]["r0"],
+        np.sum(expected_prior * state_probabilities[0, :, 0], dtype=np.float32),
+        rtol=2e-6,
+    )
+    np.testing.assert_allclose(
+        moments["loading_counts_by_rate"]["r1"],
+        np.sum(expected_prior * state_probabilities[0, :, 1], dtype=np.float32),
+        rtol=2e-6,
+    )
+
+
+def test_polymerase_sampler_prior_intensity_uses_expected_log_rates():
+    graph = VariationalGraph()
+    state_probabilities = np.array([[[0.8, 0.2], [0.25, 0.75]]], dtype=np.float32)
+    promoter = StatsNode(
+        "s",
+        {
+            "interval_state_probabilities": state_probabilities,
+            "interval_durations": np.array([0.5, 0.5], dtype=np.float32),
+        },
+    )
+    r0 = LoadingRate(
+        name="r0",
+        prior_shape=1.0,
+        prior_rate=1.0,
+        pinned_value=np.float32(0.4),
+        state_index=0,
+    )
+    r1 = LoadingRate(
+        name="r1",
+        prior_shape=1.0,
+        prior_rate=1.0,
+        pinned_value=np.float32(2.0),
+        state_index=1,
+    )
+    tau = PolymeraseLoadings(
+        name="tau",
+        observed=np.array([[np.nan, np.nan]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        mode="sampler",
+        sampling_times=np.array([0.0, 0.5], dtype=np.float32),
+        fine_grid=np.array([0.0, 0.5], dtype=np.float32),
+        rise_time=np.float32(0.5),
+        plateau_time=np.float32(0.0),
+        rna_intensity=np.float32(1.0),
+        sampler_iterations=2,
+        sampler_repeats=1,
+    )
+    for node in [promoter, r0, r1, tau]:
+        graph.add_node(node)
+    graph.add_edge("s", "tau")
+    graph.add_edge("r0", "tau")
+    graph.add_edge("r1", "tau")
+
+    graph.run_schedule(["tau"])
+
+    rates = np.array([0.4, 2.0], dtype=np.float32)
+    expected = np.exp(np.sum(state_probabilities[0] * np.log(rates), axis=-1))
+    np.testing.assert_allclose(tau.sampler_rates_on_grid, expected[None, :], rtol=2e-6)
 
 
 def test_promoter_state_applies_contact_drive_and_emits_survival_stats():
