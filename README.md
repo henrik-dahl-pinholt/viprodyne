@@ -32,7 +32,7 @@ from viprodyne import MS2Dataset, ModelConfig, ViprodyneModel
 
 dataset = MS2Dataset(
     name="condition_0",
-    observed=np.array([0.1, np.nan, 0.8], dtype=np.float32),
+    observed=np.array([[0.1, np.nan, 0.8]], dtype=np.float32),
     noise_std=np.float32(0.5),
     time_grid=np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
 )
@@ -49,11 +49,12 @@ model = ViprodyneModel(
 )
 ```
 
-For multi-trace fits, pass one `MS2Dataset` per trace. Use
-`MS2Dataset.rate_group` plus `transition_rate_scope` and `loading_rate_scope` to
-choose per-track, per-dataset, or global rate nodes. Run coordinate-ascent VI
-with `model.fit_cavi(...)`; convergence is monitored by parameter changes and
-the ELBO is computed only after the final sweep.
+`MS2Dataset.observed` must have shape `(n_traces, n_timepoints)`, including
+single-trace datasets as `(1, n_timepoints)`. Use `MS2Dataset.rate_group` plus
+`transition_rate_scope` and `loading_rate_scope` to choose per-track,
+per-dataset, or global rate nodes. Run coordinate-ascent VI with
+`model.fit_cavi(...)`; convergence is monitored by parameter changes and the
+ELBO is computed only after the final sweep.
 
 `pol2_mode="auto"` uses the memory-efficient transfer backend. The continuous
 Pol2 sampler is available with `pol2_mode="sampler"` for proximal MS2 kernels.

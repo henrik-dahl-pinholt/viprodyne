@@ -463,7 +463,7 @@ def test_polymerase_loadings_sampler_mode_smoke_runs_and_emits_counts():
     assert moments["posterior_rate"].dtype == np.float32
     assert moments["expected_loading_counts"].dtype == np.float32
     assert moments["load_probabilities"].dtype == np.float32
-    assert moments["posterior_rate"].shape == (3,)
+    assert moments["posterior_rate"].shape == (1, 3)
     assert np.all(np.isfinite(moments["posterior_rate"]))
     assert np.isfinite(moments["log_partition"])
 

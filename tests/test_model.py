@@ -8,7 +8,7 @@ from viprodyne import DrivenRateMap, MS2Dataset, ModelConfig, ProximalKernel, Rc
 def make_dataset(name, offset=0.0):
     return MS2Dataset(
         name=name,
-        observed=np.array([0.1 + offset, 0.8 + offset], dtype=np.float32),
+        observed=np.array([[0.1 + offset, 0.8 + offset]], dtype=np.float32),
         noise_std=np.float32(0.5),
     )
 
@@ -71,19 +71,19 @@ def test_model_rate_scopes_cover_track_dataset_and_global():
         MS2Dataset(
             name="a_track0",
             rate_group="condition_a",
-            observed=np.array([0.1, 0.8], dtype=np.float32),
+            observed=np.array([[0.1, 0.8]], dtype=np.float32),
             noise_std=np.float32(0.5),
         ),
         MS2Dataset(
             name="a_track1",
             rate_group="condition_a",
-            observed=np.array([0.2, 0.7], dtype=np.float32),
+            observed=np.array([[0.2, 0.7]], dtype=np.float32),
             noise_std=np.float32(0.5),
         ),
         MS2Dataset(
             name="b_track0",
             rate_group="condition_b",
-            observed=np.array([0.3, 0.6], dtype=np.float32),
+            observed=np.array([[0.3, 0.6]], dtype=np.float32),
             noise_std=np.float32(0.5),
         ),
     )
@@ -147,13 +147,13 @@ def test_model_supports_per_rate_scope_overrides():
         MS2Dataset(
             name="track0",
             rate_group="condition",
-            observed=np.array([0.1, 0.8], dtype=np.float32),
+            observed=np.array([[0.1, 0.8]], dtype=np.float32),
             noise_std=np.float32(0.5),
         ),
         MS2Dataset(
             name="track1",
             rate_group="condition",
-            observed=np.array([0.2, 0.7], dtype=np.float32),
+            observed=np.array([[0.2, 0.7]], dtype=np.float32),
             noise_std=np.float32(0.5),
         ),
     )
@@ -183,7 +183,7 @@ def test_model_rejects_reserved_rate_prefix_labels():
             datasets=(
                 MS2Dataset(
                     name="shared",
-                    observed=np.array([0.1, 0.8], dtype=np.float32),
+                    observed=np.array([[0.1, 0.8]], dtype=np.float32),
                     noise_std=np.float32(0.5),
                 ),
             ),
@@ -196,11 +196,20 @@ def test_model_rejects_reserved_rate_prefix_labels():
                 MS2Dataset(
                     name="track0",
                     rate_group="condition:0",
-                    observed=np.array([0.1, 0.8], dtype=np.float32),
+                    observed=np.array([[0.1, 0.8]], dtype=np.float32),
                     noise_std=np.float32(0.5),
                 ),
             ),
             config=ModelConfig(n_states=2, time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32)),
+        )
+
+
+def test_ms2_dataset_requires_trace_time_matrix():
+    with pytest.raises(ValueError, match="observed must have shape"):
+        MS2Dataset(
+            name="d0",
+            observed=np.array([0.1, 0.8], dtype=np.float32),
+            noise_std=np.float32(0.5),
         )
 
 
@@ -227,10 +236,46 @@ def test_model_schedule_runs_promoter_and_pol2_nodes():
     assert "d0:tau" in model.default_schedule()
 
 
+def test_model_batches_traces_inside_dataset_plate_with_track_rates():
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.array(
+            [
+                [0.1, 0.5, 0.9],
+                [0.2, np.nan, 0.7],
+            ],
+            dtype=np.float32,
+        ),
+        noise_std=np.float32(0.5),
+    )
+    model = ViprodyneModel(
+        datasets=(dataset,),
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
+            transition_rate_scope="track",
+            loading_rate_scope="track",
+        ),
+    )
+
+    assert model.graph.nodes["d0:r0"].shape.shape == (2,)
+    assert model.graph.nodes["d0:R0"].shape.shape == (2,)
+
+    model.run_schedule(["d0:s", "d0:tau", "d0:s", "d0:r0"])
+    promoter_moments = model.graph.moments.get("d0:s")
+    pol2_moments = model.graph.moments.get("d0:tau")
+
+    assert promoter_moments["posterior"].shape == (2, 4, 2)
+    assert pol2_moments["load_probabilities"].shape == (2, 3)
+    assert model.graph.nodes["d0:tau"].prior_probabilities.shape == (2, 3)
+    assert pol2_moments["loading_counts_by_rate"]["d0:r0"].shape == (2,)
+    assert model.graph.nodes["d0:r0"].shape.shape == (2,)
+
+
 def test_model_uses_transfer_pol2_mode_from_kernel_config():
     dataset = MS2Dataset(
         name="d0",
-        observed=np.array([0.1, np.nan, 0.9], dtype=np.float32),
+        observed=np.array([[0.1, np.nan, 0.9]], dtype=np.float32),
         noise_std=np.float32(0.5),
     )
     model = ViprodyneModel(
@@ -258,7 +303,7 @@ def test_model_uses_transfer_pol2_mode_from_kernel_config():
 def test_model_can_run_sampler_pol2_mode():
     dataset = MS2Dataset(
         name="d0",
-        observed=np.array([0.1, np.nan, 0.9], dtype=np.float32),
+        observed=np.array([[0.1, np.nan, 0.9]], dtype=np.float32),
         noise_std=np.float32(0.5),
     )
     model = ViprodyneModel(
@@ -281,7 +326,7 @@ def test_model_can_run_sampler_pol2_mode():
     assert model.graph.nodes["d0:tau"].mode == "sampler"
     assert moments["posterior_rate"].dtype == np.float32
     assert moments["expected_loading_counts"].dtype == np.float32
-    assert moments["posterior_rate"].shape == (3,)
+    assert moments["posterior_rate"].shape == (1, 3)
     assert "loading_counts_by_rate" in moments
     assert "d0:r0" in moments["loading_counts_by_rate"]
 
@@ -292,7 +337,7 @@ def test_model_accepts_explicit_kernel_function():
 
     dataset = MS2Dataset(
         name="d0",
-        observed=np.array([0.2, 0.4], dtype=np.float32),
+        observed=np.array([[0.2, 0.4]], dtype=np.float32),
         noise_std=np.float32(0.5),
     )
     model = ViprodyneModel(
@@ -314,7 +359,7 @@ def test_model_accepts_explicit_kernel_function():
 def test_model_accepts_kernel_dataclass():
     dataset = MS2Dataset(
         name="d0",
-        observed=np.array([0.2, 0.4], dtype=np.float32),
+        observed=np.array([[0.2, 0.4]], dtype=np.float32),
         noise_std=np.float32(0.5),
     )
     model = ViprodyneModel(
@@ -366,7 +411,7 @@ def test_model_derives_pol2_prior_from_promoter_and_loading_rates():
     )
     polymerase = model.graph.nodes["d0:tau"]
 
-    np.testing.assert_allclose(polymerase.prior_probabilities, expected_prior, rtol=2e-6)
+    np.testing.assert_allclose(polymerase.prior_probabilities, expected_prior[None, :], rtol=2e-6)
 
 
 def test_model_derives_pol2_prior_from_gamma_rate_laplace_moments():
@@ -396,19 +441,19 @@ def test_model_derives_pol2_prior_from_gamma_rate_laplace_moments():
     )
     polymerase = model.graph.nodes["d0:tau"]
 
-    np.testing.assert_allclose(polymerase.prior_probabilities, expected, rtol=3e-6)
+    np.testing.assert_allclose(polymerase.prior_probabilities, expected[None, :], rtol=3e-6)
 
 
 def test_model_accepts_dataset_specific_time_grids():
     d0 = MS2Dataset(
         name="d0",
-        observed=np.array([0.1, 0.8], dtype=np.float32),
+        observed=np.array([[0.1, 0.8]], dtype=np.float32),
         noise_std=np.float32(0.5),
         time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
     )
     d1 = MS2Dataset(
         name="d1",
-        observed=np.array([0.2, 0.5, 0.9], dtype=np.float32),
+        observed=np.array([[0.2, 0.5, 0.9]], dtype=np.float32),
         noise_std=np.float32(0.5),
         time_grid=np.array([0.0, 0.25, 0.75, 1.5], dtype=np.float32),
     )
@@ -428,7 +473,7 @@ def test_model_accepts_dataset_specific_time_grids():
 def test_model_builds_driven_transition_with_dataset_contact_drive():
     dataset = MS2Dataset(
         name="d0",
-        observed=np.array([0.1, 0.9], dtype=np.float32),
+        observed=np.array([[0.1, 0.9]], dtype=np.float32),
         noise_std=np.float32(0.5),
         contact_probability=np.array([0.25, 0.75], dtype=np.float32),
     )

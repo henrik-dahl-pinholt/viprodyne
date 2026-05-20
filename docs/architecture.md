@@ -158,10 +158,9 @@ E[n_i] * E[log r_s] - E[r_s] * dt_i
 
 divided by `dt_i` before being added to the tilted CTMC potential.
 
-Current limitation: the `PolymeraseLoadings` graph node assumes one trajectory
-plate at a time. Batched transfer likelihoods exist at the core-kernel level,
-but batched/plated loading-rate priors still need explicit node-level
-interfaces.
+Current limitation: batched traces within a dataset plate must share the same
+time grid, sampling times, and MS2 kernel representation. Heterogeneous trace
+timing should be split across separate `MS2Dataset` plates.
 
 ## Promoter-State Construction
 
@@ -195,18 +194,20 @@ transition.
 Create one `MS2Dataset` per dataset plate and pass them to `ViprodyneModel` with
 a `ModelConfig`.
 
-`MS2Dataset` contains observed intensities, noise, optional per-dataset
-`time_grid`, optional `sampling_times`, optional missing-data mask, and optional
-contact probabilities for driven transitions. It does not require users to pass
-dense design matrices or transfer windows. Those are derived internally from the
-MS2 kernel in `ModelConfig`.
+`MS2Dataset` contains observed intensities with shape
+`(n_traces, n_timepoints)`, noise, optional per-dataset `time_grid`, optional
+`sampling_times`, optional missing-data mask, and optional contact probabilities
+for driven transitions. Single-trace datasets are passed as
+`(1, n_timepoints)`. It does not require users to pass dense design matrices or
+transfer windows. Those are derived internally from the MS2 kernel in
+`ModelConfig`.
 
-For fitting many traces, use one `MS2Dataset` object per trace and set
-`MS2Dataset.rate_group` to the experimental dataset or condition label when
-rates should be shared at the dataset level. Rate scopes are controlled by
+For fitting many traces, put all same-grid traces for an experimental dataset
+or condition into one `MS2Dataset`. Rate scopes are controlled by
 `ModelConfig.transition_rate_scope` and `ModelConfig.loading_rate_scope`:
 
-- `"track"` creates one rate node per `MS2Dataset.name`;
+- `"track"` creates one vector-valued rate node with one entry per trace in the
+  dataset plate;
 - `"dataset"` creates one rate node per `MS2Dataset.rate_group` when supplied,
   otherwise one rate node per `MS2Dataset.name`;
 - `"global"` creates one shared rate node for the whole model.
@@ -229,7 +230,7 @@ from viprodyne import MS2Dataset, ModelConfig, ViprodyneModel
 
 dataset = MS2Dataset(
     name="condition_0",
-    observed=np.array([0.1, np.nan, 0.8], dtype=np.float32),
+    observed=np.array([[0.1, np.nan, 0.8]], dtype=np.float32),
     noise_std=np.float32(0.5),
     time_grid=np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
 )
@@ -269,7 +270,7 @@ Datasets can either inherit `ModelConfig.time_grid` or provide their own
 conditions have different frame timing or different trace lengths.
 
 By default, observations are assumed to occur at interval ends,
-`time_grid[1:len(observed) + 1]`. Use `MS2Dataset.sampling_times` when frame
+`time_grid[1:n_timepoints + 1]`. Use `MS2Dataset.sampling_times` when frame
 times are not the interval ends.
 
 `ModelConfig.ms2_kernel` can be a named kernel string, a `ProximalKernel`
@@ -290,13 +291,13 @@ Example with heterogeneous grids:
 ```python
 d0 = MS2Dataset(
     name="d0",
-    observed=np.array([0.1, 0.8], dtype=np.float32),
+    observed=np.array([[0.1, 0.8]], dtype=np.float32),
     noise_std=np.float32(0.5),
     time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
 )
 d1 = MS2Dataset(
     name="d1",
-    observed=np.array([0.2, 0.5, 0.9], dtype=np.float32),
+    observed=np.array([[0.2, 0.5, 0.9]], dtype=np.float32),
     noise_std=np.float32(0.5),
     time_grid=np.array([0.0, 0.25, 0.75, 1.5], dtype=np.float32),
 )
@@ -323,7 +324,7 @@ index `1` is `0 -> 1`.
 ```python
 dataset = MS2Dataset(
     name="condition_0",
-    observed=np.array([0.1, 0.8], dtype=np.float32),
+    observed=np.array([[0.1, 0.8]], dtype=np.float32),
     noise_std=np.float32(0.5),
     time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
     contact_probability=np.array([0.25, 0.75], dtype=np.float32),

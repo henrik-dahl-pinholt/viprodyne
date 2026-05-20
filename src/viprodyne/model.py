@@ -49,15 +49,33 @@ class MS2Dataset:
             raise ValueError("dataset name must be non-empty.")
         if self.rate_group is not None and not self.rate_group:
             raise ValueError("rate_group must be non-empty when provided.")
+        observed = np.asarray(self.observed, dtype=FLOAT_DTYPE)
+        if observed.ndim != 2:
+            raise ValueError("observed must have shape (n_traces, n_timepoints).")
+        if observed.shape[0] < 1 or observed.shape[1] < 1:
+            raise ValueError("observed must have at least one trace and one timepoint.")
         if self.time_grid is not None:
             _validate_time_grid(self.time_grid, "dataset.time_grid")
         if self.sampling_times is not None:
             sampling_times = np.asarray(self.sampling_times, dtype=FLOAT_DTYPE)
-            observed = np.asarray(self.observed, dtype=FLOAT_DTYPE)
-            if sampling_times.shape != observed.shape:
-                raise ValueError("sampling_times must have the same shape as observed.")
+            if sampling_times.shape != (observed.shape[1],):
+                raise ValueError("sampling_times must have shape (n_timepoints,).")
             if np.any(np.diff(sampling_times) <= 0):
                 raise ValueError("sampling_times must be strictly increasing.")
+        if self.finite_mask is not None:
+            mask = np.asarray(self.finite_mask, dtype=bool)
+            if mask.shape != observed.shape:
+                raise ValueError("finite_mask must have the same shape as observed.")
+
+    @property
+    def n_traces(self) -> int:
+        """Number of traces in this dataset plate."""
+        return int(np.asarray(self.observed).shape[0])
+
+    @property
+    def n_timepoints(self) -> int:
+        """Number of observed timepoints per trace."""
+        return int(np.asarray(self.observed).shape[1])
 
 
 @dataclass(frozen=True)
@@ -375,7 +393,8 @@ class ViprodyneModel:
     def _add_transition_rates(self, dataset_name: str) -> list[str]:
         names = []
         for index in range(self.config.n_states * (self.config.n_states - 1)):
-            prefix = self._rate_prefix(dataset_name, self._transition_rate_scope(index))
+            scope = self._transition_rate_scope(index)
+            prefix = self._rate_prefix(dataset_name, scope)
             to_state, from_state = transition_states(self.config.n_states, index)
             name = f"{prefix}:R{index}"
             if name not in self.graph.nodes:
@@ -393,8 +412,18 @@ class ViprodyneModel:
                     self.graph.add_node(
                         TransitionRate(
                             name=name,
-                            prior_shape=self.config.transition_prior_shape,
-                            prior_rate=self.config.transition_prior_rate,
+                            prior_shape=self._rate_prior_parameter(
+                                self.config.transition_prior_shape,
+                                dataset_name,
+                                scope,
+                                "transition_prior_shape",
+                            ),
+                            prior_rate=self._rate_prior_parameter(
+                                self.config.transition_prior_rate,
+                                dataset_name,
+                                scope,
+                                "transition_prior_rate",
+                            ),
                             n_states=self.config.n_states,
                             to_state=to_state,
                             from_state=from_state,
@@ -406,14 +435,25 @@ class ViprodyneModel:
     def _add_loading_rates(self, dataset_name: str) -> list[str]:
         names = []
         for state in range(self.config.n_states):
-            prefix = self._rate_prefix(dataset_name, self._loading_rate_scope(state))
+            scope = self._loading_rate_scope(state)
+            prefix = self._rate_prefix(dataset_name, scope)
             name = f"{prefix}:r{state}"
             if name not in self.graph.nodes:
                 self.graph.add_node(
                     LoadingRate(
                         name=name,
-                        prior_shape=self.config.loading_prior_shape,
-                        prior_rate=self.config.loading_prior_rate,
+                        prior_shape=self._rate_prior_parameter(
+                            self.config.loading_prior_shape,
+                            dataset_name,
+                            scope,
+                            "loading_prior_shape",
+                        ),
+                        prior_rate=self._rate_prior_parameter(
+                            self.config.loading_prior_rate,
+                            dataset_name,
+                            scope,
+                            "loading_prior_rate",
+                        ),
                         state_index=state,
                     )
                 )
@@ -444,6 +484,23 @@ class ViprodyneModel:
             return dataset.rate_group or dataset.name
         raise ValueError(f"unknown rate scope {scope!r}.")
 
+    def _rate_prior_parameter(
+        self,
+        value: np.ndarray | float,
+        dataset_name: str,
+        scope: RateScope,
+        name: str,
+    ) -> np.ndarray:
+        parameter = np.asarray(value, dtype=FLOAT_DTYPE)
+        if scope != "track":
+            return parameter
+        n_traces = next(dataset.n_traces for dataset in self.datasets if dataset.name == dataset_name)
+        if parameter.shape == ():
+            return np.full((n_traces,), parameter, dtype=FLOAT_DTYPE)
+        if parameter.shape == (n_traces,):
+            return parameter.astype(FLOAT_DTYPE)
+        raise ValueError(f"{name} must be scalar or have shape (n_traces,) for track scope.")
+
     def _initial_concentration(self) -> np.ndarray:
         if self.config.initial_concentration is None:
             return np.ones(self.config.n_states, dtype=FLOAT_DTYPE)
@@ -473,7 +530,7 @@ class ViprodyneModel:
             return None
         return build_ms2_observation_model(
             time_grid=self._time_grid(dataset),
-            n_observations=np.asarray(dataset.observed).size,
+            n_observations=dataset.n_timepoints,
             kernel=kernel,
             sampling_times=dataset.sampling_times,
             mode=mode,

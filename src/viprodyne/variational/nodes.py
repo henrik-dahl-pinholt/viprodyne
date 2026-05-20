@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from scipy.optimize import minimize_scalar
@@ -487,6 +488,8 @@ class PolymeraseLoadings(VariationalNode):
     def __post_init__(self) -> None:
         VariationalNode.__init__(self, self.name)
         self.observed = np.asarray(self.observed, dtype=FLOAT_DTYPE)
+        if self.observed.ndim not in {1, 2}:
+            raise ValueError("observed must be one- or two-dimensional.")
         if self.design_matrix is not None:
             self.design_matrix = np.asarray(self.design_matrix, dtype=FLOAT_DTYPE)
         if self.prior_probabilities is None:
@@ -501,7 +504,10 @@ class PolymeraseLoadings(VariationalNode):
         if self.finite_mask is None:
             self.finite_mask = np.isfinite(self.observed)
         else:
-            self.finite_mask = np.asarray(self.finite_mask, dtype=bool) & np.isfinite(self.observed)
+            mask = np.asarray(self.finite_mask, dtype=bool)
+            if mask.shape != self.observed.shape:
+                raise ValueError("finite_mask must have the same shape as observed.")
+            self.finite_mask = mask & np.isfinite(self.observed)
         if self.window_weights is not None:
             self.window_weights = np.asarray(self.window_weights, dtype=FLOAT_DTYPE)
         if self.observation_starts is not None:
@@ -617,16 +623,32 @@ class PolymeraseLoadings(VariationalNode):
     def _update_exact(self) -> None:
         if self.design_matrix is None:
             raise ValueError("design_matrix is required for exact Pol2 loading updates.")
-        configurations = enumerate_binary_configurations(self.prior_probabilities.size)
-        log_z, marginals, _, predicted, posterior_probabilities = exact_bernoulli_posterior(
-            jnp.asarray(self.observed),
-            jnp.asarray(self.prior_probabilities),
-            jnp.asarray(self.design_matrix),
-            jnp.asarray(self.noise_std),
-            jnp.asarray(self.finite_mask),
-            configurations,
-        )
-        self.objective_value = np.asarray(log_z, dtype=FLOAT_DTYPE)
+        n_loadings = int(np.asarray(self.prior_probabilities).shape[-1])
+        configurations = enumerate_binary_configurations(n_loadings)
+        if self.observed.ndim == 1:
+            log_z, marginals, _, predicted, posterior_probabilities = exact_bernoulli_posterior(
+                jnp.asarray(self.observed),
+                jnp.asarray(self.prior_probabilities),
+                jnp.asarray(self.design_matrix),
+                jnp.asarray(self.noise_std),
+                jnp.asarray(self.finite_mask),
+                configurations,
+            )
+        else:
+            prior = _batch_loading_prior(self.prior_probabilities, self.observed.shape[0])
+            noise = _batch_noise(self.noise_std, self.observed.shape)
+            log_z, marginals, _, predicted, posterior_probabilities = jax.vmap(
+                exact_bernoulli_posterior,
+                in_axes=(0, 0, None, 0, 0, None),
+            )(
+                jnp.asarray(self.observed),
+                jnp.asarray(prior),
+                jnp.asarray(self.design_matrix),
+                jnp.asarray(noise),
+                jnp.asarray(self.finite_mask),
+                configurations,
+            )
+        self.objective_value = np.asarray(np.sum(np.asarray(log_z)), dtype=FLOAT_DTYPE)
         self.load_probabilities = np.asarray(marginals, dtype=FLOAT_DTYPE)
         self.predicted_signal = np.asarray(predicted, dtype=FLOAT_DTYPE)
         self.posterior_probabilities = np.asarray(posterior_probabilities, dtype=FLOAT_DTYPE)
@@ -639,34 +661,77 @@ class PolymeraseLoadings(VariationalNode):
     def _update_transfer(self) -> None:
         if self.window_weights is None or self.observation_starts is None:
             raise ValueError("window_weights and observation_starts are required for transfer mode.")
-        log_z, marginals, predicted, entropy, _, _ = bernoulli_transfer_posterior(
-            jnp.asarray(self.observed),
-            jnp.asarray(self.prior_probabilities),
-            jnp.asarray(self.window_weights),
-            jnp.asarray(self.observation_starts),
-            jnp.asarray(self.noise_std),
-            jnp.asarray(self.finite_mask),
-        )
-        self.objective_value = np.asarray(log_z, dtype=FLOAT_DTYPE)
+        if self.observed.ndim == 1:
+            log_z, marginals, predicted, entropy, _, _ = bernoulli_transfer_posterior(
+                jnp.asarray(self.observed),
+                jnp.asarray(self.prior_probabilities),
+                jnp.asarray(self.window_weights),
+                jnp.asarray(self.observation_starts),
+                jnp.asarray(self.noise_std),
+                jnp.asarray(self.finite_mask),
+            )
+        else:
+            prior = _batch_loading_prior(self.prior_probabilities, self.observed.shape[0])
+            noise = _batch_noise(self.noise_std, self.observed.shape)
+            log_z, marginals, predicted, entropy, _, _ = jax.vmap(
+                bernoulli_transfer_posterior,
+                in_axes=(0, 0, None, None, 0, 0),
+            )(
+                jnp.asarray(self.observed),
+                jnp.asarray(prior),
+                jnp.asarray(self.window_weights),
+                jnp.asarray(self.observation_starts),
+                jnp.asarray(noise),
+                jnp.asarray(self.finite_mask),
+            )
+        self.objective_value = np.asarray(np.sum(np.asarray(log_z)), dtype=FLOAT_DTYPE)
         self.load_probabilities = np.asarray(marginals, dtype=FLOAT_DTYPE)
         self.predicted_signal = np.asarray(predicted, dtype=FLOAT_DTYPE)
         self.posterior_probabilities = None
         self.configurations = None
-        self.entropy_value = np.asarray(entropy, dtype=FLOAT_DTYPE)
+        self.entropy_value = np.asarray(np.sum(np.asarray(entropy)), dtype=FLOAT_DTYPE)
 
     def _update_mean_field(self) -> None:
         if self.design_matrix is None:
             raise ValueError("design_matrix is required for mean-field Pol2 loading updates.")
-        result = fit_mean_field_bernoulli(
-            observed=self.observed,
-            prior_probabilities=self.prior_probabilities,
-            design_matrix=self.design_matrix,
-            noise_std=float(self.noise_std),
-            mask=self.finite_mask,
-        )
-        self.load_probabilities = result.load_probabilities
-        self.predicted_signal = result.predicted_signal
-        self.objective_value = np.asarray(result.elbo, dtype=FLOAT_DTYPE)
+        if self.observed.ndim == 1:
+            result = fit_mean_field_bernoulli(
+                observed=self.observed,
+                prior_probabilities=self.prior_probabilities,
+                design_matrix=self.design_matrix,
+                noise_std=float(np.ravel(self.noise_std)[0]),
+                mask=self.finite_mask,
+            )
+            load_probabilities = result.load_probabilities
+            predicted_signal = result.predicted_signal
+            objective_value = result.elbo
+        else:
+            prior = _batch_loading_prior(self.prior_probabilities, self.observed.shape[0])
+            noise = _batch_noise(self.noise_std, self.observed.shape)
+            results = [
+                fit_mean_field_bernoulli(
+                    observed=observed,
+                    prior_probabilities=prior_trace,
+                    design_matrix=self.design_matrix,
+                    noise_std=float(np.ravel(noise_trace)[0]),
+                    mask=mask,
+                )
+                for observed, prior_trace, noise_trace, mask in zip(
+                    self.observed,
+                    prior,
+                    noise,
+                    self.finite_mask,
+                )
+            ]
+            load_probabilities = np.stack(
+                [result.load_probabilities for result in results],
+                axis=0,
+            )
+            predicted_signal = np.stack([result.predicted_signal for result in results], axis=0)
+            objective_value = np.sum([result.elbo for result in results], dtype=FLOAT_DTYPE)
+        self.load_probabilities = np.asarray(load_probabilities, dtype=FLOAT_DTYPE)
+        self.predicted_signal = np.asarray(predicted_signal, dtype=FLOAT_DTYPE)
+        self.objective_value = np.asarray(objective_value, dtype=FLOAT_DTYPE)
         self.posterior_probabilities = None
         self.configurations = None
         self.entropy_value = np.asarray(
@@ -700,10 +765,6 @@ class PolymeraseLoadings(VariationalNode):
         )
         posterior_rate = np.asarray(result.posterior_rate, dtype=FLOAT_DTYPE)
         predicted_signal = np.asarray(result.predicted_signal, dtype=FLOAT_DTYPE)
-        if posterior_rate.ndim == 2 and posterior_rate.shape[0] == 1:
-            posterior_rate = posterior_rate[0]
-        if predicted_signal.ndim == 2 and predicted_signal.shape[0] == 1:
-            predicted_signal = predicted_signal[0]
         grid_dt = np.asarray(self.fine_grid[1] - self.fine_grid[0], dtype=FLOAT_DTYPE)
         self.sampler_result = result
         self.posterior_rate = posterior_rate.astype(FLOAT_DTYPE)
@@ -762,7 +823,10 @@ class PolymeraseLoadings(VariationalNode):
             return
         load_counts = np.asarray(counts_source, dtype=FLOAT_DTYPE)
         if self.expected_loading_counts is not None:
-            intensity = prior_stats.state_probabilities * prior_stats.rate_means[None, :]
+            intensity = (
+                prior_stats.state_probabilities
+                * np.asarray(prior_stats.rate_means, dtype=FLOAT_DTYPE)[..., None, :]
+            )
             total_intensity = np.clip(
                 np.sum(intensity, axis=-1, keepdims=True, dtype=FLOAT_DTYPE),
                 1e-7,
@@ -774,24 +838,24 @@ class PolymeraseLoadings(VariationalNode):
             responsibilities = (
                 prior_stats.state_probabilities
                 * prior_stats.per_state_load_probabilities
-                / prior[:, None]
+                / prior[..., :, None]
             )
         counts_by_state = np.sum(
-            load_counts[:, None] * responsibilities,
-            axis=0,
+            load_counts[..., :, None] * responsibilities,
+            axis=-2,
             dtype=FLOAT_DTYPE,
         )
         exposure_by_state = np.sum(
-            prior_stats.state_probabilities * prior_stats.interval_durations[:, None],
-            axis=0,
+            prior_stats.state_probabilities * prior_stats.interval_durations[..., None],
+            axis=-2,
             dtype=FLOAT_DTYPE,
         )
         self.loading_counts_by_rate = {
-            name: np.asarray(counts_by_state[index], dtype=FLOAT_DTYPE)
+            name: np.asarray(counts_by_state[..., index], dtype=FLOAT_DTYPE)
             for index, name in enumerate(prior_stats.rate_names)
         }
         self.loading_exposure_by_rate = {
-            name: np.asarray(exposure_by_state[index], dtype=FLOAT_DTYPE)
+            name: np.asarray(exposure_by_state[..., index], dtype=FLOAT_DTYPE)
             for index, name in enumerate(prior_stats.rate_names)
         }
 
@@ -874,6 +938,25 @@ def _interval_drive_probability(moments: MomentDict, n_intervals: int) -> np.nda
     return np.clip(values, 0.0, 1.0).astype(FLOAT_DTYPE)
 
 
+def _batch_loading_prior(prior_probabilities: np.ndarray, n_traces: int) -> np.ndarray:
+    prior = np.asarray(prior_probabilities, dtype=FLOAT_DTYPE)
+    if prior.ndim == 1:
+        return np.broadcast_to(prior[None, :], (n_traces, prior.shape[0])).astype(FLOAT_DTYPE)
+    if prior.ndim == 2 and prior.shape[0] == n_traces:
+        return prior.astype(FLOAT_DTYPE)
+    raise ValueError("batched prior_probabilities must have shape (n_traces, n_loadings).")
+
+
+def _batch_noise(noise_std: np.ndarray, observed_shape: tuple[int, int]) -> np.ndarray:
+    noise = np.asarray(noise_std, dtype=FLOAT_DTYPE)
+    try:
+        return np.broadcast_to(noise, observed_shape).astype(FLOAT_DTYPE)
+    except ValueError as exc:
+        if noise.shape == (observed_shape[0],):
+            return np.broadcast_to(noise[:, None], observed_shape).astype(FLOAT_DTYPE)
+        raise ValueError("noise_std must broadcast to observed shape.") from exc
+
+
 def _load_prior_stats_from_parents(
     parent_moments: dict[str, MomentDict],
     n_loadings: int,
@@ -892,15 +975,12 @@ def _load_prior_stats_from_parents(
         dtype=FLOAT_DTYPE,
     )
     interval_durations = np.asarray(promoter["interval_durations"], dtype=FLOAT_DTYPE)
-    if state_probabilities.ndim == 3:
-        if state_probabilities.shape[0] != 1:
-            raise NotImplementedError("batched Pol2 loading priors are not implemented yet.")
-        state_probabilities = state_probabilities[0]
-    if state_probabilities.shape[-1] != loading_rate_moments.means.size:
+    n_states = state_probabilities.shape[-1]
+    if loading_rate_moments.means.shape[-1] != n_states:
         raise ValueError("number of loading-rate parents must match promoter states.")
-    if state_probabilities.shape[0] < n_loadings:
+    if state_probabilities.shape[-2] < n_loadings:
         raise ValueError("promoter interval grid is shorter than the Pol2 loading grid.")
-    state_probabilities = state_probabilities[:n_loadings]
+    state_probabilities = state_probabilities[..., :n_loadings, :]
     interval_durations = interval_durations[:n_loadings]
     per_state_load_probability = _expected_load_probability(
         loading_rate_moments,
@@ -967,33 +1047,39 @@ def _state_loading_rate_moments_from_moments(
         gamma_rates = [rate for _, _, _, _, rate in fallback]
     else:
         return None
-    mean_array = np.asarray(means, dtype=FLOAT_DTYPE)
-    if mean_array.ndim != 1:
+    mean_array = np.stack(means, axis=-1).astype(FLOAT_DTYPE)
+    if mean_array.ndim not in {1, 2}:
         raise NotImplementedError("plated loading-rate priors are not implemented yet.")
     expected_log_array = None
     if any(expected_log is not None for expected_log in expected_logs):
-        expected_log_array = np.asarray(
+        expected_log_array = np.stack(
             [
                 expected_log if expected_log is not None else np.log(np.clip(mean, 1e-20, None))
                 for expected_log, mean in zip(expected_logs, means)
             ],
-            dtype=FLOAT_DTYPE,
-        )
-        if expected_log_array.ndim != 1:
+            axis=-1,
+        ).astype(FLOAT_DTYPE)
+        if expected_log_array.ndim not in {1, 2}:
             raise NotImplementedError("plated loading-rate priors are not implemented yet.")
     has_gamma = tuple(
         shape is not None and rate is not None for shape, rate in zip(shapes, gamma_rates)
     )
     if any(has_gamma):
-        shape_array = np.asarray(
-            [shape if shape is not None else np.nan for shape in shapes],
-            dtype=FLOAT_DTYPE,
-        )
-        rate_array = np.asarray(
-            [rate if rate is not None else np.nan for rate in gamma_rates],
-            dtype=FLOAT_DTYPE,
-        )
-        if shape_array.ndim != 1 or rate_array.ndim != 1:
+        shape_array = np.stack(
+            [
+                shape if shape is not None else np.full_like(mean, np.nan, dtype=FLOAT_DTYPE)
+                for shape, mean in zip(shapes, means)
+            ],
+            axis=-1,
+        ).astype(FLOAT_DTYPE)
+        rate_array = np.stack(
+            [
+                rate if rate is not None else np.full_like(mean, np.nan, dtype=FLOAT_DTYPE)
+                for rate, mean in zip(gamma_rates, means)
+            ],
+            axis=-1,
+        ).astype(FLOAT_DTYPE)
+        if shape_array.ndim not in {1, 2} or rate_array.ndim not in {1, 2}:
             raise NotImplementedError("plated loading-rate priors are not implemented yet.")
         return _LoadingRateMoments(
             names=names,
@@ -1008,7 +1094,7 @@ def _state_loading_rate_moments_from_moments(
 
 def _loading_intensity_from_prior_stats(prior_stats: _LoadingPriorStats) -> np.ndarray:
     intensity = np.sum(
-        prior_stats.state_probabilities * prior_stats.rate_means[None, :],
+        prior_stats.state_probabilities * prior_stats.rate_means[..., None, :],
         axis=-1,
         dtype=FLOAT_DTYPE,
     )
@@ -1021,14 +1107,17 @@ def _expected_load_probability(
 ) -> np.ndarray:
     dt = np.asarray(interval_durations, dtype=FLOAT_DTYPE)
     means = np.asarray(loading_rate_moments.means, dtype=FLOAT_DTYPE)
-    probability = 1.0 - np.exp(-dt[:, None] * means[None, :])
+    dt_view = dt.reshape((1,) * (means.ndim - 1) + (dt.size, 1))
+    probability = 1.0 - np.exp(-dt_view * means[..., None, :])
     if loading_rate_moments.shapes is not None and loading_rate_moments.rates is not None:
         shapes = np.asarray(loading_rate_moments.shapes, dtype=FLOAT_DTYPE)
         rates = np.asarray(loading_rate_moments.rates, dtype=FLOAT_DTYPE)
-        survival = (rates[None, :] / (rates[None, :] + dt[:, None])) ** shapes[None, :]
+        survival = (rates[..., None, :] / (rates[..., None, :] + dt_view)) ** shapes[
+            ..., None, :
+        ]
         gamma_probability = 1.0 - survival
         gamma_mask = np.asarray(loading_rate_moments.gamma_mask, dtype=bool)
-        probability = np.where(gamma_mask[None, :], gamma_probability, probability)
+        probability = np.where(gamma_mask.reshape((1,) * (probability.ndim - 1) + (-1,)), gamma_probability, probability)
     return np.clip(probability, 1e-7, 1.0 - 1e-7).astype(FLOAT_DTYPE)
 
 
@@ -1041,50 +1130,67 @@ def _promoter_loading_child_potentials(
     loading_rate_moments = _state_loading_rate_moments_from_moments(blanket_moments)
     if loading_rate_moments is None:
         return None
-    if loading_rate_moments.means.size != n_states:
+    if loading_rate_moments.means.shape[-1] != n_states:
         raise ValueError("number of loading-rate blanket nodes must match promoter states.")
     interval_durations = np.diff(np.asarray(time_grid, dtype=FLOAT_DTYPE))
-    potentials = np.zeros((interval_durations.size, n_states), dtype=FLOAT_DTYPE)
+    rate_batch_shape = loading_rate_moments.means.shape[:-1]
+    potentials = None
     found = False
     for moments in child_moments.values():
         if "expected_loading_counts" in moments:
             found = True
             counts = np.asarray(moments["expected_loading_counts"], dtype=FLOAT_DTYPE)
-            if counts.ndim != 1:
+            if counts.ndim not in {1, 2}:
                 raise NotImplementedError("batched Pol2-to-promoter messages are not implemented yet.")
-            if counts.size > interval_durations.size:
+            if counts.shape[-1] > interval_durations.size:
                 raise ValueError("Pol2 loading posterior is longer than the promoter interval grid.")
-            n_loadings = counts.size
+            n_loadings = counts.shape[-1]
+            batch_shape = np.broadcast_shapes(rate_batch_shape, counts.shape[:-1])
+            if potentials is None:
+                potentials = np.zeros(batch_shape + (interval_durations.size, n_states), dtype=FLOAT_DTYPE)
             dt = interval_durations[:n_loadings]
             expected_logs = loading_rate_moments.expected_logs
             if expected_logs is None:
                 expected_logs = np.log(np.clip(loading_rate_moments.means, 1e-20, None))
+            expected_logs = np.broadcast_to(expected_logs, batch_shape + (n_states,))
+            means = np.broadcast_to(loading_rate_moments.means, batch_shape + (n_states,))
+            counts = np.broadcast_to(counts, batch_shape + (n_loadings,))
             interval_log_potential = (
-                counts[:, None] * expected_logs[None, :]
-                - dt[:, None] * loading_rate_moments.means[None, :]
+                counts[..., :, None] * expected_logs[..., None, :]
+                - dt.reshape((1,) * len(batch_shape) + (n_loadings, 1)) * means[..., None, :]
             )
-            potentials[:n_loadings] += (interval_log_potential / dt[:, None]).astype(
-                FLOAT_DTYPE
-            )
+            potentials[..., :n_loadings, :] += (
+                interval_log_potential
+                / dt.reshape((1,) * len(batch_shape) + (n_loadings, 1))
+            ).astype(FLOAT_DTYPE)
             continue
         if "load_probabilities" not in moments:
             continue
         found = True
         load_probabilities = np.asarray(moments["load_probabilities"], dtype=FLOAT_DTYPE)
-        if load_probabilities.ndim != 1:
+        if load_probabilities.ndim not in {1, 2}:
             raise NotImplementedError("batched Pol2-to-promoter messages are not implemented yet.")
-        if load_probabilities.size > interval_durations.size:
+        if load_probabilities.shape[-1] > interval_durations.size:
             raise ValueError("Pol2 loading posterior is longer than the promoter interval grid.")
-        n_loadings = load_probabilities.size
+        n_loadings = load_probabilities.shape[-1]
+        batch_shape = np.broadcast_shapes(rate_batch_shape, load_probabilities.shape[:-1])
+        if potentials is None:
+            potentials = np.zeros(batch_shape + (interval_durations.size, n_states), dtype=FLOAT_DTYPE)
         q_load = np.clip(load_probabilities, 0.0, 1.0)
+        q_load = np.broadcast_to(q_load, batch_shape + (n_loadings,))
         dt = interval_durations[:n_loadings]
         log_load = _expected_log_load_probability(loading_rate_moments, dt)
-        log_no_load = -dt[:, None] * loading_rate_moments.means[None, :]
+        log_load = np.broadcast_to(log_load, batch_shape + (n_loadings, n_states))
+        means = np.broadcast_to(loading_rate_moments.means, batch_shape + (n_states,))
+        dt_view = dt.reshape((1,) * len(batch_shape) + (n_loadings, 1))
+        log_no_load = -dt_view * means[..., None, :]
         interval_log_potential = (
-            q_load[:, None] * log_load + (1.0 - q_load[:, None]) * log_no_load
+            q_load[..., :, None] * log_load + (1.0 - q_load[..., :, None]) * log_no_load
         )
-        potentials[:n_loadings] += (interval_log_potential / dt[:, None]).astype(FLOAT_DTYPE)
+        potentials[..., :n_loadings, :] += (interval_log_potential / dt_view).astype(FLOAT_DTYPE)
     if not found:
+        return None
+    if potentials is None:
         return None
     return potentials.astype(FLOAT_DTYPE)
 
@@ -1095,7 +1201,8 @@ def _expected_log_load_probability(
 ) -> np.ndarray:
     dt = np.asarray(interval_durations, dtype=FLOAT_DTYPE)
     means = np.asarray(loading_rate_moments.means, dtype=FLOAT_DTYPE)
-    x = np.maximum(dt[:, None] * means[None, :], np.float32(1e-20))
+    dt_view = dt.reshape((1,) * (means.ndim - 1) + (dt.size, 1))
+    x = np.maximum(dt_view * means[..., None, :], np.float32(1e-20))
     expected_log = np.log(-np.expm1(-x)).astype(FLOAT_DTYPE)
     if loading_rate_moments.shapes is None or loading_rate_moments.rates is None:
         return expected_log
@@ -1103,12 +1210,17 @@ def _expected_log_load_probability(
     shapes = np.asarray(loading_rate_moments.shapes, dtype=FLOAT_DTYPE)
     rates = np.asarray(loading_rate_moments.rates, dtype=FLOAT_DTYPE)
     terms = np.arange(1, 257, dtype=FLOAT_DTYPE)
-    scaled = rates[None, None, :] / (
-        rates[None, None, :] + terms[:, None, None] * dt[None, :, None]
+    scaled = rates[None, ..., None, :] / (
+        rates[None, ..., None, :] + terms.reshape((-1,) + (1,) * means.ndim + (1,)) * dt_view
     )
-    series = np.sum((scaled**shapes[None, None, :]) / terms[:, None, None], axis=0)
+    series = np.sum(
+        (scaled**shapes[None, ..., None, :])
+        / terms.reshape((-1,) + (1,) * (expected_log.ndim)),
+        axis=0,
+    )
     gamma_mask = np.asarray(loading_rate_moments.gamma_mask, dtype=bool)
-    return np.where(gamma_mask[None, :], -series, expected_log).astype(FLOAT_DTYPE)
+    mask = gamma_mask.reshape((1,) * (expected_log.ndim - 1) + (-1,))
+    return np.where(mask, -series, expected_log).astype(FLOAT_DTYPE)
 
 
 def _validate_sampler_fine_grid(fine_grid: np.ndarray) -> np.ndarray:
@@ -1165,11 +1277,18 @@ def _wrap_interval_generators(
 def _add_user_potentials(base: np.ndarray, user_potentials: np.ndarray) -> np.ndarray:
     base = np.asarray(base, dtype=FLOAT_DTYPE)
     user = np.asarray(user_potentials, dtype=FLOAT_DTYPE)
-    if base.ndim == 2:
-        return (base + np.broadcast_to(user, base.shape)).astype(FLOAT_DTYPE)
+    base_was_unbatched = base.ndim == 2
+    user_was_unbatched = user.ndim == 2
+    if base_was_unbatched:
+        base = base[None, :, :]
     if user.ndim == 2:
         user = user[None, :, :]
-    return (base + np.broadcast_to(user, base.shape)).astype(FLOAT_DTYPE)
+    batch_shape = np.broadcast_shapes(base.shape[:-2], user.shape[:-2])
+    target_shape = batch_shape + base.shape[-2:]
+    result = np.broadcast_to(base, target_shape) + np.broadcast_to(user, target_shape)
+    if base_was_unbatched and user_was_unbatched:
+        return result[0].astype(FLOAT_DTYPE)
+    return result.astype(FLOAT_DTYPE)
 
 
 def _constant_interval_duration(time_grid: np.ndarray) -> float:
@@ -1187,7 +1306,7 @@ def _sum_child_stat(context: UpdateContext, key: str) -> np.ndarray | None:
     ]
     if not values:
         return None
-    return np.sum(np.stack(values), axis=0, dtype=FLOAT_DTYPE)
+    return _sum_stat_values(values)
 
 
 def _sum_child_loading_stat(
@@ -1204,7 +1323,7 @@ def _sum_child_loading_stat(
             if isinstance(keyed, dict) and rate_node_name in keyed:
                 values.append(np.asarray(keyed[rate_node_name], dtype=FLOAT_DTYPE))
     if values:
-        return np.sum(np.stack(values), axis=0, dtype=FLOAT_DTYPE)
+        return _sum_stat_values(values)
     value = _sum_child_stat(context, key)
     if value is None or state_index is None:
         return value
@@ -1229,7 +1348,7 @@ def _sum_child_transition_counts(
             values.append(np.sum(jumps[..., to_state, from_state], axis=-1, dtype=FLOAT_DTYPE))
     if not values:
         return None
-    return np.sum(np.stack(values), axis=0, dtype=FLOAT_DTYPE)
+    return _sum_stat_values(values)
 
 
 def _sum_child_transition_exposure(context: UpdateContext, from_state: int) -> np.ndarray | None:
@@ -1243,7 +1362,7 @@ def _sum_child_transition_exposure(context: UpdateContext, from_state: int) -> n
             values.append(np.sum(occupancy[..., from_state], axis=-1, dtype=FLOAT_DTYPE))
     if not values:
         return None
-    return np.sum(np.stack(values), axis=0, dtype=FLOAT_DTYPE)
+    return _sum_stat_values(values)
 
 
 def _match_parameter_shape(value: np.ndarray, target_shape: tuple[int, ...]) -> np.ndarray:
@@ -1260,6 +1379,16 @@ def _match_parameter_shape(value: np.ndarray, target_shape: tuple[int, ...]) -> 
             dtype=FLOAT_DTYPE,
         )
     return np.broadcast_to(value, target_shape).astype(FLOAT_DTYPE)
+
+
+def _sum_stat_values(values: list[np.ndarray]) -> np.ndarray:
+    try:
+        return np.sum(np.stack(values), axis=0, dtype=FLOAT_DTYPE)
+    except ValueError:
+        return np.asarray(
+            sum(float(np.sum(value, dtype=FLOAT_DTYPE)) for value in values),
+            dtype=FLOAT_DTYPE,
+        )
 
 
 def _collect_contact_survival_stats(

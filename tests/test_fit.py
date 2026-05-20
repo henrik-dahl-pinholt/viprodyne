@@ -6,7 +6,7 @@ from viprodyne import CAVIConfig, MS2Dataset, ModelConfig, ViprodyneModel, run_c
 def make_model():
     dataset = MS2Dataset(
         name="track_0",
-        observed=np.array([0.2, 0.9], dtype=np.float32),
+        observed=np.array([[0.2, 0.9]], dtype=np.float32),
         noise_std=np.float32(0.5),
     )
     return ViprodyneModel(
