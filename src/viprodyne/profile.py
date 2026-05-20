@@ -73,6 +73,7 @@ def profile_contact_threshold(
                     candidate,
                     less_than=less_than,
                 ),
+                contact_score=None,
             )
             for dataset in datasets
         )

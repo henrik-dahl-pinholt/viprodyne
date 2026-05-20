@@ -875,9 +875,12 @@ class RcNode(VariationalNode):
     contact_probability_fn: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None
     bounds: tuple[float, float] | None = None
     objective_fn: Callable[[np.ndarray, UpdateContext], float] | None = None
+    candidate_values: np.ndarray | None = None
     pinned: bool = False
     xatol: float = 1e-4
     maxiter: int = 80
+    objective_value: np.float32 = field(default=np.float32(0.0), init=False)
+    candidate_objective_values: np.ndarray | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         VariationalNode.__init__(self, self.name)
@@ -885,6 +888,13 @@ class RcNode(VariationalNode):
         self.time_grid = np.asarray(self.time_grid, dtype=FLOAT_DTYPE)
         if np.any(self.value <= 0.0):
             raise ValueError("rc must be positive.")
+        if self.candidate_values is not None:
+            candidates = np.asarray(self.candidate_values, dtype=FLOAT_DTYPE)
+            if candidates.ndim != 1 or candidates.size == 0:
+                raise ValueError("candidate_values must be a non-empty one-dimensional array.")
+            if np.any(candidates <= 0.0):
+                raise ValueError("candidate_values must be positive.")
+            self.candidate_values = candidates
 
     def update(self, context: UpdateContext) -> None:
         if self.pinned or self.objective_fn is None or self.bounds is None:
@@ -892,6 +902,30 @@ class RcNode(VariationalNode):
         lo, hi = self.bounds
         if not 0 < lo < hi:
             raise ValueError("bounds must satisfy 0 < lower < upper.")
+        if self.candidate_values is not None:
+            candidates = self.candidate_values[
+                (self.candidate_values >= np.float32(lo))
+                & (self.candidate_values <= np.float32(hi))
+            ]
+            if candidates.size == 0:
+                raise ValueError("candidate_values must include at least one value within bounds.")
+            values = np.asarray(
+                [
+                    self.objective_fn(np.asarray(candidate, dtype=FLOAT_DTYPE), context)
+                    for candidate in candidates
+                ],
+                dtype=FLOAT_DTYPE,
+            )
+            values = np.nan_to_num(values, nan=-np.inf)
+            best_value = np.max(values)
+            tied = np.flatnonzero(np.isclose(values, best_value, rtol=1e-6, atol=1e-6))
+            current = float(np.asarray(self.value, dtype=FLOAT_DTYPE))
+            best_index = int(tied[np.argmin(np.abs(candidates[tied] - current))])
+            self.value = np.asarray(candidates[best_index], dtype=FLOAT_DTYPE)
+            self.objective_value = np.asarray(values[best_index], dtype=FLOAT_DTYPE)
+            self.candidate_values = candidates.astype(FLOAT_DTYPE)
+            self.candidate_objective_values = values.astype(FLOAT_DTYPE)
+            return
 
         def objective(rc_value):
             return -self.objective_fn(np.asarray(rc_value, dtype=FLOAT_DTYPE), context)
@@ -905,6 +939,8 @@ class RcNode(VariationalNode):
         candidates = [(lo, -objective(lo)), (hi, -objective(hi)), (result.x, -result.fun)]
         best_value, _ = max(candidates, key=lambda item: item[1])
         self.value = np.asarray(best_value, dtype=FLOAT_DTYPE)
+        self.objective_value = np.asarray(max(value for _, value in candidates), dtype=FLOAT_DTYPE)
+        self.candidate_objective_values = None
 
     def moments(self) -> MomentDict:
         value = np.asarray(self.value, dtype=FLOAT_DTYPE)
@@ -912,10 +948,18 @@ class RcNode(VariationalNode):
             "mean": value,
             "expected_log": np.log(value).astype(FLOAT_DTYPE),
             "rc": value,
+            "map_objective": np.asarray(self.objective_value, dtype=FLOAT_DTYPE),
         }
         if self.contact_probability_fn is not None:
             moments["p_contact"] = np.asarray(
                 self.contact_probability_fn(self.time_grid, value),
+                dtype=FLOAT_DTYPE,
+            )
+        if self.candidate_values is not None:
+            moments["candidate_values"] = np.asarray(self.candidate_values, dtype=FLOAT_DTYPE)
+        if self.candidate_objective_values is not None:
+            moments["candidate_objective_values"] = np.asarray(
+                self.candidate_objective_values,
                 dtype=FLOAT_DTYPE,
             )
         return moments

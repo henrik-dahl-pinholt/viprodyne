@@ -98,6 +98,36 @@ profile = profile_contact_threshold(
 print(profile.best_value, profile.elbos)
 ```
 
+For coordinate updates inside one model, pass the score on the dataset and,
+optionally, an `rc` candidate grid on the config:
+
+```python
+dataset = MS2Dataset(
+    name="condition_0",
+    observed=observed,
+    noise_std=np.float32(0.5),
+    time_grid=time_grid,
+    contact_score=contact_score,
+)
+
+model = ViprodyneModel(
+    datasets=(dataset,),
+    config=ModelConfig(
+        n_states=2,
+        driven_transition_indices=(1,),
+        rc_initial=np.float32(0.3),
+        rc_bounds=(0.1, 1.0),
+        rc_candidate_values=np.linspace(0.1, 1.0, 10, dtype=np.float32),
+    ),
+)
+
+fit = model.run_inference(CAVIConfig(max_iterations=100))
+print(fit.datasets["condition_0"].contact_rc)
+```
+
+If `rc_candidate_values` is omitted, viprodyne builds a threshold grid from the
+finite contact-score values inside `rc_bounds`.
+
 A rendered notebook with visible output is in
 `examples/contact_threshold_profile.ipynb`; the same workflow is also available
 as a small script in `examples/contact_threshold_profile.py`.

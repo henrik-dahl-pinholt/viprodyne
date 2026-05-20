@@ -397,6 +397,36 @@ Driven transition rates can be scoped as track, dataset, or global rates. The
 contact-drive node remains per track/dataset plate, so a shared driven-rate node
 can still receive different contact probabilities from different traces.
 
+If the contact drive is not pre-thresholded, pass `MS2Dataset.contact_score`
+instead of `contact_probability`. The model then builds an unpinned `RcNode`
+which emits `p_contact(t)` from the current threshold and updates `rc` from the
+promoter-state Markov blanket:
+
+```python
+dataset = MS2Dataset(
+    name="condition_0",
+    observed=observed,
+    noise_std=np.float32(0.5),
+    time_grid=time_grid,
+    contact_score=contact_score,
+)
+
+model = ViprodyneModel(
+    datasets=(dataset,),
+    config=ModelConfig(
+        n_states=2,
+        driven_transition_indices=(1,),
+        rc_initial=np.float32(0.3),
+        rc_bounds=(0.1, 1.0),
+        rc_candidate_values=np.linspace(0.1, 1.0, 10, dtype=np.float32),
+    ),
+)
+```
+
+When `rc_candidate_values` is omitted, the model derives a candidate grid from
+the finite score values inside `rc_bounds`. Explicit candidates are preferred
+when the user wants a specific profile grid or comparable output across fits.
+
 ## Contact-Threshold Profiles
 
 Notebook-style `rc` profiles, where an external score is thresholded into a
@@ -434,10 +464,8 @@ package-native version of the ad hoc profile loop used in the
 - Dense mean-field/exact Pol2 modes remain available internally, but should not
   be used for large regular MS2 traces because dense memory scales as
   `O(n_observations * n_loadings)`.
-- Driven `RcNode` currently supports pinned contact probabilities or an injected
-  objective function. The threshold-profile helper covers grid-search profiles,
-  but a direct production data adapter for optimizing `rc` inside `RcNode` is
-  still pending.
+- Direct `RcNode` threshold updates are MAP/grid updates. Full posterior
+  quadrature over `rc` is still pending.
 
 ## Verification Strategy
 
@@ -458,7 +486,8 @@ Tests cover:
   signal, and promoter state probabilities;
 - Gamma/Dirichlet parameter entropy and pinned-node behavior;
 - driven contact-survival MAP profiles and driven promoter tilts;
-- contact-threshold profile plumbing;
+- contact-threshold profile plumbing and direct in-graph `RcNode` threshold
+  updates;
 - graph Markov-blanket wiring;
 - top-level graph construction with shared, scoped, and driven parameter nodes;
 - CAVI convergence monitoring without per-iteration ELBO evaluation.

@@ -206,6 +206,37 @@ def test_rc_node_emits_contact_probability_and_can_optimize_map_value():
     np.testing.assert_allclose(moments["p_contact"], np.exp(-time_grid / np.float32(2.0)))
 
 
+def test_rc_node_can_use_candidate_grid_for_map_value():
+    time_grid = np.linspace(0.0, 3.0, 4, dtype=np.float32)
+
+    def contact_probability(times, rc):
+        del times
+        return np.asarray([rc > 0.5, rc > 1.0, rc > 1.5], dtype=np.float32)
+
+    def objective(rc, context):
+        del context
+        return -float((rc - np.float32(0.75)) ** 2)
+
+    node = RcNode(
+        name="rc",
+        value=np.float32(0.3),
+        time_grid=time_grid,
+        contact_probability_fn=contact_probability,
+        bounds=(0.25, 2.0),
+        objective_fn=objective,
+        candidate_values=np.array([0.3, 0.75, 1.5], dtype=np.float32),
+    )
+    graph = VariationalGraph()
+    graph.add_node(node)
+
+    graph.run_schedule(["rc"])
+    moments = node.moments()
+
+    assert moments["mean"] == pytest.approx(0.75)
+    assert moments["candidate_objective_values"].dtype == np.float32
+    np.testing.assert_allclose(moments["p_contact"], [1.0, 0.0, 0.0])
+
+
 def test_promoter_state_uses_parent_rates_and_emits_sufficient_statistics():
     graph = VariationalGraph()
     pi = InitialStateProb(

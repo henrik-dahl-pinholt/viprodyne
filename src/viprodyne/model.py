@@ -14,6 +14,7 @@ from viprodyne.core.ms2_kernels import (
     build_ms2_observation_model,
     resolve_ms2_kernel,
 )
+from viprodyne.core.contact_survival import ContactSurvivalStats, contact_survival_log_profile
 from viprodyne.core.rate_edges import RateEdge, transition_states
 from viprodyne.variational import (
     DrivenRateMap,
@@ -52,6 +53,8 @@ class DatasetInferenceResult:
     loading_rates: dict[int, np.ndarray]
     transition_rate_nodes: dict[int, str]
     loading_rate_nodes: dict[int, str]
+    contact_rc: np.ndarray | None = None
+    contact_probability: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -75,6 +78,7 @@ class MS2Dataset:
     sampling_times: np.ndarray | None = None
     finite_mask: np.ndarray | None = None
     contact_probability: np.ndarray | None = None
+    contact_score: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -98,6 +102,8 @@ class MS2Dataset:
             mask = np.asarray(self.finite_mask, dtype=bool)
             if mask.shape != observed.shape:
                 raise ValueError("finite_mask must have the same shape as observed.")
+        if self.contact_probability is not None and self.contact_score is not None:
+            raise ValueError("pass either contact_probability or contact_score, not both.")
 
     @property
     def n_traces(self) -> int:
@@ -148,6 +154,10 @@ class ModelConfig:
     driven_rate_bounds: tuple[float, float] = (1e-6, 1.0)
     driven_prior_shape: float = 1.0
     driven_prior_rate: float = 0.0
+    rc_initial: np.ndarray | float = np.float32(0.5)
+    rc_bounds: tuple[float, float] = (1e-6, 1.0)
+    rc_candidate_values: np.ndarray | None = None
+    contact_score_less_than: bool = True
 
     def __post_init__(self) -> None:
         if self.n_states < 2:
@@ -235,6 +245,18 @@ class ModelConfig:
             raise ValueError("driven_prior_shape must be positive.")
         if self.driven_prior_rate < 0:
             raise ValueError("driven_prior_rate must be non-negative.")
+        lo_rc, hi_rc = self.rc_bounds
+        if not 0 < lo_rc < hi_rc:
+            raise ValueError("rc_bounds must satisfy 0 < lower < upper.")
+        if np.any(np.asarray(self.rc_initial, dtype=FLOAT_DTYPE) <= 0.0):
+            raise ValueError("rc_initial must be positive.")
+        if self.rc_candidate_values is not None:
+            candidates = np.asarray(self.rc_candidate_values, dtype=FLOAT_DTYPE)
+            if candidates.ndim != 1 or candidates.size == 0:
+                raise ValueError("rc_candidate_values must be a non-empty one-dimensional array.")
+            if np.any(candidates <= 0.0):
+                raise ValueError("rc_candidate_values must be positive.")
+            object.__setattr__(self, "rc_candidate_values", candidates)
 
 
 @dataclass
@@ -312,6 +334,8 @@ class ViprodyneModel:
             if polymerase_name is not None
             else {}
         )
+        contact_name = nodes["contact_drive"]
+        contact = self.graph.moments.get(str(contact_name)) if contact_name is not None else {}
         sampling_times = None
         if polymerase_name is not None:
             sampling_times = np.asarray(
@@ -354,6 +378,8 @@ class ViprodyneModel:
             },
             transition_rate_nodes=transition_rate_nodes,
             loading_rate_nodes=loading_rate_nodes,
+            contact_rc=_optional_float_moment(contact, "rc"),
+            contact_probability=_optional_float_moment(contact, "p_contact"),
         )
 
     def default_schedule(self) -> tuple[str, ...]:
@@ -443,7 +469,7 @@ class ViprodyneModel:
         self.graph.add_node(initial)
 
         transition_names = self._add_transition_rates(dataset.name)
-        contact_drive_name = self._add_contact_drive(dataset)
+        contact_drive_name = self._add_contact_drive(dataset, transition_names)
         rate_edges = tuple(
             self._rate_edge(index, transition_name, contact_drive_name)
             for index, transition_name in enumerate(transition_names)
@@ -710,32 +736,128 @@ class ViprodyneModel:
             transition_index=transition_index,
         )
 
-    def _add_contact_drive(self, dataset: MS2Dataset) -> str | None:
+    def _add_contact_drive(self, dataset: MS2Dataset, transition_names: list[str]) -> str | None:
         if not self.config.driven_transition_indices:
             return None
-        if dataset.contact_probability is None:
-            raise ValueError("driven transition models require dataset.contact_probability.")
-        contact = np.asarray(dataset.contact_probability, dtype=FLOAT_DTYPE)
         time_grid = self._time_grid(dataset)
         n_intervals = time_grid.size - 1
-        if contact.ndim == 0 or contact.shape[-1] not in (n_intervals, n_intervals + 1):
-            raise ValueError("contact_probability last axis must match intervals or grid points.")
         contact_name = f"{dataset.name}:rc"
+        if dataset.contact_probability is not None:
+            contact = np.asarray(dataset.contact_probability, dtype=FLOAT_DTYPE)
+            if contact.ndim == 0 or contact.shape[-1] not in (n_intervals, n_intervals + 1):
+                raise ValueError("contact_probability last axis must match intervals or grid points.")
 
-        def fixed_contact_probability(times, rc):
-            del times, rc
-            return contact
+            def fixed_contact_probability(times, rc):
+                del times, rc
+                return contact
 
+            self.graph.add_node(
+                RcNode(
+                    name=contact_name,
+                    value=np.float32(1.0),
+                    time_grid=time_grid,
+                    contact_probability_fn=fixed_contact_probability,
+                    pinned=True,
+                )
+            )
+            return contact_name
+
+        if dataset.contact_score is None:
+            raise ValueError(
+                "driven transition models require dataset.contact_probability or "
+                "dataset.contact_score."
+            )
+        contact_score = np.asarray(dataset.contact_score, dtype=FLOAT_DTYPE)
+        if contact_score.ndim == 0 or contact_score.shape[-1] not in (
+            n_intervals,
+            n_intervals + 1,
+        ):
+            raise ValueError("contact_score last axis must match intervals or grid points.")
+
+        def threshold_contact_probability(times, rc):
+            del times
+            return _threshold_contact_score(
+                contact_score,
+                rc,
+                less_than=self.config.contact_score_less_than,
+            )
+
+        objective = self._contact_threshold_objective(
+            contact_score=contact_score,
+            transition_names=transition_names,
+            less_than=self.config.contact_score_less_than,
+        )
+        candidate_values = (
+            self.config.rc_candidate_values
+            if self.config.rc_candidate_values is not None
+            else _default_rc_candidate_values(contact_score, self.config.rc_bounds)
+        )
         self.graph.add_node(
             RcNode(
                 name=contact_name,
-                value=np.float32(1.0),
+                value=self.config.rc_initial,
                 time_grid=time_grid,
-                contact_probability_fn=fixed_contact_probability,
-                pinned=True,
+                contact_probability_fn=threshold_contact_probability,
+                bounds=self.config.rc_bounds,
+                objective_fn=objective,
+                candidate_values=candidate_values,
             )
         )
         return contact_name
+
+    def _contact_threshold_objective(
+        self,
+        *,
+        contact_score: np.ndarray,
+        transition_names: list[str],
+        less_than: bool,
+    ):
+        driven_edges = tuple(
+            (
+                index,
+                transition_states(self.config.n_states, index),
+                transition_names[index],
+            )
+            for index in self.config.driven_transition_indices
+        )
+
+        def objective(rc_value, context) -> float:
+            child_moments = context.child_moments()
+            blanket_moments = context.blanket_moments()
+            total = 0.0
+            for moments in child_moments.values():
+                if not {"expected_occupancy", "expected_jumps", "interval_durations"} <= moments.keys():
+                    continue
+                occupancy = np.asarray(moments["expected_occupancy"], dtype=FLOAT_DTYPE)
+                jumps = np.asarray(moments["expected_jumps"], dtype=FLOAT_DTYPE)
+                interval_durations = np.asarray(moments["interval_durations"], dtype=FLOAT_DTYPE)
+                dt = _constant_interval_duration(interval_durations)
+                p_contact = _interval_threshold_contact_score(
+                    contact_score,
+                    rc_value,
+                    n_intervals=interval_durations.size,
+                    less_than=less_than,
+                )
+                for _, (to_state, from_state), rate_name in driven_edges:
+                    if rate_name not in blanket_moments:
+                        continue
+                    rate = np.asarray(
+                        blanket_moments[rate_name]["mean"],
+                        dtype=FLOAT_DTYPE,
+                    )
+                    gamma_from = occupancy[..., from_state] / np.float32(dt)
+                    gamma_jump = jumps[..., to_state, from_state] / np.float32(dt)
+                    p_broadcast = np.broadcast_to(p_contact, gamma_from.shape).astype(FLOAT_DTYPE)
+                    total += _contact_survival_log_likelihood(
+                        log_rate=np.log(np.clip(rate, 1e-20, None)).astype(FLOAT_DTYPE),
+                        gamma_jump=gamma_jump,
+                        gamma_from=gamma_from,
+                        p_contact=p_broadcast,
+                        dt=dt,
+                    )
+            return float(total)
+
+        return objective
 
     def _time_grid(self, dataset: MS2Dataset) -> np.ndarray:
         if dataset.time_grid is not None:
@@ -751,6 +873,101 @@ def _validate_time_grid(time_grid: np.ndarray, name: str) -> np.ndarray:
     if np.any(np.diff(time_grid) <= 0):
         raise ValueError(f"{name} must be strictly increasing.")
     return time_grid
+
+
+def _threshold_contact_score(
+    score: np.ndarray,
+    threshold: np.ndarray,
+    *,
+    less_than: bool,
+) -> np.ndarray:
+    score = np.asarray(score, dtype=FLOAT_DTYPE)
+    threshold = np.asarray(threshold, dtype=FLOAT_DTYPE)
+    contact = score < threshold if less_than else score > threshold
+    return np.asarray(contact, dtype=FLOAT_DTYPE)
+
+
+def _interval_threshold_contact_score(
+    score: np.ndarray,
+    threshold: np.ndarray,
+    *,
+    n_intervals: int,
+    less_than: bool,
+) -> np.ndarray:
+    contact = _threshold_contact_score(score, threshold, less_than=less_than)
+    if contact.shape[-1] == n_intervals + 1:
+        contact = contact[..., 1:]
+    elif contact.shape[-1] != n_intervals:
+        raise ValueError("contact_score last axis must match intervals or grid points.")
+    return np.clip(contact, 0.0, 1.0).astype(FLOAT_DTYPE)
+
+
+def _constant_interval_duration(interval_durations: np.ndarray) -> float:
+    durations = np.asarray(interval_durations, dtype=FLOAT_DTYPE)
+    if durations.ndim != 1 or durations.size == 0:
+        raise ValueError("interval_durations must be a non-empty one-dimensional array.")
+    if not np.allclose(durations, durations[0], rtol=1e-6, atol=1e-7):
+        raise ValueError("RcNode threshold updates currently require a uniform time grid.")
+    return float(durations[0])
+
+
+def _default_rc_candidate_values(
+    contact_score: np.ndarray,
+    bounds: tuple[float, float],
+) -> np.ndarray:
+    lo, hi = map(np.float32, bounds)
+    values = np.unique(np.ravel(np.asarray(contact_score, dtype=FLOAT_DTYPE)))
+    values = values[np.isfinite(values)]
+    values = values[(values > lo) & (values < hi)]
+    breaks = np.unique(np.concatenate([np.asarray([lo, hi], dtype=FLOAT_DTYPE), values]))
+    if breaks.size == 1:
+        return breaks.astype(FLOAT_DTYPE)
+    midpoints = (breaks[:-1] + breaks[1:]) / np.float32(2.0)
+    candidates = np.unique(
+        np.concatenate([np.asarray([lo, hi], dtype=FLOAT_DTYPE), midpoints.astype(FLOAT_DTYPE)])
+    )
+    return candidates[(candidates >= lo) & (candidates <= hi)].astype(FLOAT_DTYPE)
+
+
+def _contact_survival_log_likelihood(
+    *,
+    log_rate: np.ndarray,
+    gamma_jump: np.ndarray,
+    gamma_from: np.ndarray,
+    p_contact: np.ndarray,
+    dt: float,
+) -> float:
+    log_rate = np.asarray(log_rate, dtype=FLOAT_DTYPE)
+    gamma_jump = np.asarray(gamma_jump, dtype=FLOAT_DTYPE)
+    gamma_from = np.asarray(gamma_from, dtype=FLOAT_DTYPE)
+    p_contact = np.asarray(p_contact, dtype=FLOAT_DTYPE)
+    if gamma_jump.shape != gamma_from.shape or gamma_from.shape != p_contact.shape:
+        raise ValueError("gamma_jump, gamma_from, and p_contact must have matching shapes.")
+    if log_rate.shape == ():
+        stats = ContactSurvivalStats.from_posteriors(
+            gamma_jump=gamma_jump,
+            gamma_from=gamma_from,
+            p_contact=p_contact,
+            dt=dt,
+        )
+        return contact_survival_log_profile(float(log_rate), stats)
+
+    batch_shape = np.broadcast_shapes(log_rate.shape, gamma_from.shape[:-1])
+    n_intervals = gamma_from.shape[-1]
+    log_rate = np.broadcast_to(log_rate, batch_shape).astype(FLOAT_DTYPE)
+    gamma_jump = np.broadcast_to(gamma_jump, batch_shape + (n_intervals,)).astype(FLOAT_DTYPE)
+    gamma_from = np.broadcast_to(gamma_from, batch_shape + (n_intervals,)).astype(FLOAT_DTYPE)
+    p_contact = np.broadcast_to(p_contact, batch_shape + (n_intervals,)).astype(FLOAT_DTYPE)
+    total = 0.0
+    for index in np.ndindex(batch_shape):
+        stats = ContactSurvivalStats.from_posteriors(
+            gamma_jump=gamma_jump[index],
+            gamma_from=gamma_from[index],
+            p_contact=p_contact[index],
+            dt=dt,
+        )
+        total += contact_survival_log_profile(float(log_rate[index]), stats)
+    return float(total)
 
 
 def _optional_float_moment(moments: dict, key: str) -> np.ndarray | None:

@@ -565,6 +565,65 @@ def test_model_builds_driven_transition_with_dataset_contact_drive():
     assert "d0:rc" in model.default_schedule()
 
 
+def test_model_builds_driven_transition_with_dataset_contact_score():
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.array([[0.1, 0.9]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        contact_score=np.array([0.25, 0.75], dtype=np.float32),
+    )
+    model = ViprodyneModel(
+        datasets=(dataset,),
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+            driven_transition_indices=(1,),
+            driven_rate_initial=np.float32(0.8),
+            driven_rate_bounds=(1e-4, 10.0),
+            rc_initial=np.float32(0.5),
+            rc_bounds=(0.1, 1.0),
+            rc_candidate_values=np.array([0.3, 0.8], dtype=np.float32),
+        ),
+    )
+
+    assert isinstance(model.graph.nodes["d0:R1"], DrivenRateMap)
+    assert isinstance(model.graph.nodes["d0:rc"], RcNode)
+    assert not model.graph.nodes["d0:rc"].pinned
+    model.run_schedule(["d0:s", "d0:rc"])
+
+    moments = model.graph.moments.get("d0:rc")
+    assert moments["rc"] in (np.float32(0.3), np.float32(0.8))
+    assert moments["candidate_objective_values"].shape == (2,)
+    assert moments["p_contact"].shape == (2,)
+
+
+def test_model_derives_rc_candidates_from_contact_score_when_grid_is_omitted():
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.array([[0.1, 0.9, 0.2]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        contact_score=np.array([0.2, 0.5, 0.8], dtype=np.float32),
+    )
+    model = ViprodyneModel(
+        datasets=(dataset,),
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
+            driven_transition_indices=(1,),
+            rc_initial=np.float32(0.5),
+            rc_bounds=(0.1, 1.0),
+        ),
+    )
+
+    candidates = model.graph.moments.get("d0:rc")["candidate_values"]
+
+    assert candidates.dtype == np.float32
+    assert candidates[0] == pytest.approx(0.1)
+    assert candidates[-1] == pytest.approx(1.0)
+    assert np.any(np.isclose(candidates, np.float32(0.35)))
+    assert np.any(np.isclose(candidates, np.float32(0.65)))
+
+
 def test_model_requires_contact_probability_for_driven_transitions():
     with pytest.raises(ValueError, match="contact_probability"):
         ViprodyneModel(

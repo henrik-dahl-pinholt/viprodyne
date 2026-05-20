@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from viprodyne import (
     CAVIConfig,
@@ -6,6 +7,7 @@ from viprodyne import (
     MS2Dataset,
     ModelConfig,
     ProximalKernel,
+    ViprodyneModel,
     profile_contact_threshold,
 )
 
@@ -135,20 +137,63 @@ def test_profile_contact_threshold_recovers_latent_statistics_from_synthetic_dat
         candidate_values=np.array([0.2, 0.3, 0.4, 0.5, 0.6], dtype=np.float32),
         fit_config=CAVIConfig(max_iterations=20, min_iterations=20, tolerance=0.0),
     )
+    direct_dataset = MS2Dataset(
+        name="toy",
+        observed=observed,
+        noise_std=np.float32(0.08),
+        time_grid=time_grid,
+        contact_score=contact_score,
+    )
+    direct_model = ViprodyneModel(
+        datasets=(direct_dataset,),
+        config=ModelConfig(
+            n_states=2,
+            pol2_mode="transfer",
+            ms2_kernel="proximal",
+            t_rise=np.float32(0.5),
+            t_plateau=np.float32(0.5),
+            rna_intensity=np.float32(1.0),
+            driven_transition_indices=(1,),
+            driven_rate_initial=np.float32(1.0),
+            driven_rate_bounds=(1e-3, 5.0),
+            rc_initial=true_threshold,
+            rc_bounds=(0.2, 0.6),
+            rc_candidate_values=np.array([0.2, 0.3, 0.4, 0.5, 0.6], dtype=np.float32),
+        ),
+    )
+    direct_fit = direct_model.run_inference(
+        CAVIConfig(max_iterations=20, min_iterations=20, tolerance=0.0),
+    )
     fit = profile.best_fit.datasets["toy"]
+    direct = direct_fit.datasets["toy"]
     loading_posterior = np.asarray(fit.loading_posterior, dtype=np.float32)
+    direct_loading_posterior = np.asarray(direct.loading_posterior, dtype=np.float32)
     posterior_state_mean = np.asarray(fit.state_posterior, dtype=np.float32).mean(axis=0)
+    direct_state_mean = np.asarray(direct.state_posterior, dtype=np.float32).mean(axis=0)
     posterior_loading_mean = loading_posterior.mean(axis=0)
+    direct_loading_mean = direct_loading_posterior.mean(axis=0)
 
     assert profile.best_value == true_threshold
+    assert direct.contact_rc == pytest.approx(true_threshold)
+    np.testing.assert_allclose(
+        direct.contact_probability,
+        contact_probability,
+        atol=0.0,
+    )
     assert np.all(np.isfinite(profile.elbos))
     assert profile.elbos[profile.best_index] > profile.elbos[-1]
     assert np.mean((loading_posterior > 0.5) == latent_loadings) > 0.98
+    assert np.mean((direct_loading_posterior > 0.5) == latent_loadings) > 0.98
     assert _rmse(np.asarray(fit.predicted_signal, dtype=np.float32), clean_signal) < 0.03
+    assert _rmse(np.asarray(direct.predicted_signal, dtype=np.float32), clean_signal) < 0.03
     assert _correlation(posterior_loading_mean, truth["loading_probability"]) > 0.93
+    assert _correlation(direct_loading_mean, truth["loading_probability"]) > 0.93
     assert np.mean(np.abs(posterior_loading_mean - truth["loading_probability"])) < 0.05
+    assert np.mean(np.abs(direct_loading_mean - truth["loading_probability"])) < 0.05
     assert _correlation(posterior_state_mean[:, 1], truth["state_probability"][:, 1]) > 0.95
+    assert _correlation(direct_state_mean[:, 1], truth["state_probability"][:, 1]) > 0.95
     assert np.mean(np.abs(posterior_state_mean - truth["state_probability"])) < 0.18
+    assert np.mean(np.abs(direct_state_mean - truth["state_probability"])) < 0.18
 
 
 def _contact_threshold_truth(contact_probability: np.ndarray, dt: np.float32) -> dict[str, np.ndarray]:
