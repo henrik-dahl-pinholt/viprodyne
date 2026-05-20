@@ -120,8 +120,14 @@ def build_ms2_observation_model(
         raise ValueError("n_observations must be positive.")
     loading_times = time_grid[:-1]
     sampling_times_arr = _sampling_times(time_grid, n_observations, sampling_times)
-    if mode not in {"transfer", "mean_field", "exact"}:
-        raise ValueError("mode must be 'transfer', 'mean_field', or 'exact'.")
+    if mode not in {"transfer", "mean_field", "exact", "sampler"}:
+        raise ValueError("mode must be 'transfer', 'mean_field', 'exact', or 'sampler'.")
+    if mode == "sampler":
+        return MS2ObservationModel(
+            mode="sampler",
+            sampling_times=sampling_times_arr,
+            loading_times=loading_times,
+        )
     if mode == "transfer":
         window_weights, starts = transfer_windows_from_kernel(
             sampling_times_arr,

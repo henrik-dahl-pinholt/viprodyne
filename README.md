@@ -55,6 +55,9 @@ choose per-track, per-dataset, or global rate nodes. Run coordinate-ascent VI
 with `model.fit_cavi(...)`; convergence is monitored by parameter changes and
 the ELBO is computed only after the final sweep.
 
+`pol2_mode="auto"` uses the memory-efficient transfer backend. The continuous
+Pol2 sampler is available with `pol2_mode="sampler"` for proximal MS2 kernels.
+
 Install locally for development:
 
 ```bash

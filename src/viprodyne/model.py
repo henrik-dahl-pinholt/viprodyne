@@ -85,6 +85,14 @@ class ModelConfig:
     t_plateau: np.ndarray | float = np.float32(0.0)
     rna_intensity: np.ndarray | float = np.float32(1.0)
     kernel_support_tolerance: float = 1e-7
+    sampler_fine_grid: np.ndarray | None = None
+    sampler_seed: int = 0
+    sampler_iterations: int = 15_000
+    sampler_repeats: int = 100
+    sampler_compute_elbo: bool = False
+    sampler_elbo_iterations: int = 10_000
+    sampler_elbo_steps: int = 10
+    sampler_elbo_repeats: int = 20
     driven_transition_indices: tuple[int, ...] = ()
     driven_rate_initial: np.ndarray | float = np.float32(1.0)
     driven_rate_bounds: tuple[float, float] = (1e-6, 1.0)
@@ -96,10 +104,23 @@ class ModelConfig:
             raise ValueError("n_states must be at least 2.")
         if self.time_grid is not None:
             _validate_time_grid(self.time_grid, "time_grid")
-        if self.pol2_mode not in {"auto", "transfer", "mean_field", "exact"}:
-            raise ValueError("pol2_mode must be 'auto', 'transfer', 'mean_field', or 'exact'.")
+        if self.pol2_mode not in {"auto", "transfer", "mean_field", "exact", "sampler"}:
+            raise ValueError(
+                "pol2_mode must be 'auto', 'transfer', 'mean_field', 'exact', or 'sampler'."
+            )
         if self.kernel_support_tolerance < 0:
             raise ValueError("kernel_support_tolerance must be non-negative.")
+        if self.sampler_fine_grid is not None:
+            _validate_time_grid(self.sampler_fine_grid, "sampler_fine_grid")
+        for name in (
+            "sampler_iterations",
+            "sampler_repeats",
+            "sampler_elbo_iterations",
+            "sampler_elbo_steps",
+            "sampler_elbo_repeats",
+        ):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be positive.")
         object.__setattr__(
             self,
             "transition_rate_scope",
@@ -322,6 +343,18 @@ class ViprodyneModel:
                 mode=pol2_observation.mode,
                 window_weights=pol2_observation.window_weights,
                 observation_starts=pol2_observation.observation_starts,
+                sampling_times=pol2_observation.sampling_times,
+                fine_grid=self._sampler_fine_grid(pol2_observation),
+                rise_time=self._proximal_kernel().t_rise,
+                plateau_time=self._proximal_kernel().t_plateau,
+                rna_intensity=self._proximal_kernel().rna_intensity,
+                sampler_seed=self.config.sampler_seed,
+                sampler_iterations=self.config.sampler_iterations,
+                sampler_repeats=self.config.sampler_repeats,
+                sampler_compute_elbo=self.config.sampler_compute_elbo,
+                sampler_elbo_iterations=self.config.sampler_elbo_iterations,
+                sampler_elbo_steps=self.config.sampler_elbo_steps,
+                sampler_elbo_repeats=self.config.sampler_elbo_repeats,
             )
             self.graph.add_node(polymerase)
             self.graph.add_edge(promoter_name, polymerase_name)
@@ -428,6 +461,8 @@ class ViprodyneModel:
 
     def _pol2_observation_model(self, dataset: MS2Dataset) -> MS2ObservationModel | None:
         mode = self._pol2_mode()
+        if mode == "sampler":
+            self._validate_sampler_kernel()
         kernel = resolve_ms2_kernel(
             self.config.ms2_kernel,
             self.config.t_rise,
@@ -444,6 +479,33 @@ class ViprodyneModel:
             mode=mode,
             tolerance=self.config.kernel_support_tolerance,
         )
+
+    def _sampler_fine_grid(self, observation: MS2ObservationModel) -> np.ndarray | None:
+        if observation.mode != "sampler":
+            return None
+        if self.config.sampler_fine_grid is not None:
+            return _validate_time_grid(self.config.sampler_fine_grid, "sampler_fine_grid")
+        return np.asarray(observation.loading_times, dtype=FLOAT_DTYPE)
+
+    def _proximal_kernel(self) -> ProximalKernel:
+        if isinstance(self.config.ms2_kernel, ProximalKernel):
+            return self.config.ms2_kernel
+        return ProximalKernel(
+            t_rise=self.config.t_rise,
+            t_plateau=self.config.t_plateau,
+            rna_intensity=self.config.rna_intensity,
+        )
+
+    def _validate_sampler_kernel(self) -> None:
+        if isinstance(self.config.ms2_kernel, ProximalKernel):
+            return
+        if self.config.ms2_kernel is None:
+            raise ValueError("sampler Pol2 mode requires a proximal MS2 kernel.")
+        if isinstance(self.config.ms2_kernel, str):
+            name = self.config.ms2_kernel.lower()
+            if name in {"proximal", "ms2posterior"}:
+                return
+        raise ValueError("sampler Pol2 mode currently supports only ProximalKernel.")
 
     def _is_driven_transition(self, transition_index: int) -> bool:
         return transition_index in self.config.driven_transition_indices

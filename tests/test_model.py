@@ -255,6 +255,37 @@ def test_model_uses_transfer_pol2_mode_from_kernel_config():
     assert np.isfinite(moments["elbo"])
 
 
+def test_model_can_run_sampler_pol2_mode():
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.array([0.1, np.nan, 0.9], dtype=np.float32),
+        noise_std=np.float32(0.5),
+    )
+    model = ViprodyneModel(
+        datasets=(dataset,),
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
+            pol2_mode="sampler",
+            t_rise=np.float32(0.5),
+            t_plateau=np.float32(0.0),
+            sampler_iterations=12,
+            sampler_repeats=1,
+            sampler_compute_elbo=False,
+        ),
+    )
+
+    model.run_schedule(["d0:s", "d0:tau"])
+    moments = model.graph.moments.get("d0:tau")
+
+    assert model.graph.nodes["d0:tau"].mode == "sampler"
+    assert moments["posterior_rate"].dtype == np.float32
+    assert moments["expected_loading_counts"].dtype == np.float32
+    assert moments["posterior_rate"].shape == (3,)
+    assert "loading_counts_by_rate" in moments
+    assert "d0:r0" in moments["loading_counts_by_rate"]
+
+
 def test_model_accepts_explicit_kernel_function():
     def rectangular_kernel(offsets):
         return jnp.where((offsets >= 0.0) & (offsets < 0.75), 2.0, 0.0)

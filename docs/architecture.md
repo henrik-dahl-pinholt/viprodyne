@@ -57,14 +57,15 @@ internal conversion from user timing inputs to Pol2 observation representations:
 - `ModelConfig.ms2_kernel` can also take `"proximal"` or a custom
   JAX-compatible kernel function. The legacy string `"ms2posterior"` is accepted
   as an alias for the proximal kernel.
-- `build_ms2_observation_model` derives the dense or transfer representation
-  used by `PolymeraseLoadings`. The transfer path extracts row-specific windows
-  from the kernel without storing a full dense observation-by-loading matrix.
+- `build_ms2_observation_model` derives the dense, transfer, or sampler
+  representation used by `PolymeraseLoadings`. The transfer path extracts
+  row-specific windows from the kernel without storing a full dense
+  observation-by-loading matrix.
 
 `viprodyne.core.pol2_sampler` contains the continuous-time reversible-jump Pol2
-loading sampler and thermodynamic-integration log-partition estimator. The core
-module is implemented and tested; it is not yet exposed as a
-`PolymeraseLoadings` node mode in the graph builder.
+loading sampler and thermodynamic-integration log-partition estimator. It is
+available through `PolymeraseLoadings(mode="sampler")` and
+`ModelConfig.pol2_mode="sampler"` for proximal MS2 kernels.
 
 The dense design matrix and transfer-window representation are internal objects.
 The user-facing model API takes observed intensities, timing, and an MS2 kernel
@@ -147,10 +148,20 @@ log-survival series. The initial Pol2 prior inside the node is only a
 placeholder until graph messages from `PromoterState` and `LoadingRate` are
 available.
 
+For sampler mode, `PolymeraseLoadings` emits a posterior loading rate and
+expected loading counts on the sampler fine grid. Its promoter-state reverse
+message uses the Poisson point-process form,
+
+```text
+E[n_i] * E[log r_s] - E[r_s] * dt_i
+```
+
+divided by `dt_i` before being added to the tilted CTMC potential.
+
 Current limitation: the `PolymeraseLoadings` graph node assumes one trajectory
 plate at a time. Batched transfer likelihoods exist at the core-kernel level,
-but batched/plated loading-rate priors and sampler-mode graph integration still
-need explicit node-level interfaces.
+but batched/plated loading-rate priors still need explicit node-level
+interfaces.
 
 ## Promoter-State Construction
 
@@ -269,7 +280,10 @@ parameterized kernel is `"proximal"` and uses `t_rise`, `t_plateau`, and
 `ModelConfig.pol2_mode="auto"` chooses the transfer backend from the kernel
 configuration. `pol2_mode="mean_field"` or `"exact"` asks the builder to create
 the internal dense representation and should be reserved for small tests and
-diagnostics.
+diagnostics. `pol2_mode="sampler"` uses the continuous Pol2 sampler for
+proximal kernels; tune `sampler_iterations`, `sampler_repeats`,
+`sampler_fine_grid`, and the thermodynamic-integration settings when requesting
+sampler ELBOs with `sampler_compute_elbo=True`.
 
 Example with heterogeneous grids:
 
@@ -332,10 +346,6 @@ can still receive different contact probabilities from different traces.
 
 ## Current Gaps
 
-- The continuous Pol2 sampler is implemented as a core kernel, but it still needs
-  a `PolymeraseLoadings(mode="sampler")` adapter and model-builder inputs for
-  `fine_grid`, sampler iterations, repeats, and thermodynamic-integration
-  settings.
 - Dense mean-field/exact Pol2 modes remain available internally, but should not
   be used for large regular MS2 traces because dense memory scales as
   `O(n_observations * n_loadings)`.

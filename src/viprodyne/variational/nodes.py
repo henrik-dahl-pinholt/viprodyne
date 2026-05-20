@@ -19,6 +19,12 @@ from viprodyne.core.contact_survival import (
     optimize_contact_survival_rate_map,
 )
 from viprodyne.core.mf_pol2_finder import fit_mean_field_bernoulli
+from viprodyne.core.pol2_sampler import (
+    Pol2SamplerResult,
+    ThermodynamicIntegrationResult,
+    compute_log_z,
+    sample_loadings,
+)
 from viprodyne.core.rate_edges import RateEdge
 from viprodyne.core.tilted_ctmc import TiltedCTMC, TiltedCTMCSolution
 from viprodyne.variational.base import MomentDict, UpdateContext, VariationalNode
@@ -31,6 +37,7 @@ FLOAT_DTYPE = np.float32
 class _LoadingPriorStats:
     probabilities: np.ndarray
     rate_names: tuple[str, ...]
+    rate_means: np.ndarray
     state_probabilities: np.ndarray
     interval_durations: np.ndarray
     per_state_load_probabilities: np.ndarray
@@ -40,6 +47,7 @@ class _LoadingPriorStats:
 class _LoadingRateMoments:
     names: tuple[str, ...]
     means: np.ndarray
+    expected_logs: np.ndarray | None = None
     shapes: np.ndarray | None = None
     rates: np.ndarray | None = None
     gamma_mask: np.ndarray | None = None
@@ -447,15 +455,32 @@ class PolymeraseLoadings(VariationalNode):
     design_matrix: np.ndarray | None = None
     noise_std: np.ndarray | float = 1.0
     finite_mask: np.ndarray | None = None
-    mode: Literal["mean_field", "exact", "transfer"] = "mean_field"
+    mode: Literal["mean_field", "exact", "transfer", "sampler"] = "mean_field"
     window_weights: np.ndarray | None = None
     observation_starts: np.ndarray | None = None
+    sampling_times: np.ndarray | None = None
+    fine_grid: np.ndarray | None = None
+    sampler_rates_on_grid: np.ndarray | None = None
+    rise_time: np.ndarray | float = np.float32(1.0)
+    plateau_time: np.ndarray | float = np.float32(0.0)
+    rna_intensity: np.ndarray | float = np.float32(1.0)
+    sampler_seed: int = 0
+    sampler_iterations: int = 15_000
+    sampler_repeats: int = 100
+    sampler_compute_elbo: bool = False
+    sampler_elbo_iterations: int = 10_000
+    sampler_elbo_steps: int = 10
+    sampler_elbo_repeats: int = 20
     load_probabilities: np.ndarray | None = field(default=None, init=False)
+    posterior_rate: np.ndarray | None = field(default=None, init=False)
+    expected_loading_counts: np.ndarray | None = field(default=None, init=False)
     predicted_signal: np.ndarray | None = field(default=None, init=False)
     objective_value: np.float32 = field(default=np.float32(0.0), init=False)
     entropy_value: np.float32 | None = field(default=None, init=False)
     posterior_probabilities: np.ndarray | None = field(default=None, init=False)
     configurations: np.ndarray | None = field(default=None, init=False)
+    sampler_result: Pol2SamplerResult | None = field(default=None, init=False)
+    sampler_log_z_result: ThermodynamicIntegrationResult | None = field(default=None, init=False)
     loading_counts_by_rate: dict[str, np.ndarray] = field(default_factory=dict, init=False)
     loading_exposure_by_rate: dict[str, np.ndarray] = field(default_factory=dict, init=False)
 
@@ -481,6 +506,15 @@ class PolymeraseLoadings(VariationalNode):
             self.window_weights = np.asarray(self.window_weights, dtype=FLOAT_DTYPE)
         if self.observation_starts is not None:
             self.observation_starts = np.asarray(self.observation_starts, dtype=np.int32)
+        if self.sampling_times is not None:
+            self.sampling_times = np.asarray(self.sampling_times, dtype=FLOAT_DTYPE)
+        if self.fine_grid is not None:
+            self.fine_grid = _validate_sampler_fine_grid(self.fine_grid)
+        if self.sampler_rates_on_grid is not None:
+            self.sampler_rates_on_grid = np.asarray(self.sampler_rates_on_grid, dtype=FLOAT_DTYPE)
+        self.rise_time = np.asarray(self.rise_time, dtype=FLOAT_DTYPE)
+        self.plateau_time = np.asarray(self.plateau_time, dtype=FLOAT_DTYPE)
+        self.rna_intensity = np.asarray(self.rna_intensity, dtype=FLOAT_DTYPE)
         self.update_from_current_inputs()
 
     def update(self, context: UpdateContext) -> None:
@@ -491,6 +525,8 @@ class PolymeraseLoadings(VariationalNode):
         )
         if prior_stats is not None:
             self.prior_probabilities = prior_stats.probabilities
+            if self.mode == "sampler":
+                self.sampler_rates_on_grid = _loading_intensity_from_prior_stats(prior_stats)
         for moments in parent_moments.values():
             if "load_prior_probabilities" in moments:
                 self.prior_probabilities = np.asarray(
@@ -509,10 +545,12 @@ class PolymeraseLoadings(VariationalNode):
             self._update_exact()
         elif self.mode == "transfer":
             self._update_transfer()
+        elif self.mode == "sampler":
+            self._update_sampler()
         elif self.mode == "mean_field":
             self._update_mean_field()
         else:
-            raise ValueError("mode must be 'mean_field', 'exact', or 'transfer'.")
+            raise ValueError("mode must be 'mean_field', 'exact', 'transfer', or 'sampler'.")
 
     def moments(self) -> MomentDict:
         moments: MomentDict = {
@@ -521,6 +559,13 @@ class PolymeraseLoadings(VariationalNode):
         }
         if self.load_probabilities is not None:
             moments["load_probabilities"] = np.asarray(self.load_probabilities, dtype=FLOAT_DTYPE)
+        if self.posterior_rate is not None:
+            moments["posterior_rate"] = np.asarray(self.posterior_rate, dtype=FLOAT_DTYPE)
+        if self.expected_loading_counts is not None:
+            moments["expected_loading_counts"] = np.asarray(
+                self.expected_loading_counts,
+                dtype=FLOAT_DTYPE,
+            )
         if self.predicted_signal is not None:
             moments["predicted_signal"] = np.asarray(self.predicted_signal, dtype=FLOAT_DTYPE)
         if self.entropy_value is not None:
@@ -535,7 +580,7 @@ class PolymeraseLoadings(VariationalNode):
                 name: np.asarray(value, dtype=FLOAT_DTYPE)
                 for name, value in self.loading_exposure_by_rate.items()
             }
-        if self.mode in {"exact", "transfer"}:
+        if self.mode in {"exact", "transfer", "sampler"}:
             moments["log_partition"] = np.asarray(self.objective_value, dtype=FLOAT_DTYPE)
         return moments
 
@@ -559,8 +604,10 @@ class PolymeraseLoadings(VariationalNode):
                 p=self.posterior_probabilities,
             )
             return self.configurations[indices].astype(np.int32)
-        if self.mode == "transfer":
-            raise NotImplementedError("transfer mode currently exposes marginals but not joint samples.")
+        if self.mode in {"transfer", "sampler"}:
+            raise NotImplementedError(
+                f"{self.mode} mode currently exposes marginals but not joint samples."
+            )
         if self.load_probabilities is None:
             raise NotImplementedError("Pol2 loading samples require posterior probabilities.")
         probabilities = np.asarray(self.load_probabilities, dtype=FLOAT_DTYPE)
@@ -627,6 +674,68 @@ class PolymeraseLoadings(VariationalNode):
             dtype=FLOAT_DTYPE,
         )
 
+    def _update_sampler(self) -> None:
+        if self.sampling_times is None or self.fine_grid is None:
+            raise ValueError("sampling_times and fine_grid are required for sampler mode.")
+        if self.sampler_rates_on_grid is None:
+            self.posterior_rate = np.zeros(self._infer_n_loadings(), dtype=FLOAT_DTYPE)
+            self.expected_loading_counts = None
+            self.load_probabilities = None
+            self.predicted_signal = np.zeros_like(self.observed, dtype=FLOAT_DTYPE)
+            self.objective_value = np.asarray(0.0, dtype=FLOAT_DTYPE)
+            self.entropy_value = np.asarray(0.0, dtype=FLOAT_DTYPE)
+            return
+        result = sample_loadings(
+            observed=jnp.asarray(self.observed),
+            noise_std=jnp.asarray(self.noise_std),
+            rise_time=float(np.asarray(self.rise_time, dtype=FLOAT_DTYPE)),
+            plateau_time=float(np.asarray(self.plateau_time, dtype=FLOAT_DTYPE)),
+            sampling_times=jnp.asarray(self.sampling_times),
+            rates_on_grid=jnp.asarray(self.sampler_rates_on_grid),
+            fine_grid=jnp.asarray(self.fine_grid),
+            seed=int(self.sampler_seed),
+            rna_intensity=jnp.asarray(self.rna_intensity),
+            n_iter=int(self.sampler_iterations),
+            nrepeat=int(self.sampler_repeats),
+        )
+        posterior_rate = np.asarray(result.posterior_rate, dtype=FLOAT_DTYPE)
+        predicted_signal = np.asarray(result.predicted_signal, dtype=FLOAT_DTYPE)
+        if posterior_rate.ndim == 2 and posterior_rate.shape[0] == 1:
+            posterior_rate = posterior_rate[0]
+        if predicted_signal.ndim == 2 and predicted_signal.shape[0] == 1:
+            predicted_signal = predicted_signal[0]
+        grid_dt = np.asarray(self.fine_grid[1] - self.fine_grid[0], dtype=FLOAT_DTYPE)
+        self.sampler_result = result
+        self.posterior_rate = posterior_rate.astype(FLOAT_DTYPE)
+        self.expected_loading_counts = (self.posterior_rate * grid_dt).astype(FLOAT_DTYPE)
+        self.load_probabilities = np.clip(
+            1.0 - np.exp(-self.expected_loading_counts),
+            1e-7,
+            1.0 - 1e-7,
+        ).astype(FLOAT_DTYPE)
+        self.predicted_signal = predicted_signal.astype(FLOAT_DTYPE)
+        self.entropy_value = np.asarray(0.0, dtype=FLOAT_DTYPE)
+        if self.sampler_compute_elbo:
+            log_z_result = compute_log_z(
+                observed=jnp.asarray(self.observed),
+                noise_std=jnp.asarray(self.noise_std),
+                rise_time=float(np.asarray(self.rise_time, dtype=FLOAT_DTYPE)),
+                plateau_time=float(np.asarray(self.plateau_time, dtype=FLOAT_DTYPE)),
+                sampling_times=jnp.asarray(self.sampling_times),
+                rates_on_grid=jnp.asarray(self.sampler_rates_on_grid),
+                fine_grid=jnp.asarray(self.fine_grid),
+                seed=int(self.sampler_seed),
+                rna_intensity=jnp.asarray(self.rna_intensity),
+                n_iter=int(self.sampler_elbo_iterations),
+                n_steps=int(self.sampler_elbo_steps),
+                nrepeat=int(self.sampler_elbo_repeats),
+            )
+            self.sampler_log_z_result = log_z_result
+            self.objective_value = np.asarray(log_z_result.log_z, dtype=FLOAT_DTYPE)
+        else:
+            self.sampler_log_z_result = None
+            self.objective_value = np.asarray(0.0, dtype=FLOAT_DTYPE)
+
     def _infer_n_loadings(self) -> int:
         if self.design_matrix is not None:
             return int(self.design_matrix.shape[1])
@@ -634,25 +743,41 @@ class PolymeraseLoadings(VariationalNode):
             window_weights = np.asarray(self.window_weights, dtype=FLOAT_DTYPE)
             observation_starts = np.asarray(self.observation_starts, dtype=np.int32)
             return int(np.max(observation_starts) + window_weights.shape[-1])
+        if self.fine_grid is not None:
+            return int(np.asarray(self.fine_grid).size)
         raise ValueError(
             "prior_probabilities can only be omitted when design_matrix or transfer "
-            "window_weights/observation_starts define the loading grid."
+            "window_weights/observation_starts, or sampler fine_grid define the loading grid."
         )
 
     def _set_loading_sufficient_statistics(self, prior_stats: _LoadingPriorStats) -> None:
-        if self.load_probabilities is None:
+        counts_source = (
+            self.expected_loading_counts
+            if self.expected_loading_counts is not None
+            else self.load_probabilities
+        )
+        if counts_source is None:
             self.loading_counts_by_rate = {}
             self.loading_exposure_by_rate = {}
             return
-        load_probabilities = np.asarray(self.load_probabilities, dtype=FLOAT_DTYPE)
-        prior = np.clip(prior_stats.probabilities, 1e-7, 1.0).astype(FLOAT_DTYPE)
-        responsibilities = (
-            prior_stats.state_probabilities
-            * prior_stats.per_state_load_probabilities
-            / prior[:, None]
-        )
+        load_counts = np.asarray(counts_source, dtype=FLOAT_DTYPE)
+        if self.expected_loading_counts is not None:
+            intensity = prior_stats.state_probabilities * prior_stats.rate_means[None, :]
+            total_intensity = np.clip(
+                np.sum(intensity, axis=-1, keepdims=True, dtype=FLOAT_DTYPE),
+                1e-7,
+                None,
+            )
+            responsibilities = intensity / total_intensity
+        else:
+            prior = np.clip(prior_stats.probabilities, 1e-7, 1.0).astype(FLOAT_DTYPE)
+            responsibilities = (
+                prior_stats.state_probabilities
+                * prior_stats.per_state_load_probabilities
+                / prior[:, None]
+            )
         counts_by_state = np.sum(
-            load_probabilities[:, None] * responsibilities,
+            load_counts[:, None] * responsibilities,
             axis=0,
             dtype=FLOAT_DTYPE,
         )
@@ -789,6 +914,7 @@ def _load_prior_stats_from_parents(
     return _LoadingPriorStats(
         probabilities=np.clip(probabilities, 1e-7, 1.0 - 1e-7).astype(FLOAT_DTYPE),
         rate_names=loading_rate_moments.names,
+        rate_means=loading_rate_moments.means.astype(FLOAT_DTYPE),
         state_probabilities=state_probabilities.astype(FLOAT_DTYPE),
         interval_durations=interval_durations.astype(FLOAT_DTYPE),
         per_state_load_probabilities=per_state_load_probability.astype(FLOAT_DTYPE),
@@ -798,12 +924,19 @@ def _load_prior_stats_from_parents(
 def _state_loading_rate_moments_from_moments(
     moment_map: dict[str, MomentDict],
 ) -> _LoadingRateMoments | None:
-    rates: list[tuple[int, str, np.ndarray, np.ndarray | None, np.ndarray | None]] = []
-    fallback: list[tuple[str, np.ndarray, np.ndarray | None, np.ndarray | None]] = []
+    rates: list[
+        tuple[int, str, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]
+    ] = []
+    fallback: list[tuple[str, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]] = []
     for name, moments in moment_map.items():
         if "mean" not in moments:
             continue
         mean = np.asarray(moments["mean"], dtype=FLOAT_DTYPE)
+        expected_log = (
+            np.asarray(moments["expected_log"], dtype=FLOAT_DTYPE)
+            if "expected_log" in moments
+            else None
+        )
         shape = np.asarray(moments["shape"], dtype=FLOAT_DTYPE) if "shape" in moments else None
         rate = np.asarray(moments["rate"], dtype=FLOAT_DTYPE) if "rate" in moments else None
         if "state_index" in moments:
@@ -812,28 +945,42 @@ def _state_loading_rate_moments_from_moments(
                     int(np.asarray(moments["state_index"])),
                     name,
                     mean,
+                    expected_log,
                     shape,
                     rate,
                 )
             )
         elif name.rsplit(":", 1)[-1].startswith("r"):
-            fallback.append((name, mean, shape, rate))
+            fallback.append((name, mean, expected_log, shape, rate))
     if rates:
         rates.sort(key=lambda item: item[0])
-        names = tuple(name for _, name, _, _, _ in rates)
-        means = [mean for _, _, mean, _, _ in rates]
-        shapes = [shape for _, _, _, shape, _ in rates]
-        gamma_rates = [rate for _, _, _, _, rate in rates]
+        names = tuple(name for _, name, _, _, _, _ in rates)
+        means = [mean for _, _, mean, _, _, _ in rates]
+        expected_logs = [expected_log for _, _, _, expected_log, _, _ in rates]
+        shapes = [shape for _, _, _, _, shape, _ in rates]
+        gamma_rates = [rate for _, _, _, _, _, rate in rates]
     elif fallback:
-        names = tuple(name for name, _, _, _ in fallback)
-        means = [mean for _, mean, _, _ in fallback]
-        shapes = [shape for _, _, shape, _ in fallback]
-        gamma_rates = [rate for _, _, _, rate in fallback]
+        names = tuple(name for name, _, _, _, _ in fallback)
+        means = [mean for _, mean, _, _, _ in fallback]
+        expected_logs = [expected_log for _, _, expected_log, _, _ in fallback]
+        shapes = [shape for _, _, _, shape, _ in fallback]
+        gamma_rates = [rate for _, _, _, _, rate in fallback]
     else:
         return None
     mean_array = np.asarray(means, dtype=FLOAT_DTYPE)
     if mean_array.ndim != 1:
         raise NotImplementedError("plated loading-rate priors are not implemented yet.")
+    expected_log_array = None
+    if any(expected_log is not None for expected_log in expected_logs):
+        expected_log_array = np.asarray(
+            [
+                expected_log if expected_log is not None else np.log(np.clip(mean, 1e-20, None))
+                for expected_log, mean in zip(expected_logs, means)
+            ],
+            dtype=FLOAT_DTYPE,
+        )
+        if expected_log_array.ndim != 1:
+            raise NotImplementedError("plated loading-rate priors are not implemented yet.")
     has_gamma = tuple(
         shape is not None and rate is not None for shape, rate in zip(shapes, gamma_rates)
     )
@@ -851,11 +998,21 @@ def _state_loading_rate_moments_from_moments(
         return _LoadingRateMoments(
             names=names,
             means=mean_array,
+            expected_logs=expected_log_array,
             shapes=shape_array,
             rates=rate_array,
             gamma_mask=np.asarray(has_gamma, dtype=bool),
         )
-    return _LoadingRateMoments(names=names, means=mean_array)
+    return _LoadingRateMoments(names=names, means=mean_array, expected_logs=expected_log_array)
+
+
+def _loading_intensity_from_prior_stats(prior_stats: _LoadingPriorStats) -> np.ndarray:
+    intensity = np.sum(
+        prior_stats.state_probabilities * prior_stats.rate_means[None, :],
+        axis=-1,
+        dtype=FLOAT_DTYPE,
+    )
+    return np.clip(intensity, 0.0, None).astype(FLOAT_DTYPE)
 
 
 def _expected_load_probability(
@@ -890,6 +1047,26 @@ def _promoter_loading_child_potentials(
     potentials = np.zeros((interval_durations.size, n_states), dtype=FLOAT_DTYPE)
     found = False
     for moments in child_moments.values():
+        if "expected_loading_counts" in moments:
+            found = True
+            counts = np.asarray(moments["expected_loading_counts"], dtype=FLOAT_DTYPE)
+            if counts.ndim != 1:
+                raise NotImplementedError("batched Pol2-to-promoter messages are not implemented yet.")
+            if counts.size > interval_durations.size:
+                raise ValueError("Pol2 loading posterior is longer than the promoter interval grid.")
+            n_loadings = counts.size
+            dt = interval_durations[:n_loadings]
+            expected_logs = loading_rate_moments.expected_logs
+            if expected_logs is None:
+                expected_logs = np.log(np.clip(loading_rate_moments.means, 1e-20, None))
+            interval_log_potential = (
+                counts[:, None] * expected_logs[None, :]
+                - dt[:, None] * loading_rate_moments.means[None, :]
+            )
+            potentials[:n_loadings] += (interval_log_potential / dt[:, None]).astype(
+                FLOAT_DTYPE
+            )
+            continue
         if "load_probabilities" not in moments:
             continue
         found = True
@@ -932,6 +1109,18 @@ def _expected_log_load_probability(
     series = np.sum((scaled**shapes[None, None, :]) / terms[:, None, None], axis=0)
     gamma_mask = np.asarray(loading_rate_moments.gamma_mask, dtype=bool)
     return np.where(gamma_mask[None, :], -series, expected_log).astype(FLOAT_DTYPE)
+
+
+def _validate_sampler_fine_grid(fine_grid: np.ndarray) -> np.ndarray:
+    fine_grid = np.asarray(fine_grid, dtype=FLOAT_DTYPE)
+    if fine_grid.ndim != 1 or fine_grid.size < 2:
+        raise ValueError("fine_grid must be one-dimensional with at least two entries.")
+    dt = np.diff(fine_grid)
+    if np.any(dt <= 0):
+        raise ValueError("fine_grid must be strictly increasing.")
+    if not np.allclose(dt, dt[0], rtol=1e-6, atol=1e-7):
+        raise ValueError("sampler fine_grid must be uniformly spaced.")
+    return fine_grid
 
 
 def _broadcast_parameter_over_intervals(
