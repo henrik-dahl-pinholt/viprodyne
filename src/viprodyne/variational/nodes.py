@@ -515,6 +515,7 @@ class PolymeraseLoadings(VariationalNode):
     configurations: np.ndarray | None = field(default=None, init=False)
     sampler_result: Pol2SamplerResult | None = field(default=None, init=False)
     sampler_log_z_result: ThermodynamicIntegrationResult | None = field(default=None, init=False)
+    loading_mask: np.ndarray | None = field(default=None, init=False)
     loading_counts_by_rate: dict[str, np.ndarray] = field(default_factory=dict, init=False)
     loading_exposure_by_rate: dict[str, np.ndarray] = field(default_factory=dict, init=False)
 
@@ -554,6 +555,18 @@ class PolymeraseLoadings(VariationalNode):
         self.rise_time = np.asarray(self.rise_time, dtype=FLOAT_DTYPE)
         self.plateau_time = np.asarray(self.plateau_time, dtype=FLOAT_DTYPE)
         self.rna_intensity = np.asarray(self.rna_intensity, dtype=FLOAT_DTYPE)
+        self.loading_mask = _loading_support_mask(
+            finite_mask=np.asarray(self.finite_mask, dtype=bool),
+            n_loadings=self._infer_n_loadings(),
+            design_matrix=self.design_matrix,
+            window_weights=self.window_weights,
+            observation_starts=self.observation_starts,
+            sampling_times=self.sampling_times,
+            fine_grid=self.fine_grid,
+            rise_time=self.rise_time,
+            plateau_time=self.plateau_time,
+            rna_intensity=self.rna_intensity,
+        )
         self.update_from_current_inputs()
 
     def update(self, context: UpdateContext) -> None:
@@ -619,6 +632,8 @@ class PolymeraseLoadings(VariationalNode):
                 name: np.asarray(value, dtype=FLOAT_DTYPE)
                 for name, value in self.loading_exposure_by_rate.items()
             }
+        if self.loading_mask is not None:
+            moments["loading_mask"] = np.asarray(self.loading_mask, dtype=bool)
         if self.mode in {"exact", "transfer", "sampler"}:
             moments["log_partition"] = np.asarray(self.objective_value, dtype=FLOAT_DTYPE)
         return moments
@@ -826,13 +841,17 @@ class PolymeraseLoadings(VariationalNode):
             self.loading_exposure_by_rate = {}
             return
         load_counts = np.asarray(counts_source, dtype=FLOAT_DTYPE)
+        loading_mask = _batch_loading_mask(self.loading_mask, load_counts.shape)
+        load_counts = load_counts * loading_mask
         counts_by_state = np.sum(
             load_counts[..., :, None] * prior_stats.state_probabilities,
             axis=-2,
             dtype=FLOAT_DTYPE,
         )
         exposure_by_state = np.sum(
-            prior_stats.state_probabilities * prior_stats.interval_durations[..., None],
+            prior_stats.state_probabilities
+            * loading_mask[..., :, None]
+            * prior_stats.interval_durations[..., None],
             axis=-2,
             dtype=FLOAT_DTYPE,
         )
@@ -941,6 +960,106 @@ def _batch_noise(noise_std: np.ndarray, observed_shape: tuple[int, int]) -> np.n
         if noise.shape == (observed_shape[0],):
             return np.broadcast_to(noise[:, None], observed_shape).astype(FLOAT_DTYPE)
         raise ValueError("noise_std must broadcast to observed shape.") from exc
+
+
+def _batch_loading_mask(loading_mask: np.ndarray | None, target_shape: tuple[int, ...]) -> np.ndarray:
+    if loading_mask is None:
+        return np.ones(target_shape, dtype=FLOAT_DTYPE)
+    mask = np.asarray(loading_mask, dtype=bool)
+    return np.broadcast_to(mask, target_shape).astype(FLOAT_DTYPE)
+
+
+def _loading_support_mask(
+    finite_mask: np.ndarray,
+    n_loadings: int,
+    design_matrix: np.ndarray | None,
+    window_weights: np.ndarray | None,
+    observation_starts: np.ndarray | None,
+    sampling_times: np.ndarray | None,
+    fine_grid: np.ndarray | None,
+    rise_time: np.ndarray,
+    plateau_time: np.ndarray,
+    rna_intensity: np.ndarray,
+) -> np.ndarray:
+    finite = np.asarray(finite_mask, dtype=bool)
+    if finite.ndim != 2:
+        raise ValueError("finite_mask must have shape (n_traces, n_timepoints).")
+    n_traces = finite.shape[0]
+    if design_matrix is not None:
+        design = np.asarray(design_matrix, dtype=FLOAT_DTYPE)
+        support = np.abs(design[:, :n_loadings]) > np.float32(1e-7)
+        return (finite.astype(np.int32) @ support.astype(np.int32) > 0).astype(bool)
+    if window_weights is not None and observation_starts is not None:
+        return _transfer_loading_support_mask(
+            finite,
+            n_loadings,
+            np.asarray(window_weights, dtype=FLOAT_DTYPE),
+            np.asarray(observation_starts, dtype=np.int32),
+        )
+    if sampling_times is not None and fine_grid is not None:
+        sample_times = np.asarray(sampling_times, dtype=FLOAT_DTYPE)
+        loading_times = np.asarray(fine_grid, dtype=FLOAT_DTYPE)[:n_loadings]
+        offsets = sample_times[:, None] - loading_times[None, :]
+        support = _proximal_support_from_offsets(
+            offsets,
+            rise_time=rise_time,
+            plateau_time=plateau_time,
+            rna_intensity=rna_intensity,
+        )
+        return (finite.astype(np.int32) @ support.astype(np.int32) > 0).astype(bool)
+    return np.ones((n_traces, n_loadings), dtype=bool)
+
+
+def _transfer_loading_support_mask(
+    finite_mask: np.ndarray,
+    n_loadings: int,
+    window_weights: np.ndarray,
+    observation_starts: np.ndarray,
+) -> np.ndarray:
+    n_traces, n_observations = finite_mask.shape
+    weights = np.asarray(window_weights, dtype=FLOAT_DTYPE)
+    if weights.ndim == 1:
+        weights = np.broadcast_to(weights[None, :], (n_observations, weights.shape[0]))
+    if weights.shape[0] != n_observations:
+        raise ValueError("window_weights must have one row per observation.")
+    starts = np.asarray(observation_starts, dtype=np.int32)
+    if starts.shape != (n_observations,):
+        raise ValueError("observation_starts must have one entry per observation.")
+    support = np.zeros((n_traces, n_loadings), dtype=bool)
+    for obs_index in range(n_observations):
+        active_offsets = np.flatnonzero(np.abs(weights[obs_index]) > np.float32(1e-7))
+        if active_offsets.size == 0:
+            continue
+        indices = starts[obs_index] + active_offsets
+        indices = indices[(0 <= indices) & (indices < n_loadings)]
+        for index in indices:
+            support[:, int(index)] |= finite_mask[:, obs_index]
+    return support
+
+
+def _proximal_support_from_offsets(
+    offsets: np.ndarray,
+    rise_time: np.ndarray,
+    plateau_time: np.ndarray,
+    rna_intensity: np.ndarray,
+) -> np.ndarray:
+    rise = np.asarray(rise_time, dtype=FLOAT_DTYPE)
+    plateau = np.asarray(plateau_time, dtype=FLOAT_DTYPE)
+    intensity = np.asarray(rna_intensity, dtype=FLOAT_DTYPE)
+    offsets = np.asarray(offsets, dtype=FLOAT_DTYPE)
+    if rise.shape == () and plateau.shape == () and intensity.shape == ():
+        support_time = rise + plateau
+        rising = (offsets >= 0.0) & (offsets < rise)
+        plateau_region = (offsets >= rise) & (offsets <= support_time)
+        values = np.where(rising, intensity * offsets / rise, np.float32(0.0))
+        values = np.where(plateau_region, intensity, values)
+        return np.abs(values) > np.float32(1e-7)
+    support_time = np.max(rise + plateau).astype(FLOAT_DTYPE)
+    return (
+        (offsets > 0.0)
+        & (offsets <= support_time)
+        & bool(np.any(intensity > 0.0))
+    )
 
 
 def _load_prior_stats_from_parents(
@@ -1187,10 +1306,12 @@ def _promoter_loading_child_potentials(
             expected_logs = np.broadcast_to(expected_logs, batch_shape + (n_states,))
             means = np.broadcast_to(loading_rate_moments.means, batch_shape + (n_states,))
             counts = np.broadcast_to(counts, batch_shape + (n_loadings,))
+            loading_mask = _child_loading_mask(moments, batch_shape, n_loadings)
             interval_log_potential = (
                 counts[..., :, None] * expected_logs[..., None, :]
                 - dt.reshape((1,) * len(batch_shape) + (n_loadings, 1)) * means[..., None, :]
             )
+            interval_log_potential *= loading_mask[..., :, None]
             potentials[..., :n_loadings, :] += (
                 interval_log_potential
                 / dt.reshape((1,) * len(batch_shape) + (n_loadings, 1))
@@ -1210,6 +1331,7 @@ def _promoter_loading_child_potentials(
             potentials = np.zeros(batch_shape + (interval_durations.size, n_states), dtype=FLOAT_DTYPE)
         q_load = np.clip(load_probabilities, 0.0, 1.0)
         q_load = np.broadcast_to(q_load, batch_shape + (n_loadings,))
+        loading_mask = _child_loading_mask(moments, batch_shape, n_loadings)
         dt = interval_durations[:n_loadings]
         log_load = _expected_log_load_probability(loading_rate_moments, dt)
         log_load = np.broadcast_to(log_load, batch_shape + (n_loadings, n_states))
@@ -1219,12 +1341,24 @@ def _promoter_loading_child_potentials(
         interval_log_potential = (
             q_load[..., :, None] * log_load + (1.0 - q_load[..., :, None]) * log_no_load
         )
+        interval_log_potential *= loading_mask[..., :, None]
         potentials[..., :n_loadings, :] += (interval_log_potential / dt_view).astype(FLOAT_DTYPE)
     if not found:
         return None
     if potentials is None:
         return None
     return potentials.astype(FLOAT_DTYPE)
+
+
+def _child_loading_mask(
+    moments: MomentDict,
+    batch_shape: tuple[int, ...],
+    n_loadings: int,
+) -> np.ndarray:
+    if "loading_mask" not in moments:
+        return np.ones(batch_shape + (n_loadings,), dtype=FLOAT_DTYPE)
+    mask = np.asarray(moments["loading_mask"], dtype=bool)
+    return np.broadcast_to(mask[..., :n_loadings], batch_shape + (n_loadings,)).astype(FLOAT_DTYPE)
 
 
 def _expected_log_load_probability(

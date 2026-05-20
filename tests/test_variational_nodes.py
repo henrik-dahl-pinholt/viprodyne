@@ -441,6 +441,74 @@ def test_promoter_state_uses_pol2_loading_child_message():
     assert graph.moments.get("s")["elbo"] == pytest.approx(expected_elbo, rel=2e-6)
 
 
+def test_promoter_state_masks_prior_only_pol2_child_intervals():
+    graph = VariationalGraph()
+    pi = InitialStateProb(
+        name="pi",
+        prior_concentration=np.ones(2, dtype=np.float32),
+        pinned_value=np.array([0.5, 0.5], dtype=np.float32),
+    )
+    kon = TransitionRate(
+        name="kon",
+        prior_shape=1.0,
+        prior_rate=1.0,
+        pinned_value=np.float32(0.1),
+        n_states=2,
+        to_state=1,
+        from_state=0,
+    )
+    koff = TransitionRate(
+        name="koff",
+        prior_shape=1.0,
+        prior_rate=1.0,
+        pinned_value=np.float32(0.1),
+        n_states=2,
+        to_state=0,
+        from_state=1,
+    )
+    r0 = LoadingRate(
+        name="r0",
+        prior_shape=1.0,
+        prior_rate=1.0,
+        pinned_value=np.float32(0.4),
+        state_index=0,
+    )
+    r1 = LoadingRate(
+        name="r1",
+        prior_shape=1.0,
+        prior_rate=1.0,
+        pinned_value=np.float32(2.0),
+        state_index=1,
+    )
+    tau = StatsNode(
+        "tau",
+        {
+            "load_probabilities": np.array([0.25, 0.75], dtype=np.float32),
+            "loading_mask": np.array([True, False]),
+        },
+    )
+    promoter = PromoterState(
+        name="s",
+        time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+        n_states=2,
+        rate_edges=(kon.edge, koff.edge),
+        initial_probability_node="pi",
+    )
+    for node in [pi, kon, koff, r0, r1, tau, promoter]:
+        graph.add_node(node)
+    graph.add_edge("pi", "s")
+    graph.add_edge("kon", "s")
+    graph.add_edge("koff", "s")
+    graph.add_edge("s", "tau")
+    graph.add_edge("r0", "tau")
+    graph.add_edge("r1", "tau")
+
+    graph.run_schedule(["s"])
+
+    assert np.allclose(promoter.tilt_potentials[1], 0.0)
+    assert not np.allclose(promoter.tilt_potentials[0], 0.0)
+
+
 def test_promoter_state_uses_sampler_expected_count_child_message():
     graph = VariationalGraph()
     pi = InitialStateProb(
@@ -578,9 +646,9 @@ def test_polymerase_loadings_uses_natural_prior_and_state_product_stats():
     )
     tau = PolymeraseLoadings(
         name="tau",
-        observed=np.array([[np.nan, np.nan]], dtype=np.float32),
+        observed=np.array([[0.0, 0.0]], dtype=np.float32),
         design_matrix=np.eye(2, dtype=np.float32),
-        noise_std=np.float32(0.5),
+        noise_std=np.float32(100.0),
         mode="exact",
     )
     for node in [promoter, r0, r1, tau]:
@@ -605,15 +673,75 @@ def test_polymerase_loadings_uses_natural_prior_and_state_product_stats():
     moments = graph.moments.get("tau")
 
     np.testing.assert_allclose(tau.prior_probabilities, expected_prior[None, :], rtol=2e-6)
-    np.testing.assert_allclose(moments["load_probabilities"], expected_prior[None, :], rtol=2e-6)
+    np.testing.assert_array_equal(moments["loading_mask"], [[True, True]])
     np.testing.assert_allclose(
         moments["loading_counts_by_rate"]["r0"],
-        np.sum(expected_prior * state_probabilities[0, :, 0], dtype=np.float32),
+        np.sum(
+            moments["load_probabilities"][0] * state_probabilities[0, :, 0],
+            dtype=np.float32,
+        ),
         rtol=2e-6,
     )
     np.testing.assert_allclose(
         moments["loading_counts_by_rate"]["r1"],
-        np.sum(expected_prior * state_probabilities[0, :, 1], dtype=np.float32),
+        np.sum(
+            moments["load_probabilities"][0] * state_probabilities[0, :, 1],
+            dtype=np.float32,
+        ),
+        rtol=2e-6,
+    )
+
+
+def test_polymerase_loadings_masks_prior_only_intervals_from_rate_stats():
+    graph = VariationalGraph()
+    promoter = StatsNode(
+        "s",
+        {
+            "interval_state_probabilities": np.array([[[0.8, 0.2], [0.25, 0.75]]], dtype=np.float32),
+            "interval_durations": np.array([0.5, 0.5], dtype=np.float32),
+        },
+    )
+    r0 = LoadingRate(
+        name="r0",
+        prior_shape=1.0,
+        prior_rate=1.0,
+        pinned_value=np.float32(0.4),
+        state_index=0,
+    )
+    r1 = LoadingRate(
+        name="r1",
+        prior_shape=1.0,
+        prior_rate=1.0,
+        pinned_value=np.float32(2.0),
+        state_index=1,
+    )
+    tau = PolymeraseLoadings(
+        name="tau",
+        observed=np.array([[np.nan, 0.0]], dtype=np.float32),
+        prior_probabilities=np.array([0.2, 0.7], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        mode="transfer",
+        window_weights=np.array([1.0], dtype=np.float32),
+        observation_starts=np.array([0, 1], dtype=np.int32),
+    )
+    for node in [promoter, r0, r1, tau]:
+        graph.add_node(node)
+    graph.add_edge("s", "tau")
+    graph.add_edge("r0", "tau")
+    graph.add_edge("r1", "tau")
+
+    graph.run_schedule(["tau"])
+    moments = graph.moments.get("tau")
+
+    np.testing.assert_array_equal(moments["loading_mask"], [[False, True]])
+    np.testing.assert_allclose(
+        moments["loading_counts_by_rate"]["r0"],
+        moments["load_probabilities"][0, 1] * np.float32(0.25),
+        rtol=2e-6,
+    )
+    np.testing.assert_allclose(
+        moments["loading_exposure_by_rate"]["r0"],
+        np.float32(0.5) * np.float32(0.25),
         rtol=2e-6,
     )
 

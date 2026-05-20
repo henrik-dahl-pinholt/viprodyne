@@ -15,6 +15,11 @@ model builder so the graphical structure lives above the node implementations.
 - Missing MS2 observations are represented by `NaN` and a boolean finite mask.
   Kernels sanitize missing values before residuals are formed, so missing data
   does not create `NaN` gradients or posterior moments.
+- Pol2 loading intervals also carry an internal support mask derived from the
+  finite observations and the MS2 kernel representation. Unsupported intervals
+  may report prior marginals for inspection, but they do not send reverse
+  potentials to `PromoterState` and do not contribute loading-rate sufficient
+  statistics.
 
 ## Core Kernels
 
@@ -167,6 +172,12 @@ E[n_i] * E[log r_s] - E[r_s] * dt_i
 divided by `dt_i` before being added to the tilted CTMC potential. The sampler
 prior intensity is `exp(sum_s q_i(s) * E[log r_s])`, matching the natural CAVI
 message rather than the arithmetic rate average.
+
+Missing data is handled at the loading-grid level. `PolymeraseLoadings` derives
+`loading_mask` internally from `finite_mask` plus either the dense design
+matrix, transfer windows, or sampler kernel support. The mask gates
+Pol2-to-promoter potentials and loading-rate counts/exposures, preventing
+prior-only loadings from updating rates when nearby MS2 observations are absent.
 
 Current limitation: batched traces within a dataset plate must share the same
 time grid, sampling times, and MS2 kernel representation. Heterogeneous trace

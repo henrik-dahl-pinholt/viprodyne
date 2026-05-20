@@ -56,7 +56,9 @@ per-dataset, or global rate nodes. Run coordinate-ascent VI with
 `model.fit_cavi(...)`; convergence is monitored by parameter changes and the
 ELBO is computed only after the final sweep. Promoter and Pol2 updates use
 natural expected-log messages, including `E[log pi]` for initial state weights
-and expected log load/no-load terms for Pol2 priors.
+and expected log load/no-load terms for Pol2 priors. Missing observations are
+also propagated to an internal Pol2 loading mask so prior-only intervals do not
+update promoter or loading-rate factors.
 
 `pol2_mode="auto"` uses the memory-efficient transfer backend. The continuous
 Pol2 sampler is available with `pol2_mode="sampler"` for proximal MS2 kernels.

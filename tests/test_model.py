@@ -309,6 +309,33 @@ def test_model_uses_transfer_pol2_mode_from_kernel_config():
     assert np.isfinite(moments["elbo"])
 
 
+def test_model_missing_observations_do_not_update_loading_rates():
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.array([[np.nan, np.nan]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+    )
+    model = ViprodyneModel(
+        datasets=(dataset,),
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+            pol2_mode="transfer",
+            t_rise=np.float32(0.5),
+            t_plateau=np.float32(0.0),
+        ),
+    )
+
+    before_shape = np.asarray(model.graph.nodes["d0:r0"].shape, dtype=np.float32)
+    before_rate = np.asarray(model.graph.nodes["d0:r0"].rate, dtype=np.float32)
+    model.run_schedule(["d0:s", "d0:tau", "d0:r0"])
+    moments = model.graph.moments.get("d0:tau")
+
+    np.testing.assert_array_equal(moments["loading_mask"], [[False, False]])
+    np.testing.assert_allclose(model.graph.nodes["d0:r0"].shape, before_shape)
+    np.testing.assert_allclose(model.graph.nodes["d0:r0"].rate, before_rate)
+
+
 def test_model_can_run_sampler_pol2_mode():
     dataset = MS2Dataset(
         name="d0",
