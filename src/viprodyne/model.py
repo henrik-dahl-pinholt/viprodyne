@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Literal
 
 import numpy as np
 
@@ -27,6 +28,7 @@ from viprodyne.variational import (
 )
 
 FLOAT_DTYPE = np.float32
+RateScope = Literal["track", "dataset", "global"]
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,7 @@ class MS2Dataset:
     name: str
     observed: np.ndarray
     noise_std: np.ndarray | float
+    rate_group: str | None = None
     time_grid: np.ndarray | None = None
     sampling_times: np.ndarray | None = None
     finite_mask: np.ndarray | None = None
@@ -44,6 +47,8 @@ class MS2Dataset:
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("dataset name must be non-empty.")
+        if self.rate_group is not None and not self.rate_group:
+            raise ValueError("rate_group must be non-empty when provided.")
         if self.time_grid is not None:
             _validate_time_grid(self.time_grid, "dataset.time_grid")
         if self.sampling_times is not None:
@@ -70,6 +75,10 @@ class ModelConfig:
     shared_loading_rates: bool = False
     shared_transition_rate_indices: tuple[int, ...] = ()
     shared_loading_rate_states: tuple[int, ...] = ()
+    transition_rate_scope: RateScope = "dataset"
+    loading_rate_scope: RateScope = "dataset"
+    transition_rate_scopes: dict[int, RateScope] = field(default_factory=dict)
+    loading_rate_scopes: dict[int, RateScope] = field(default_factory=dict)
     pol2_mode: str = "auto"
     ms2_kernel: ProximalKernel | str | Callable | None = "proximal"
     t_rise: np.ndarray | float = np.float32(1.0)
@@ -91,6 +100,16 @@ class ModelConfig:
             raise ValueError("pol2_mode must be 'auto', 'transfer', 'mean_field', or 'exact'.")
         if self.kernel_support_tolerance < 0:
             raise ValueError("kernel_support_tolerance must be non-negative.")
+        object.__setattr__(
+            self,
+            "transition_rate_scope",
+            _validate_rate_scope(self.transition_rate_scope, "transition_rate_scope"),
+        )
+        object.__setattr__(
+            self,
+            "loading_rate_scope",
+            _validate_rate_scope(self.loading_rate_scope, "loading_rate_scope"),
+        )
         resolve_ms2_kernel(
             self.ms2_kernel,
             self.t_rise,
@@ -114,6 +133,24 @@ class ModelConfig:
                 self.shared_loading_rate_states,
                 self.n_states,
                 "shared_loading_rate_states",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "transition_rate_scopes",
+            _validate_scope_mapping(
+                self.transition_rate_scopes,
+                n_edges,
+                "transition_rate_scopes",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "loading_rate_scopes",
+            _validate_scope_mapping(
+                self.loading_rate_scopes,
+                self.n_states,
+                "loading_rate_scopes",
             ),
         )
         driven_indices = tuple(int(index) for index in self.driven_transition_indices)
@@ -144,6 +181,7 @@ class ViprodyneModel:
             raise ValueError("at least one dataset is required.")
         if len({dataset.name for dataset in self.datasets}) != len(self.datasets):
             raise ValueError("dataset names must be unique.")
+        _validate_rate_prefix_labels(self.datasets)
         for dataset in self.datasets:
             self._time_grid(dataset)
         self._build_graph()
@@ -151,6 +189,16 @@ class ViprodyneModel:
     def run_schedule(self, schedule: list[str] | tuple[str, ...] | None = None, rho: float = 1.0) -> None:
         """Run a graph update schedule."""
         self.graph.run_schedule(schedule=schedule, rho=rho)
+
+    def fit_cavi(self, config=None, **kwargs):
+        """Run coordinate-ascent variational inference for this model."""
+        from viprodyne.fit import CAVIConfig, run_cavi
+
+        if config is not None and kwargs:
+            raise ValueError("pass either config or keyword arguments, not both.")
+        if config is None:
+            config = CAVIConfig(**kwargs)
+        return run_cavi(self, config=config)
 
     def default_schedule(self) -> tuple[str, ...]:
         """Return a conservative default schedule over non-observed nodes."""
@@ -165,6 +213,51 @@ class ViprodyneModel:
             if nodes["polymerase"] is not None:
                 schedule.append(nodes["polymerase"])
         return tuple(dict.fromkeys(schedule))
+
+    def cavi_schedule(self) -> tuple[str, ...]:
+        """Return a CAVI sweep with hidden nodes before parameter nodes."""
+        hidden: list[str] = []
+        parameters: list[str] = []
+        for nodes in self.dataset_nodes.values():
+            hidden.append(nodes["promoter"])
+            if nodes["polymerase"] is not None:
+                hidden.append(nodes["polymerase"])
+            parameters.append(nodes["initial"])
+            parameters.extend(nodes["transition_rates"])
+            parameters.extend(nodes["loading_rates"])
+            if nodes["contact_drive"] is not None:
+                parameters.append(nodes["contact_drive"])
+        return tuple(dict.fromkeys(hidden + parameters))
+
+    def parameter_node_names(self) -> tuple[str, ...]:
+        """Return names of nodes used for CAVI convergence monitoring."""
+        names = [
+            name
+            for name, node in self.graph.nodes.items()
+            if isinstance(
+                node,
+                (
+                    InitialStateProb,
+                    LoadingRate,
+                    TransitionRate,
+                    DrivenRateMap,
+                    RcNode,
+                ),
+            )
+        ]
+        return tuple(names)
+
+    def compute_elbo_terms(self) -> dict[str, np.float32]:
+        """Compute available local ELBO contributions for all graph nodes."""
+        return {
+            name: np.asarray(node.elbo_contribution(), dtype=FLOAT_DTYPE)
+            for name, node in self.graph.nodes.items()
+        }
+
+    def compute_elbo(self) -> np.float32:
+        """Compute the current available model ELBO."""
+        terms = self.compute_elbo_terms()
+        return np.asarray(sum(float(value) for value in terms.values()), dtype=FLOAT_DTYPE)
 
     def _build_graph(self) -> None:
         for dataset in self.datasets:
@@ -248,9 +341,8 @@ class ViprodyneModel:
 
     def _add_transition_rates(self, dataset_name: str) -> list[str]:
         names = []
-        shared_indices = self._shared_transition_indices()
         for index in range(self.config.n_states * (self.config.n_states - 1)):
-            prefix = "shared" if index in shared_indices else dataset_name
+            prefix = self._rate_prefix(dataset_name, self._transition_rate_scope(index))
             to_state, from_state = transition_states(self.config.n_states, index)
             name = f"{prefix}:R{index}"
             if name not in self.graph.nodes:
@@ -280,9 +372,8 @@ class ViprodyneModel:
 
     def _add_loading_rates(self, dataset_name: str) -> list[str]:
         names = []
-        shared_states = self._shared_loading_states()
         for state in range(self.config.n_states):
-            prefix = "shared" if state in shared_states else dataset_name
+            prefix = self._rate_prefix(dataset_name, self._loading_rate_scope(state))
             name = f"{prefix}:r{state}"
             if name not in self.graph.nodes:
                 self.graph.add_node(
@@ -296,15 +387,29 @@ class ViprodyneModel:
             names.append(name)
         return names
 
-    def _shared_transition_indices(self) -> set[int]:
+    def _transition_rate_scope(self, index: int) -> RateScope:
         if self.config.shared_transition_rates:
-            return set(range(self.config.n_states * (self.config.n_states - 1)))
-        return set(self.config.shared_transition_rate_indices)
+            return "global"
+        if index in self.config.shared_transition_rate_indices:
+            return "global"
+        return self.config.transition_rate_scopes.get(index, self.config.transition_rate_scope)
 
-    def _shared_loading_states(self) -> set[int]:
+    def _loading_rate_scope(self, state: int) -> RateScope:
         if self.config.shared_loading_rates:
-            return set(range(self.config.n_states))
-        return set(self.config.shared_loading_rate_states)
+            return "global"
+        if state in self.config.shared_loading_rate_states:
+            return "global"
+        return self.config.loading_rate_scopes.get(state, self.config.loading_rate_scope)
+
+    def _rate_prefix(self, dataset_name: str, scope: RateScope) -> str:
+        if scope == "global":
+            return "shared"
+        if scope == "track":
+            return dataset_name
+        if scope == "dataset":
+            dataset = next(item for item in self.datasets if item.name == dataset_name)
+            return dataset.rate_group or dataset.name
+        raise ValueError(f"unknown rate scope {scope!r}.")
 
     def _initial_concentration(self) -> np.ndarray:
         if self.config.initial_concentration is None:
@@ -410,3 +515,36 @@ def _validate_index_tuple(indices: tuple[int, ...], upper_bound: int, name: str)
     if any(index < 0 or index >= upper_bound for index in values):
         raise ValueError(f"{name} contains an out-of-range index.")
     return values
+
+
+def _validate_rate_prefix_labels(datasets: tuple[MS2Dataset, ...]) -> None:
+    labels = []
+    for dataset in datasets:
+        labels.append(("dataset name", dataset.name))
+        if dataset.rate_group is not None:
+            labels.append(("rate_group", dataset.rate_group))
+    for label_type, label in labels:
+        if ":" in label:
+            raise ValueError(f"{label_type} {label!r} must not contain ':'.")
+        if label == "shared":
+            raise ValueError(f"{label_type} {label!r} is reserved for global rate nodes.")
+
+
+def _validate_rate_scope(scope: str, name: str) -> RateScope:
+    if scope not in {"track", "dataset", "global"}:
+        raise ValueError(f"{name} must be 'track', 'dataset', or 'global'.")
+    return scope
+
+
+def _validate_scope_mapping(
+    mapping: dict[int, RateScope],
+    upper_bound: int,
+    name: str,
+) -> dict[int, RateScope]:
+    normalized: dict[int, RateScope] = {}
+    for raw_index, raw_scope in dict(mapping).items():
+        index = int(raw_index)
+        if index < 0 or index >= upper_bound:
+            raise ValueError(f"{name} contains an out-of-range index.")
+        normalized[index] = _validate_rate_scope(raw_scope, name)
+    return normalized

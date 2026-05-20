@@ -9,7 +9,7 @@ from typing import Mapping, MutableMapping
 
 import numpy as np
 
-MomentDict = dict[str, np.ndarray | float]
+MomentDict = dict[str, object]
 
 
 class MomentStore:
@@ -18,7 +18,7 @@ class MomentStore:
     def __init__(self) -> None:
         self._moments: dict[str, MomentDict] = {}
 
-    def publish(self, node_name: str, moments: Mapping[str, np.ndarray | float]) -> None:
+    def publish(self, node_name: str, moments: Mapping[str, object]) -> None:
         self._moments[node_name] = dict(moments)
 
     def get(self, node_name: str) -> MomentDict:
@@ -38,6 +38,7 @@ class UpdateContext:
     moments: MomentStore
     parent_names: tuple[str, ...]
     child_names: tuple[str, ...]
+    blanket_names: tuple[str, ...] = ()
     rho: float = 1.0
 
     def parent_moments(self) -> dict[str, MomentDict]:
@@ -45,6 +46,9 @@ class UpdateContext:
 
     def child_moments(self) -> dict[str, MomentDict]:
         return {name: self.moments.get(name) for name in self.child_names}
+
+    def blanket_moments(self) -> dict[str, MomentDict]:
+        return {name: self.moments.get(name) for name in self.blanket_names}
 
 
 class VariationalNode(ABC):
@@ -110,6 +114,15 @@ class VariationalGraph:
         self._require_node(node_name)
         return tuple(sorted(self._children[node_name]))
 
+    def markov_blanket(self, node_name: str) -> tuple[str, ...]:
+        """Return graph neighbors needed for a node-local variational update."""
+        self._require_node(node_name)
+        blanket = set(self._parents[node_name]) | set(self._children[node_name])
+        for child in self._children[node_name]:
+            blanket.update(self._parents[child])
+        blanket.discard(node_name)
+        return tuple(sorted(blanket))
+
     def run_schedule(self, schedule: list[str] | tuple[str, ...] | None = None, rho: float = 1.0) -> None:
         if not 0 < rho <= 1:
             raise ValueError("rho must be in (0, 1].")
@@ -121,6 +134,7 @@ class VariationalGraph:
                 moments=self.moments,
                 parent_names=self.parents_of(node_name),
                 child_names=self.children_of(node_name),
+                blanket_names=self.markov_blanket(node_name),
                 rho=float(rho),
             )
             node.update(context)
@@ -129,4 +143,3 @@ class VariationalGraph:
     def _require_node(self, node_name: str) -> None:
         if node_name not in self.nodes:
             raise KeyError(f"Unknown node {node_name!r}.")
-

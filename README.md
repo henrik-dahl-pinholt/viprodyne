@@ -49,6 +49,12 @@ model = ViprodyneModel(
 )
 ```
 
+For multi-trace fits, pass one `MS2Dataset` per trace. Use
+`MS2Dataset.rate_group` plus `transition_rate_scope` and `loading_rate_scope` to
+choose per-track, per-dataset, or global rate nodes. Run coordinate-ascent VI
+with `model.fit_cavi(...)`; convergence is monitored by parameter changes and
+the ELBO is computed only after the final sweep.
+
 Install locally for development:
 
 ```bash

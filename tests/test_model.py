@@ -66,6 +66,144 @@ def test_model_can_share_selected_rates_only():
     assert set(model.graph.parents_of("d1:tau")) == {"d1:s", "shared:r0", "d1:r1"}
 
 
+def test_model_rate_scopes_cover_track_dataset_and_global():
+    datasets = (
+        MS2Dataset(
+            name="a_track0",
+            rate_group="condition_a",
+            observed=np.array([0.1, 0.8], dtype=np.float32),
+            noise_std=np.float32(0.5),
+        ),
+        MS2Dataset(
+            name="a_track1",
+            rate_group="condition_a",
+            observed=np.array([0.2, 0.7], dtype=np.float32),
+            noise_std=np.float32(0.5),
+        ),
+        MS2Dataset(
+            name="b_track0",
+            rate_group="condition_b",
+            observed=np.array([0.3, 0.6], dtype=np.float32),
+            noise_std=np.float32(0.5),
+        ),
+    )
+    model = ViprodyneModel(
+        datasets=datasets,
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+            transition_rate_scope="global",
+            loading_rate_scope="dataset",
+        ),
+    )
+
+    assert set(model.dataset_nodes["a_track0"]["transition_rates"]) == {"shared:R0", "shared:R1"}
+    assert set(model.dataset_nodes["a_track1"]["transition_rates"]) == {"shared:R0", "shared:R1"}
+    assert set(model.dataset_nodes["a_track0"]["loading_rates"]) == {
+        "condition_a:r0",
+        "condition_a:r1",
+    }
+    assert set(model.dataset_nodes["a_track1"]["loading_rates"]) == {
+        "condition_a:r0",
+        "condition_a:r1",
+    }
+    assert set(model.dataset_nodes["b_track0"]["loading_rates"]) == {
+        "condition_b:r0",
+        "condition_b:r1",
+    }
+    assert "a_track0:r0" not in model.graph.nodes
+    assert "a_track1:r0" not in model.graph.nodes
+
+    track_model = ViprodyneModel(
+        datasets=datasets[:2],
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+            transition_rate_scope="track",
+            loading_rate_scope="track",
+        ),
+    )
+
+    assert set(track_model.dataset_nodes["a_track0"]["transition_rates"]) == {
+        "a_track0:R0",
+        "a_track0:R1",
+    }
+    assert set(track_model.dataset_nodes["a_track1"]["transition_rates"]) == {
+        "a_track1:R0",
+        "a_track1:R1",
+    }
+    assert set(track_model.dataset_nodes["a_track0"]["loading_rates"]) == {
+        "a_track0:r0",
+        "a_track0:r1",
+    }
+    assert set(track_model.dataset_nodes["a_track1"]["loading_rates"]) == {
+        "a_track1:r0",
+        "a_track1:r1",
+    }
+
+
+def test_model_supports_per_rate_scope_overrides():
+    datasets = (
+        MS2Dataset(
+            name="track0",
+            rate_group="condition",
+            observed=np.array([0.1, 0.8], dtype=np.float32),
+            noise_std=np.float32(0.5),
+        ),
+        MS2Dataset(
+            name="track1",
+            rate_group="condition",
+            observed=np.array([0.2, 0.7], dtype=np.float32),
+            noise_std=np.float32(0.5),
+        ),
+    )
+    model = ViprodyneModel(
+        datasets=datasets,
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+            transition_rate_scope="dataset",
+            transition_rate_scopes={1: "global"},
+            loading_rate_scope="dataset",
+            loading_rate_scopes={0: "track"},
+        ),
+    )
+
+    assert set(model.graph.parents_of("track0:s")) == {"track0:pi", "condition:R0", "shared:R1"}
+    assert set(model.graph.parents_of("track1:s")) == {"track1:pi", "condition:R0", "shared:R1"}
+    assert set(model.graph.parents_of("track0:tau")) == {"track0:s", "track0:r0", "condition:r1"}
+    assert set(model.graph.parents_of("track1:tau")) == {"track1:s", "track1:r0", "condition:r1"}
+    assert "condition:R1" not in model.graph.nodes
+    assert "condition:r0" not in model.graph.nodes
+
+
+def test_model_rejects_reserved_rate_prefix_labels():
+    with pytest.raises(ValueError, match="reserved"):
+        ViprodyneModel(
+            datasets=(
+                MS2Dataset(
+                    name="shared",
+                    observed=np.array([0.1, 0.8], dtype=np.float32),
+                    noise_std=np.float32(0.5),
+                ),
+            ),
+            config=ModelConfig(n_states=2, time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32)),
+        )
+
+    with pytest.raises(ValueError, match="must not contain ':'"):
+        ViprodyneModel(
+            datasets=(
+                MS2Dataset(
+                    name="track0",
+                    rate_group="condition:0",
+                    observed=np.array([0.1, 0.8], dtype=np.float32),
+                    noise_std=np.float32(0.5),
+                ),
+            ),
+            config=ModelConfig(n_states=2, time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32)),
+        )
+
+
 def test_model_schedule_runs_promoter_and_pol2_nodes():
     model = ViprodyneModel(
         datasets=(make_dataset("d0"),),

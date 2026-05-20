@@ -172,6 +172,24 @@ contact probabilities for driven transitions. It does not require users to pass
 dense design matrices or transfer windows. Those are derived internally from the
 MS2 kernel in `ModelConfig`.
 
+For fitting many traces, use one `MS2Dataset` object per trace and set
+`MS2Dataset.rate_group` to the experimental dataset or condition label when
+rates should be shared at the dataset level. Rate scopes are controlled by
+`ModelConfig.transition_rate_scope` and `ModelConfig.loading_rate_scope`:
+
+- `"track"` creates one rate node per `MS2Dataset.name`;
+- `"dataset"` creates one rate node per `MS2Dataset.rate_group` when supplied,
+  otherwise one rate node per `MS2Dataset.name`;
+- `"global"` creates one shared rate node for the whole model.
+
+Individual rates can override the default scope with
+`transition_rate_scopes={rate_index: scope}` and
+`loading_rate_scopes={state_index: scope}`. This supports mixed models such as a
+global `k_on`, dataset-level `k_off`, and per-track loading rates in the same
+graph. The legacy `shared_transition_rates`, `shared_loading_rates`,
+`shared_transition_rate_indices`, and `shared_loading_rate_states` options are
+kept as aliases for global sharing.
+
 `MS2Dataset` does not contain `prior_load_probabilities`. In model-built graphs,
 those are derived from `PromoterState` and `LoadingRate` parents.
 
@@ -204,6 +222,17 @@ model = ViprodyneModel(
 model.run_schedule(model.default_schedule())
 state_posterior = model.graph.moments.get("condition_0:s")["posterior"]
 loading_posterior = model.graph.moments.get("condition_0:tau")["load_probabilities"]
+```
+
+CAVI runs are handled by `viprodyne.fit.run_cavi` or `model.fit_cavi(...)`.
+The default CAVI schedule updates hidden promoter/Pol2 nodes first, then
+parameter nodes. Convergence is monitored from the maximum relative change in
+parameter-node values, and the model ELBO is computed only once after the final
+sweep because Pol2 ELBO terms can be expensive.
+
+```python
+result = model.fit_cavi(max_iterations=100, tolerance=1e-4, compute_elbo=True)
+print(result.converged, result.max_parameter_change, result.elbo)
 ```
 
 Datasets can either inherit `ModelConfig.time_grid` or provide their own
@@ -279,12 +308,9 @@ model = ViprodyneModel(
 )
 ```
 
-Shared rate nodes are enabled globally with `shared_transition_rates=True` or
-`shared_loading_rates=True`. To share only selected parameters, use
-`shared_transition_rate_indices=(...)` for transition-rate indices or
-`shared_loading_rate_states=(...)` for loading-rate state indices. Driven
-transition rates can be shared across datasets while the contact-drive node
-remains per dataset.
+Driven transition rates can be scoped as track, dataset, or global rates. The
+contact-drive node remains per track/dataset plate, so a shared driven-rate node
+can still receive different contact probabilities from different traces.
 
 ## Current Gaps
 
@@ -316,4 +342,6 @@ Tests cover:
 - large Pol2 batches with 200 tracks and 1000 timepoints;
 - Gamma/Dirichlet parameter entropy and pinned-node behavior;
 - driven contact-survival MAP profiles and driven promoter tilts;
-- top-level graph construction with shared and driven parameter nodes.
+- graph Markov-blanket wiring;
+- top-level graph construction with shared, scoped, and driven parameter nodes;
+- CAVI convergence monitoring without per-iteration ELBO evaluation.

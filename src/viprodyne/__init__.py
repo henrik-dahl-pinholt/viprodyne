@@ -1,6 +1,7 @@
 """viprodyne: variational inference tools for MS2 posterior models."""
 
 from viprodyne.core import ProximalKernel
+from viprodyne.fit import CAVIConfig, CAVIIteration, CAVIResult, run_cavi
 from viprodyne.model import MS2Dataset, ModelConfig, ViprodyneModel
 from viprodyne.variational.distributions import DeltaNode, DirichletNode, GammaNode
 from viprodyne.variational.nodes import (
@@ -16,6 +17,9 @@ from viprodyne.variational.nodes import (
 
 __all__ = [
     "DeltaNode",
+    "CAVIConfig",
+    "CAVIIteration",
+    "CAVIResult",
     "DirichletNode",
     "DrivenRateMap",
     "GammaNode",
@@ -30,4 +34,5 @@ __all__ = [
     "RcNode",
     "TransitionRate",
     "ViprodyneModel",
+    "run_cavi",
 ]
