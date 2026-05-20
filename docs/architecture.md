@@ -270,16 +270,40 @@ model = ViprodyneModel(
     ),
 )
 
-model.run_schedule(model.default_schedule())
-state_posterior = model.graph.moments.get("condition_0:s")["posterior"]
-loading_posterior = model.graph.moments.get("condition_0:tau")["load_probabilities"]
+fit = model.run_inference(max_iterations=100, tolerance=1e-4)
+condition = fit.datasets["condition_0"]
+
+state_posterior = condition.state_posterior
+loading_posterior = condition.loading_posterior
+predicted_ms2 = condition.predicted_signal
+transition_rates = condition.transition_rates
+loading_rates = condition.loading_rates
 ```
 
-CAVI runs are handled by `viprodyne.fit.run_cavi` or `model.fit_cavi(...)`.
-The default CAVI schedule updates hidden promoter/Pol2 nodes first, then
-parameter nodes. Convergence is monitored from the maximum relative change in
-parameter-node values, and the model ELBO is computed only once after the final
-sweep because Pol2 ELBO terms can be expensive.
+The standard inference entry point is `model.run_inference(...)` or the alias
+`model.fit(...)`. It returns `ModelInferenceResult`, which contains the CAVI
+diagnostics and one `DatasetInferenceResult` per dataset plate. The result
+fields expose posterior arrays and fitted rates without requiring users to look
+up graph node names.
+
+`model.fit_cavi(...)` and `viprodyne.fit.run_cavi(...)` remain available for
+lower-level schedule testing. The default CAVI schedule updates hidden
+promoter/Pol2 nodes first, then parameter nodes. Convergence is monitored from
+the maximum relative change in parameter-node values, and the model ELBO is
+computed only once after the final sweep because Pol2 ELBO terms can be
+expensive.
+
+Each `DatasetInferenceResult` contains:
+
+- `state_posterior`: promoter state posterior on the CTMC grid, shaped
+  `(n_traces, n_grid_points, n_states)`;
+- `loading_posterior`: Pol2 loading posterior on the loading grid, shaped
+  `(n_traces, n_loadings)`;
+- `predicted_signal`: posterior mean MS2 intensity at observation times;
+- `loading_mask`: loading-grid support mask derived from missing observations;
+- `initial_probabilities`, `transition_rates`, and `loading_rates`: fitted
+  parameter moments, with transition-rate keys following the documented
+  off-diagonal ordering and loading-rate keys following promoter state index.
 
 Final ELBO accounting is factor-based. Gamma and Dirichlet parameter nodes
 contribute expected log prior plus entropy, `PolymeraseLoadings` contributes its
@@ -289,8 +313,8 @@ from the tilted CTMC log partition so the Pol2 loading factor is not counted
 twice.
 
 ```python
-result = model.fit_cavi(max_iterations=100, tolerance=1e-4, compute_elbo=True)
-print(result.converged, result.max_parameter_change, result.elbo)
+fit = model.run_inference(max_iterations=100, tolerance=1e-4, compute_elbo=True)
+print(fit.cavi.converged, fit.cavi.max_parameter_change, fit.cavi.elbo)
 ```
 
 Datasets can either inherit `ModelConfig.time_grid` or provide their own

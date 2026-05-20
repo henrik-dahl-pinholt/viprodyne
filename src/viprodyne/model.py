@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
@@ -29,6 +29,38 @@ from viprodyne.variational import (
 
 FLOAT_DTYPE = np.float32
 RateScope = Literal["track", "dataset", "global"]
+
+if TYPE_CHECKING:
+    from viprodyne.fit import CAVIResult
+
+
+@dataclass(frozen=True)
+class DatasetInferenceResult:
+    """Structured posterior outputs for one dataset plate."""
+
+    name: str
+    time_grid: np.ndarray
+    sampling_times: np.ndarray | None
+    observed: np.ndarray
+    finite_mask: np.ndarray
+    state_posterior: np.ndarray
+    loading_posterior: np.ndarray | None
+    predicted_signal: np.ndarray | None
+    loading_mask: np.ndarray | None
+    initial_probabilities: np.ndarray
+    transition_rates: dict[int, np.ndarray]
+    loading_rates: dict[int, np.ndarray]
+    transition_rate_nodes: dict[int, str]
+    loading_rate_nodes: dict[int, str]
+
+
+@dataclass(frozen=True)
+class ModelInferenceResult:
+    """Result returned by top-level inference helpers."""
+
+    cavi: CAVIResult | None
+    datasets: dict[str, DatasetInferenceResult]
+    elbo_terms: dict[str, np.float32] | None = None
 
 
 @dataclass(frozen=True)
@@ -231,13 +263,98 @@ class ViprodyneModel:
 
     def fit_cavi(self, config=None, **kwargs):
         """Run coordinate-ascent variational inference for this model."""
-        from viprodyne.fit import CAVIConfig, run_cavi
+        from viprodyne.fit import run_cavi
 
-        if config is not None and kwargs:
-            raise ValueError("pass either config or keyword arguments, not both.")
-        if config is None:
-            config = CAVIConfig(**kwargs)
+        config = self._cavi_config(config, kwargs)
         return run_cavi(self, config=config)
+
+    def run_inference(self, config=None, **kwargs) -> ModelInferenceResult:
+        """Run CAVI and return structured dataset-level posterior outputs."""
+        config = self._cavi_config(config, kwargs)
+        from viprodyne.fit import run_cavi
+
+        cavi_result = run_cavi(self, config=config)
+        return self.inference_result(
+            cavi=cavi_result,
+            include_elbo_terms=bool(config.compute_elbo),
+        )
+
+    def fit(self, config=None, **kwargs) -> ModelInferenceResult:
+        """Alias for :meth:`run_inference` for the standard public workflow."""
+        return self.run_inference(config=config, **kwargs)
+
+    def inference_result(
+        self,
+        cavi=None,
+        include_elbo_terms: bool = True,
+    ) -> ModelInferenceResult:
+        """Collect current graph moments into structured inference outputs."""
+        return ModelInferenceResult(
+            cavi=cavi,
+            datasets={dataset.name: self.dataset_result(dataset.name) for dataset in self.datasets},
+            elbo_terms=self.compute_elbo_terms() if include_elbo_terms else None,
+        )
+
+    def dataset_result(self, dataset_name: str) -> DatasetInferenceResult:
+        """Return structured posterior outputs for one dataset plate."""
+        try:
+            dataset = next(item for item in self.datasets if item.name == dataset_name)
+            nodes = self.dataset_nodes[dataset_name]
+        except (KeyError, StopIteration) as exc:
+            raise KeyError(f"unknown dataset {dataset_name!r}.") from exc
+
+        promoter = self.graph.moments.get(str(nodes["promoter"]))
+        observed = self.graph.moments.get(str(nodes["observed"]))
+        initial = self.graph.moments.get(str(nodes["initial"]))
+        polymerase_name = nodes["polymerase"]
+        polymerase = (
+            self.graph.moments.get(str(polymerase_name))
+            if polymerase_name is not None
+            else {}
+        )
+        sampling_times = None
+        if polymerase_name is not None:
+            sampling_times = np.asarray(
+                self.graph.nodes[str(polymerase_name)].sampling_times,
+                dtype=FLOAT_DTYPE,
+            ).copy()
+        elif dataset.sampling_times is not None:
+            sampling_times = np.asarray(dataset.sampling_times, dtype=FLOAT_DTYPE).copy()
+
+        transition_rate_nodes = {
+            index: name for index, name in enumerate(list(nodes["transition_rates"]))
+        }
+        loading_rate_nodes = {
+            index: name for index, name in enumerate(list(nodes["loading_rates"]))
+        }
+        return DatasetInferenceResult(
+            name=dataset.name,
+            time_grid=self._time_grid(dataset).copy(),
+            sampling_times=sampling_times,
+            observed=np.asarray(observed["observed"], dtype=FLOAT_DTYPE).copy(),
+            finite_mask=np.asarray(observed["finite_mask"], dtype=bool).copy(),
+            state_posterior=np.asarray(promoter["posterior"], dtype=FLOAT_DTYPE).copy(),
+            loading_posterior=_optional_float_moment(polymerase, "load_probabilities"),
+            predicted_signal=_optional_float_moment(polymerase, "predicted_signal"),
+            loading_mask=_optional_bool_moment(polymerase, "loading_mask"),
+            initial_probabilities=np.asarray(initial["mean"], dtype=FLOAT_DTYPE).copy(),
+            transition_rates={
+                index: np.asarray(
+                    self.graph.moments.get(name)["mean"],
+                    dtype=FLOAT_DTYPE,
+                ).copy()
+                for index, name in transition_rate_nodes.items()
+            },
+            loading_rates={
+                index: np.asarray(
+                    self.graph.moments.get(name)["mean"],
+                    dtype=FLOAT_DTYPE,
+                ).copy()
+                for index, name in loading_rate_nodes.items()
+            },
+            transition_rate_nodes=transition_rate_nodes,
+            loading_rate_nodes=loading_rate_nodes,
+        )
 
     def default_schedule(self) -> tuple[str, ...]:
         """Return a conservative default schedule over non-observed nodes."""
@@ -297,6 +414,15 @@ class ViprodyneModel:
         """Compute the current available model ELBO."""
         terms = self.compute_elbo_terms()
         return np.asarray(sum(float(value) for value in terms.values()), dtype=FLOAT_DTYPE)
+
+    def _cavi_config(self, config, kwargs):
+        from viprodyne.fit import CAVIConfig
+
+        if config is not None and kwargs:
+            raise ValueError("pass either config or keyword arguments, not both.")
+        if config is None:
+            return CAVIConfig(**kwargs)
+        return config
 
     def _build_graph(self) -> None:
         for dataset in self.datasets:
@@ -625,6 +751,18 @@ def _validate_time_grid(time_grid: np.ndarray, name: str) -> np.ndarray:
     if np.any(np.diff(time_grid) <= 0):
         raise ValueError(f"{name} must be strictly increasing.")
     return time_grid
+
+
+def _optional_float_moment(moments: dict, key: str) -> np.ndarray | None:
+    if key not in moments:
+        return None
+    return np.asarray(moments[key], dtype=FLOAT_DTYPE).copy()
+
+
+def _optional_bool_moment(moments: dict, key: str) -> np.ndarray | None:
+    if key not in moments:
+        return None
+    return np.asarray(moments[key], dtype=bool).copy()
 
 
 def _validate_index_tuple(indices: tuple[int, ...], upper_bound: int, name: str) -> tuple[int, ...]:

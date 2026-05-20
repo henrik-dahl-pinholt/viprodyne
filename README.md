@@ -47,18 +47,31 @@ model = ViprodyneModel(
         rna_intensity=np.float32(1.0),
     ),
 )
+
+fit = model.run_inference(max_iterations=100, tolerance=1e-4)
+posterior = fit.datasets["condition_0"]
+
+state_posterior = posterior.state_posterior
+loading_posterior = posterior.loading_posterior
+predicted_ms2 = posterior.predicted_signal
+loading_rates = posterior.loading_rates
+transition_rates = posterior.transition_rates
+
+print(fit.cavi.converged, fit.cavi.elbo)
 ```
 
 `MS2Dataset.observed` must have shape `(n_traces, n_timepoints)`, including
 single-trace datasets as `(1, n_timepoints)`. Use `MS2Dataset.rate_group` plus
 `transition_rate_scope` and `loading_rate_scope` to choose per-track,
-per-dataset, or global rate nodes. Run coordinate-ascent VI with
-`model.fit_cavi(...)`; convergence is monitored by parameter changes and the
-ELBO is computed only after the final sweep. Promoter and Pol2 updates use
-natural expected-log messages, including `E[log pi]` for initial state weights
-and expected log load/no-load terms for Pol2 priors. Missing observations are
-also propagated to an internal Pol2 loading mask so prior-only intervals do not
-update promoter or loading-rate factors.
+per-dataset, or global rate nodes. The standard fitting entry point is
+`model.run_inference(...)` or its alias `model.fit(...)`. It runs
+coordinate-ascent VI, monitors convergence by parameter changes, computes the
+ELBO only after the final sweep, and returns structured per-dataset outputs.
+Promoter and Pol2 updates use natural expected-log messages, including
+`E[log pi]` for initial state weights and expected log load/no-load terms for
+Pol2 priors. Missing observations are also propagated to an internal Pol2
+loading mask so prior-only intervals do not update promoter or loading-rate
+factors.
 
 `pol2_mode="auto"` uses the memory-efficient transfer backend. The continuous
 Pol2 sampler is available with `pol2_mode="sampler"` for proximal MS2 kernels.

@@ -1,6 +1,14 @@
 import numpy as np
 
-from viprodyne import CAVIConfig, MS2Dataset, ModelConfig, ViprodyneModel, run_cavi
+from viprodyne import (
+    CAVIConfig,
+    DatasetInferenceResult,
+    MS2Dataset,
+    ModelConfig,
+    ModelInferenceResult,
+    ViprodyneModel,
+    run_cavi,
+)
 
 
 def make_model():
@@ -63,3 +71,40 @@ def test_model_fit_cavi_updates_loading_rates_from_pol2_blanket_stats():
     assert "loading_counts_by_rate" in pol2_moments
     assert "track_0:r0" in pol2_moments["loading_counts_by_rate"]
     assert not np.allclose(after, before)
+
+
+def test_model_run_inference_returns_structured_outputs():
+    model = make_model()
+
+    result = model.run_inference(max_iterations=2, min_iterations=2, compute_elbo=True)
+    dataset = result.datasets["track_0"]
+
+    assert isinstance(result, ModelInferenceResult)
+    assert isinstance(dataset, DatasetInferenceResult)
+    assert result.cavi.n_iterations == 2
+    assert result.cavi.elbo.dtype == np.float32
+    assert result.elbo_terms is not None
+    assert dataset.name == "track_0"
+    assert dataset.observed.shape == (1, 2)
+    assert dataset.finite_mask.shape == (1, 2)
+    assert dataset.state_posterior.shape == (1, 3, 2)
+    assert dataset.loading_posterior.shape == (1, 2)
+    assert dataset.predicted_signal.shape == (1, 2)
+    assert dataset.loading_mask.shape == (1, 2)
+    assert dataset.initial_probabilities.shape == (2,)
+    assert set(dataset.transition_rates) == {0, 1}
+    assert set(dataset.loading_rates) == {0, 1}
+    assert dataset.transition_rate_nodes[0] == "track_0:R0"
+    assert dataset.loading_rate_nodes[1] == "track_0:r1"
+
+
+def test_model_fit_alias_runs_inference():
+    model = make_model()
+
+    result = model.fit(max_iterations=1, min_iterations=1, compute_elbo=False)
+
+    assert isinstance(result, ModelInferenceResult)
+    assert result.cavi.n_iterations == 1
+    assert result.cavi.elbo is None
+    assert result.elbo_terms is None
+    assert "track_0" in result.datasets
