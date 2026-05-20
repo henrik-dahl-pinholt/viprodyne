@@ -47,8 +47,10 @@ def bernoulli_transfer_log_likelihood(
     """Exact Bernoulli loading log likelihood by sliding-window transfer.
 
     ``window_weights`` maps the active binary loading window to the MS2 signal.
-    ``observation_starts[t]`` is the loading-grid index of the first bit in the
-    window for observation ``t``. Starts must be monotone outside this JIT kernel.
+    It can be one-dimensional for a shared window or ``(n_observations,
+    window_size)`` for boundary rows with different weights. ``observation_starts[t]``
+    is the loading-grid index of the first bit in the window for observation
+    ``t``. Starts must be monotone outside this JIT kernel.
     """
     return _bernoulli_transfer_log_likelihood_from_probabilities(
         observed,
@@ -73,7 +75,7 @@ def _bernoulli_transfer_log_likelihood_from_probabilities(
     """Transfer log likelihood with a scale on observation log potentials."""
     observed = jnp.asarray(observed, dtype=jnp.float32)
     prior = jnp.clip(jnp.asarray(prior_probabilities, dtype=jnp.float32), 1e-7, 1.0 - 1e-7)
-    window_weights = jnp.asarray(window_weights, dtype=jnp.float32)
+    weights_by_observation = _weights_by_observation(window_weights, observed.shape[0])
     starts = jnp.asarray(observation_starts, dtype=jnp.int32)
     noise_by_observation = jnp.broadcast_to(
         jnp.asarray(noise_std, dtype=jnp.float32),
@@ -82,10 +84,9 @@ def _bernoulli_transfer_log_likelihood_from_probabilities(
     finite_mask = jnp.asarray(finite_mask, dtype=bool)
     safe_observed = jnp.where(finite_mask, observed, 0.0)
 
-    window_size = window_weights.shape[0]
+    window_size = weights_by_observation.shape[1]
     n_states = 1 << window_size
     bits = enumerate_binary_configurations(window_size)
-    emission_means = bits @ window_weights
     shifts = starts - jnp.concatenate([starts[:1], starts[:-1]])
     max_shift = jnp.max(shifts)
 
@@ -105,7 +106,7 @@ def _bernoulli_transfer_log_likelihood_from_probabilities(
 
     def step(carry, inputs):
         alpha_t, loglik = carry
-        y_t, is_finite_t, shift_t, start_t, noise_t = inputs
+        y_t, is_finite_t, shift_t, start_t, noise_t, weights_t = inputs
 
         def append_one(i, alpha_inner):
             append_ind = start_t + window_size - shift_t + i
@@ -118,6 +119,7 @@ def _bernoulli_transfer_log_likelihood_from_probabilities(
             )
 
         alpha_t = jax.lax.fori_loop(0, max_shift, append_one, alpha_t)
+        emission_means = bits @ weights_t
         residual = y_t - emission_means
         obs_logp = -0.5 * (
             jnp.log(2.0 * jnp.pi * noise_t**2) + residual * residual / noise_t**2
@@ -132,7 +134,14 @@ def _bernoulli_transfer_log_likelihood_from_probabilities(
     (_, loglik), _ = jax.lax.scan(
         step,
         (alpha, jnp.asarray(0.0, dtype=jnp.float32)),
-        (safe_observed, finite_mask, shifts, starts, noise_by_observation),
+        (
+            safe_observed,
+            finite_mask,
+            shifts,
+            starts,
+            noise_by_observation,
+            weights_by_observation,
+        ),
     )
     return loglik
 
@@ -157,14 +166,15 @@ def bernoulli_transfer_posterior(
     prior = jnp.clip(jnp.asarray(prior_probabilities, dtype=jnp.float32), 1e-7, 1.0 - 1e-7)
     logits = jnp.log(prior) - jnp.log1p(-prior)
     starts = jnp.asarray(observation_starts, dtype=jnp.int32)
-    window_weights = jnp.asarray(window_weights, dtype=jnp.float32)
+    observed_arr = jnp.asarray(observed, dtype=jnp.float32)
+    weights_by_observation = _weights_by_observation(window_weights, observed_arr.shape[0])
 
     def log_z_from_logits(logits_arg: jnp.ndarray) -> jnp.ndarray:
         probabilities = jax.nn.sigmoid(logits_arg)
         return _bernoulli_transfer_log_likelihood_from_probabilities(
             observed,
             probabilities,
-            window_weights,
+            weights_by_observation,
             starts,
             noise_std,
             finite_mask,
@@ -183,7 +193,7 @@ def bernoulli_transfer_posterior(
         return _bernoulli_transfer_log_likelihood_from_probabilities(
             observed,
             prior,
-            window_weights,
+            weights_by_observation,
             starts,
             noise_std,
             finite_mask,
@@ -195,11 +205,11 @@ def bernoulli_transfer_posterior(
     )
     entropy = log_z - expected_log_prior - expected_log_likelihood
 
-    def predict_one(start: jnp.ndarray) -> jnp.ndarray:
-        active = jax.lax.dynamic_slice(marginals, (start,), (window_weights.shape[0],))
-        return jnp.dot(active, window_weights)
+    def predict_one(start: jnp.ndarray, weights_t: jnp.ndarray) -> jnp.ndarray:
+        active = jax.lax.dynamic_slice(marginals, (start,), (weights_by_observation.shape[1],))
+        return jnp.dot(active, weights_t)
 
-    predicted_signal = jax.vmap(predict_one)(starts)
+    predicted_signal = jax.vmap(predict_one)(starts, weights_by_observation)
     return (
         log_z,
         marginals.astype(jnp.float32),
@@ -208,6 +218,17 @@ def bernoulli_transfer_posterior(
         expected_log_prior.astype(jnp.float32),
         expected_log_likelihood.astype(jnp.float32),
     )
+
+
+def _weights_by_observation(window_weights: jnp.ndarray, n_observations: int) -> jnp.ndarray:
+    weights = jnp.asarray(window_weights, dtype=jnp.float32)
+    if weights.ndim == 1:
+        return jnp.broadcast_to(weights[None, :], (n_observations, weights.shape[0]))
+    if weights.ndim != 2:
+        raise ValueError("window_weights must be one- or two-dimensional.")
+    if weights.shape[0] != n_observations:
+        raise ValueError("two-dimensional window_weights must match observed length.")
+    return weights
 
 
 @jax.jit

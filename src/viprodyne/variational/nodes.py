@@ -584,7 +584,7 @@ class PolymeraseLoadings(VariationalNode):
         if self.window_weights is not None and self.observation_starts is not None:
             window_weights = np.asarray(self.window_weights, dtype=FLOAT_DTYPE)
             observation_starts = np.asarray(self.observation_starts, dtype=np.int32)
-            return int(np.max(observation_starts) + window_weights.size)
+            return int(np.max(observation_starts) + window_weights.shape[-1])
         raise ValueError(
             "prior_probabilities can only be omitted when design_matrix or transfer "
             "window_weights/observation_starts define the loading grid."

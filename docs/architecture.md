@@ -49,18 +49,29 @@ loading kernels:
   from `log_Z` derivative identities. It avoids a materialized joint posterior,
   but it is more expensive than the log-likelihood-only transfer pass.
 
+`viprodyne.core.ms2_kernels` owns the public MS2 kernel specification and the
+internal conversion from user timing inputs to Pol2 observation representations:
+
+- `MS2Kernel` can select a named parameterized kernel or wrap a custom
+  JAX-compatible kernel function.
+- `ms2posterior_kernel` is the current built-in parameterized kernel. It uses
+  `t_rise`, `t_plateau`, and `rna_intensity`.
+- `build_ms2_observation_model` derives the dense or transfer representation
+  used by `PolymeraseLoadings`. The transfer path extracts row-specific windows
+  from the kernel without storing a full dense observation-by-loading matrix.
+
 `viprodyne.core.pol2_sampler` contains the continuous-time reversible-jump Pol2
 loading sampler and thermodynamic-integration log-partition estimator. The core
 module is implemented and tested; it is not yet exposed as a
 `PolymeraseLoadings` node mode in the graph builder.
 
-The dense `design_matrix` representation is the linear map from loading
-variables to expected MS2 intensity, `I_mean = design_matrix @ tau`. It is useful
-for tiny exact enumeration tests and generic mean-field checks, but it scales as
-`O(n_observations * n_loadings)`. For regular MS2 kernels, prefer the transfer
-representation (`window_weights` plus `observation_starts`) or the sampler,
-which keep memory tied to kernel support and grid size instead of a full dense
-convolution matrix.
+The dense design matrix and transfer-window representation are internal objects.
+The user-facing model API takes observed intensities, timing, and an MS2 kernel
+specification. Dense mode is still useful internally for tiny exact enumeration
+tests and generic mean-field checks, but it scales as
+`O(n_observations * n_loadings)`. For regular MS2 kernels, the model builder
+derives the transfer representation so memory stays tied to kernel support and
+grid size instead of a full dense convolution matrix.
 
 `viprodyne.core.contact_survival` implements the corrected contact-survival
 profile for driven rates. The discrete survival factor is
@@ -101,8 +112,8 @@ Domain nodes:
 - `ObservedIntensity`: deterministic observed MS2 intensity node.
 - `PromoterState`: tilted CTMC node for `q(s_t)`.
 - `PolymeraseLoadings`: Pol2 loading node with `mean_field`, `exact`, and
-  `transfer` modes. `mean_field` and `exact` use a dense `design_matrix`.
-  `transfer` uses `window_weights` and `observation_starts`.
+  `transfer` modes. The model builder supplies the internal dense or transfer
+  representation from the configured MS2 kernel.
 
 Pinned parameter nodes emit deterministic moments and have zero entropy.
 
@@ -155,11 +166,10 @@ Create one `MS2Dataset` per dataset plate and pass them to `ViprodyneModel` with
 a `ModelConfig`.
 
 `MS2Dataset` contains observed intensities, noise, optional per-dataset
-`time_grid`, optional missing-data mask, and one Pol2 observation representation:
-
-- transfer representation: `window_weights` plus `observation_starts`;
-- dense representation: `design_matrix`, intended for tests and small generic
-  mean-field/exact cases.
+`time_grid`, optional `sampling_times`, optional missing-data mask, and optional
+contact probabilities for driven transitions. It does not require users to pass
+dense design matrices or transfer windows. Those are derived internally from the
+MS2 kernel in `ModelConfig`.
 
 `MS2Dataset` does not contain `prior_load_probabilities`. In model-built graphs,
 those are derived from `PromoterState` and `LoadingRate` parents.
@@ -174,8 +184,6 @@ dataset = MS2Dataset(
     observed=np.array([0.1, np.nan, 0.8], dtype=np.float32),
     noise_std=np.float32(0.5),
     time_grid=np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
-    window_weights=np.array([1.0], dtype=np.float32),
-    observation_starts=np.array([0, 1, 2], dtype=np.int32),
 )
 
 model = ViprodyneModel(
@@ -185,6 +193,10 @@ model = ViprodyneModel(
         shared_transition_rates=False,
         shared_loading_rates=False,
         pol2_mode="auto",
+        ms2_kernel="ms2posterior",
+        t_rise=np.float32(0.25),
+        t_plateau=np.float32(0.75),
+        rna_intensity=np.float32(1.0),
     ),
 )
 
@@ -197,10 +209,18 @@ Datasets can either inherit `ModelConfig.time_grid` or provide their own
 `MS2Dataset.time_grid`. Per-dataset grids are the right representation when
 conditions have different frame timing or different trace lengths.
 
-`ModelConfig.pol2_mode="auto"` chooses `transfer` when transfer-window inputs
-are present and falls back to `mean_field` when only a dense `design_matrix` is
-provided. `pol2_mode="transfer"` also falls back to `mean_field` if transfer
-inputs are absent.
+By default, observations are assumed to occur at interval ends,
+`time_grid[1:len(observed) + 1]`. Use `MS2Dataset.sampling_times` when frame
+times are not the interval ends.
+
+`ModelConfig.ms2_kernel` can be a named kernel string, an `MS2Kernel` instance,
+or a custom JAX-compatible callable. The current built-in parameterized kernel is
+`"ms2posterior"` and uses `t_rise`, `t_plateau`, and `rna_intensity`.
+
+`ModelConfig.pol2_mode="auto"` chooses the transfer backend from the kernel
+configuration. `pol2_mode="mean_field"` or `"exact"` asks the builder to create
+the internal dense representation and should be reserved for small tests and
+diagnostics.
 
 Example with heterogeneous grids:
 
@@ -210,18 +230,28 @@ d0 = MS2Dataset(
     observed=np.array([0.1, 0.8], dtype=np.float32),
     noise_std=np.float32(0.5),
     time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
-    window_weights=np.array([1.0], dtype=np.float32),
-    observation_starts=np.array([0, 1], dtype=np.int32),
 )
 d1 = MS2Dataset(
     name="d1",
     observed=np.array([0.2, 0.5, 0.9], dtype=np.float32),
     noise_std=np.float32(0.5),
     time_grid=np.array([0.0, 0.25, 0.75, 1.5], dtype=np.float32),
-    window_weights=np.array([1.0], dtype=np.float32),
-    observation_starts=np.array([0, 1, 2], dtype=np.int32),
 )
 model = ViprodyneModel(datasets=(d0, d1), config=ModelConfig(n_states=2))
+```
+
+Example with a custom kernel:
+
+```python
+import jax.numpy as jnp
+
+def rectangular_kernel(time_offsets):
+    return jnp.where((time_offsets >= 0.0) & (time_offsets < 0.75), 1.0, 0.0)
+
+model = ViprodyneModel(
+    datasets=(dataset,),
+    config=ModelConfig(n_states=2, ms2_kernel=rectangular_kernel),
+)
 ```
 
 Driven transitions are selected by transition index. For a two-state model,
@@ -257,8 +287,8 @@ datasets while the contact-drive node remains per dataset.
   a `PolymeraseLoadings(mode="sampler")` adapter and model-builder inputs for
   `fine_grid`, sampler iterations, repeats, and thermodynamic-integration
   settings.
-- Dense mean-field/exact Pol2 modes remain available, but should not be used for
-  large regular MS2 traces because `design_matrix` memory scales as
+- Dense mean-field/exact Pol2 modes remain available internally, but should not
+  be used for large regular MS2 traces because dense memory scales as
   `O(n_observations * n_loadings)`.
 - Driven `RcNode` currently supports pinned contact probabilities or an injected
   objective function. Full profile-likelihood rc updates from GPR/contact data

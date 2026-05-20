@@ -53,10 +53,8 @@ def run_exact(observed, prior, design, noise):
 def design_from_windows(n_loadings, window_weights, starts):
     design = np.zeros((len(starts), n_loadings), dtype=np.float32)
     for row, start in enumerate(starts):
-        design[row, start : start + len(window_weights)] = np.asarray(
-            window_weights,
-            dtype=np.float32,
-        )
+        weights = np.asarray(window_weights[row] if np.ndim(window_weights) == 2 else window_weights)
+        design[row, start : start + len(weights)] = weights.astype(np.float32)
     return design
 
 
@@ -309,6 +307,63 @@ def test_transfer_log_likelihood_matches_exact_contiguous_windows():
     assert isinstance(transfer_logz, jax.Array)
     assert transfer_logz.dtype == jnp.float32
     assert float(transfer_logz) == pytest.approx(float(exact_logz), rel=1e-6, abs=1e-6)
+
+
+def test_transfer_accepts_row_specific_window_weights():
+    prior = np.array([0.2, 0.5, 0.7], dtype=np.float32)
+    window_weights = np.array(
+        [
+            [1.0, 0.0],
+            [0.4, 1.2],
+            [1.1, 0.5],
+        ],
+        dtype=np.float32,
+    )
+    starts = np.array([0, 0, 1], dtype=np.int32)
+    observed = np.array([0.1, 1.3, 0.9], dtype=np.float32)
+    noise = np.float32(0.6)
+    finite_mask = np.isfinite(observed)
+    design = design_from_windows(len(prior), window_weights, starts)
+
+    configs = enumerate_binary_configurations(len(prior))
+    exact_logz, exact_marginals, _, exact_predicted, exact_weights = (
+        exact_bernoulli_posterior(
+            jnp.asarray(observed),
+            jnp.asarray(prior),
+            jnp.asarray(design),
+            jnp.asarray(noise),
+            jnp.asarray(finite_mask),
+            configs,
+        )
+    )
+    exact_entropy = -jnp.sum(
+        jnp.where(exact_weights > 0.0, exact_weights * jnp.log(exact_weights), 0.0)
+    )
+    transfer_logz, transfer_marginals, predicted, entropy, _, _ = (
+        bernoulli_transfer_posterior(
+            jnp.asarray(observed),
+            jnp.asarray(prior),
+            jnp.asarray(window_weights),
+            jnp.asarray(starts),
+            jnp.asarray(noise),
+            jnp.asarray(finite_mask),
+        )
+    )
+
+    assert float(transfer_logz) == pytest.approx(float(exact_logz), rel=1e-5, abs=1e-6)
+    np.testing.assert_allclose(
+        np.asarray(transfer_marginals),
+        np.asarray(exact_marginals),
+        rtol=2e-4,
+        atol=2e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(predicted),
+        np.asarray(exact_predicted),
+        rtol=2e-4,
+        atol=2e-5,
+    )
+    assert float(entropy) == pytest.approx(float(exact_entropy), rel=2e-4, abs=2e-5)
 
 
 def test_transfer_log_likelihood_matches_exact_with_gaps_and_missing_data():

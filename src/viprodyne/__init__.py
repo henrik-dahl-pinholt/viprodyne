@@ -1,5 +1,6 @@
 """viprodyne: variational inference tools for MS2 posterior models."""
 
+from viprodyne.core import MS2Kernel
 from viprodyne.model import MS2Dataset, ModelConfig, ViprodyneModel
 from viprodyne.variational.distributions import DeltaNode, DirichletNode, GammaNode
 from viprodyne.variational.nodes import (
@@ -21,6 +22,7 @@ __all__ = [
     "InitialStateProb",
     "LoadingRate",
     "MS2Dataset",
+    "MS2Kernel",
     "ModelConfig",
     "ObservedIntensity",
     "PolymeraseLoadings",

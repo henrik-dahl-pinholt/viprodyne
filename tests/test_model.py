@@ -1,7 +1,8 @@
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from viprodyne import DrivenRateMap, MS2Dataset, ModelConfig, RcNode, ViprodyneModel
+from viprodyne import DrivenRateMap, MS2Dataset, MS2Kernel, ModelConfig, RcNode, ViprodyneModel
 
 
 def make_dataset(name, offset=0.0):
@@ -9,7 +10,6 @@ def make_dataset(name, offset=0.0):
         name=name,
         observed=np.array([0.1 + offset, 0.8 + offset], dtype=np.float32),
         noise_std=np.float32(0.5),
-        design_matrix=np.eye(2, dtype=np.float32),
     )
 
 
@@ -18,7 +18,7 @@ def test_model_builds_dataset_plates_with_shared_parameter_nodes():
         datasets=(make_dataset("d0"), make_dataset("d1", offset=0.2)),
         config=ModelConfig(
             n_states=2,
-            time_grid=np.array([0.0, 1.0], dtype=np.float32),
+            time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
             shared_transition_rates=True,
             shared_loading_rates=True,
         ),
@@ -61,26 +61,82 @@ def test_model_schedule_runs_promoter_and_pol2_nodes():
     assert "d0:tau" in model.default_schedule()
 
 
-def test_model_uses_transfer_pol2_mode_when_window_inputs_are_available():
+def test_model_uses_transfer_pol2_mode_from_kernel_config():
     dataset = MS2Dataset(
         name="d0",
         observed=np.array([0.1, np.nan, 0.9], dtype=np.float32),
         noise_std=np.float32(0.5),
-        window_weights=np.array([1.0], dtype=np.float32),
-        observation_starts=np.arange(3, dtype=np.int32),
     )
     model = ViprodyneModel(
         datasets=(dataset,),
         config=ModelConfig(
             n_states=2,
-            time_grid=np.array([0.0, 1.0], dtype=np.float32),
+            time_grid=np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float32),
             pol2_mode="transfer",
+            t_rise=np.float32(0.5),
+            t_plateau=np.float32(1.0),
+            rna_intensity=np.float32(1.7),
         ),
     )
 
+    polymerase = model.graph.nodes["d0:tau"]
+    assert polymerase.mode == "transfer"
+    assert polymerase.design_matrix is None
+    assert polymerase.window_weights.dtype == np.float32
+    assert polymerase.observation_starts.dtype == np.int32
     moments = model.graph.moments.get("d0:tau")
     assert moments["elbo"].dtype == np.float32
     assert np.isfinite(moments["elbo"])
+
+
+def test_model_accepts_explicit_kernel_function():
+    def rectangular_kernel(offsets):
+        return jnp.where((offsets >= 0.0) & (offsets < 0.75), 2.0, 0.0)
+
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.array([0.2, 0.4], dtype=np.float32),
+        noise_std=np.float32(0.5),
+    )
+    model = ViprodyneModel(
+        datasets=(dataset,),
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+            ms2_kernel=rectangular_kernel,
+        ),
+    )
+
+    polymerase = model.graph.nodes["d0:tau"]
+    np.testing.assert_allclose(
+        polymerase.window_weights,
+        np.array([[2.0, 2.0], [0.0, 2.0]], dtype=np.float32),
+    )
+
+
+def test_model_accepts_kernel_dataclass():
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.array([0.2, 0.4], dtype=np.float32),
+        noise_std=np.float32(0.5),
+    )
+    model = ViprodyneModel(
+        datasets=(dataset,),
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+            ms2_kernel=MS2Kernel(
+                name="ms2posterior",
+                t_rise=np.float32(0.25),
+                t_plateau=np.float32(0.5),
+                rna_intensity=np.float32(3.0),
+            ),
+        ),
+    )
+
+    polymerase = model.graph.nodes["d0:tau"]
+    assert polymerase.mode == "transfer"
+    assert polymerase.window_weights.dtype == np.float32
 
 
 def test_model_derives_pol2_prior_from_promoter_and_loading_rates():
@@ -123,14 +179,12 @@ def test_model_accepts_dataset_specific_time_grids():
         observed=np.array([0.1, 0.8], dtype=np.float32),
         noise_std=np.float32(0.5),
         time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
-        design_matrix=np.eye(2, dtype=np.float32),
     )
     d1 = MS2Dataset(
         name="d1",
         observed=np.array([0.2, 0.5, 0.9], dtype=np.float32),
         noise_std=np.float32(0.5),
         time_grid=np.array([0.0, 0.25, 0.75, 1.5], dtype=np.float32),
-        design_matrix=np.eye(3, dtype=np.float32),
     )
     model = ViprodyneModel(
         datasets=(d0, d1),

@@ -21,6 +21,34 @@ row by row, e.g. a three-state model uses `[[-, 0, 1], [2, -, 3], [4, 5, -]]`.
 The numerical kernels are JAX-first and keep arrays in `float32`. Do not enable
 JAX x64 for normal development or tests.
 
+The top-level model API derives Pol2 observation internals from an MS2 kernel.
+Users pass observations, noise, timing, and either a named kernel or a custom
+JAX-compatible kernel function:
+
+```python
+import numpy as np
+
+from viprodyne import MS2Dataset, ModelConfig, ViprodyneModel
+
+dataset = MS2Dataset(
+    name="condition_0",
+    observed=np.array([0.1, np.nan, 0.8], dtype=np.float32),
+    noise_std=np.float32(0.5),
+    time_grid=np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
+)
+
+model = ViprodyneModel(
+    datasets=(dataset,),
+    config=ModelConfig(
+        n_states=2,
+        ms2_kernel="ms2posterior",
+        t_rise=np.float32(0.25),
+        t_plateau=np.float32(0.75),
+        rna_intensity=np.float32(1.0),
+    ),
+)
+```
+
 Install locally for development:
 
 ```bash
