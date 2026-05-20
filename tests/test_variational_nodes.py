@@ -51,15 +51,27 @@ def bernoulli_entropy(probabilities):
 def test_observed_intensity_emits_float32_data_and_mask():
     node = ObservedIntensity(
         name="I",
-        observed=np.array([0.2, np.nan, 1.0], dtype=np.float32),
+        observed=np.array([[0.2, np.nan, 1.0]], dtype=np.float32),
         noise_std=np.float32(0.5),
     )
 
     moments = node.moments()
     assert moments["observed"].dtype == np.float32
     assert moments["noise_std"].dtype == np.float32
-    np.testing.assert_array_equal(moments["finite_mask"], [True, False, True])
-    np.testing.assert_allclose(node.sample(size=2)[:, [0, 2]], [[0.2, 1.0], [0.2, 1.0]])
+    np.testing.assert_array_equal(moments["finite_mask"], [[True, False, True]])
+    np.testing.assert_allclose(
+        node.sample(size=2)[:, 0, [0, 2]],
+        [[0.2, 1.0], [0.2, 1.0]],
+    )
+
+
+def test_observed_intensity_requires_trace_time_matrix():
+    with pytest.raises(ValueError, match="observed must have shape"):
+        ObservedIntensity(
+            name="I",
+            observed=np.array([0.2, 1.0], dtype=np.float32),
+            noise_std=np.float32(0.5),
+        )
 
 
 def test_parameter_nodes_update_from_graph_child_statistics():
@@ -440,7 +452,7 @@ def test_promoter_state_uses_sampler_expected_count_child_message():
 def test_polymerase_loadings_sampler_mode_smoke_runs_and_emits_counts():
     node = PolymeraseLoadings(
         name="tau_sampler",
-        observed=np.array([0.2, np.nan, 0.8], dtype=np.float32),
+        observed=np.array([[0.2, np.nan, 0.8]], dtype=np.float32),
         noise_std=np.float32(0.5),
         mode="sampler",
         sampling_times=np.array([0.0, 0.5, 1.0], dtype=np.float32),
@@ -466,6 +478,18 @@ def test_polymerase_loadings_sampler_mode_smoke_runs_and_emits_counts():
     assert moments["posterior_rate"].shape == (1, 3)
     assert np.all(np.isfinite(moments["posterior_rate"]))
     assert np.isfinite(moments["log_partition"])
+
+
+def test_polymerase_loadings_requires_trace_time_matrix():
+    with pytest.raises(ValueError, match="observed must have shape"):
+        PolymeraseLoadings(
+            name="tau_exact",
+            observed=np.array([0.2, 0.8], dtype=np.float32),
+            prior_probabilities=np.array([0.4, 0.6], dtype=np.float32),
+            design_matrix=np.eye(2, dtype=np.float32),
+            noise_std=np.float32(0.5),
+            mode="exact",
+        )
 
 
 def test_promoter_state_applies_contact_drive_and_emits_survival_stats():
@@ -554,7 +578,7 @@ def test_polymerase_loadings_exact_and_mean_field_match_independent_theory():
 
     exact = PolymeraseLoadings(
         name="tau_exact",
-        observed=observed,
+        observed=observed[None, :],
         prior_probabilities=prior,
         design_matrix=design,
         noise_std=noise,
@@ -562,7 +586,7 @@ def test_polymerase_loadings_exact_and_mean_field_match_independent_theory():
     )
     mean_field = PolymeraseLoadings(
         name="tau_mf",
-        observed=observed,
+        observed=observed[None, :],
         prior_probabilities=prior,
         design_matrix=design,
         noise_std=noise,
@@ -570,7 +594,7 @@ def test_polymerase_loadings_exact_and_mean_field_match_independent_theory():
     )
     transfer = PolymeraseLoadings(
         name="tau_transfer",
-        observed=observed,
+        observed=observed[None, :],
         prior_probabilities=prior,
         noise_std=noise,
         mode="transfer",
@@ -578,10 +602,14 @@ def test_polymerase_loadings_exact_and_mean_field_match_independent_theory():
         observation_starts=np.arange(3, dtype=np.int32),
     )
 
-    np.testing.assert_allclose(exact.moments()["load_probabilities"], expected_posterior, rtol=1e-6)
+    np.testing.assert_allclose(
+        exact.moments()["load_probabilities"],
+        expected_posterior[None, :],
+        rtol=1e-6,
+    )
     np.testing.assert_allclose(
         mean_field.moments()["load_probabilities"],
-        expected_posterior,
+        expected_posterior[None, :],
         rtol=5e-5,
         atol=2e-5,
     )
@@ -594,7 +622,7 @@ def test_polymerase_loadings_exact_and_mean_field_match_independent_theory():
     assert transfer.moments()["entropy"].dtype == np.float32
     np.testing.assert_allclose(
         transfer.moments()["load_probabilities"],
-        expected_posterior,
+        expected_posterior[None, :],
         rtol=2e-4,
         atol=2e-5,
     )
@@ -612,7 +640,7 @@ def test_exact_polymerase_entropy_matches_log_partition_identity():
     noise = np.float32(0.5)
     node = PolymeraseLoadings(
         name="tau_exact_interacting",
-        observed=observed,
+        observed=observed[None, :],
         prior_probabilities=prior,
         design_matrix=design,
         noise_std=noise,

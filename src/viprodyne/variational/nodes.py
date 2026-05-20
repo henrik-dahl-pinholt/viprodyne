@@ -219,6 +219,8 @@ class ObservedIntensity(VariationalNode):
     def __post_init__(self) -> None:
         VariationalNode.__init__(self, self.name)
         self.observed = np.asarray(self.observed, dtype=FLOAT_DTYPE)
+        if self.observed.ndim != 2:
+            raise ValueError("observed must have shape (n_traces, n_timepoints).")
         self.noise_std = np.asarray(self.noise_std, dtype=FLOAT_DTYPE)
         finite_mask = np.isfinite(self.observed)
         if self.mask is not None:
@@ -488,8 +490,8 @@ class PolymeraseLoadings(VariationalNode):
     def __post_init__(self) -> None:
         VariationalNode.__init__(self, self.name)
         self.observed = np.asarray(self.observed, dtype=FLOAT_DTYPE)
-        if self.observed.ndim not in {1, 2}:
-            raise ValueError("observed must be one- or two-dimensional.")
+        if self.observed.ndim != 2:
+            raise ValueError("observed must have shape (n_traces, n_timepoints).")
         if self.design_matrix is not None:
             self.design_matrix = np.asarray(self.design_matrix, dtype=FLOAT_DTYPE)
         if self.prior_probabilities is None:
@@ -527,7 +529,7 @@ class PolymeraseLoadings(VariationalNode):
         parent_moments = context.parent_moments()
         prior_stats = _load_prior_stats_from_parents(
             parent_moments,
-            self.prior_probabilities.size,
+            int(np.asarray(self.prior_probabilities).shape[-1]),
         )
         if prior_stats is not None:
             self.prior_probabilities = prior_stats.probabilities
@@ -625,29 +627,19 @@ class PolymeraseLoadings(VariationalNode):
             raise ValueError("design_matrix is required for exact Pol2 loading updates.")
         n_loadings = int(np.asarray(self.prior_probabilities).shape[-1])
         configurations = enumerate_binary_configurations(n_loadings)
-        if self.observed.ndim == 1:
-            log_z, marginals, _, predicted, posterior_probabilities = exact_bernoulli_posterior(
-                jnp.asarray(self.observed),
-                jnp.asarray(self.prior_probabilities),
-                jnp.asarray(self.design_matrix),
-                jnp.asarray(self.noise_std),
-                jnp.asarray(self.finite_mask),
-                configurations,
-            )
-        else:
-            prior = _batch_loading_prior(self.prior_probabilities, self.observed.shape[0])
-            noise = _batch_noise(self.noise_std, self.observed.shape)
-            log_z, marginals, _, predicted, posterior_probabilities = jax.vmap(
-                exact_bernoulli_posterior,
-                in_axes=(0, 0, None, 0, 0, None),
-            )(
-                jnp.asarray(self.observed),
-                jnp.asarray(prior),
-                jnp.asarray(self.design_matrix),
-                jnp.asarray(noise),
-                jnp.asarray(self.finite_mask),
-                configurations,
-            )
+        prior = _batch_loading_prior(self.prior_probabilities, self.observed.shape[0])
+        noise = _batch_noise(self.noise_std, self.observed.shape)
+        log_z, marginals, _, predicted, posterior_probabilities = jax.vmap(
+            exact_bernoulli_posterior,
+            in_axes=(0, 0, None, 0, 0, None),
+        )(
+            jnp.asarray(self.observed),
+            jnp.asarray(prior),
+            jnp.asarray(self.design_matrix),
+            jnp.asarray(noise),
+            jnp.asarray(self.finite_mask),
+            configurations,
+        )
         self.objective_value = np.asarray(np.sum(np.asarray(log_z)), dtype=FLOAT_DTYPE)
         self.load_probabilities = np.asarray(marginals, dtype=FLOAT_DTYPE)
         self.predicted_signal = np.asarray(predicted, dtype=FLOAT_DTYPE)
@@ -661,29 +653,19 @@ class PolymeraseLoadings(VariationalNode):
     def _update_transfer(self) -> None:
         if self.window_weights is None or self.observation_starts is None:
             raise ValueError("window_weights and observation_starts are required for transfer mode.")
-        if self.observed.ndim == 1:
-            log_z, marginals, predicted, entropy, _, _ = bernoulli_transfer_posterior(
-                jnp.asarray(self.observed),
-                jnp.asarray(self.prior_probabilities),
-                jnp.asarray(self.window_weights),
-                jnp.asarray(self.observation_starts),
-                jnp.asarray(self.noise_std),
-                jnp.asarray(self.finite_mask),
-            )
-        else:
-            prior = _batch_loading_prior(self.prior_probabilities, self.observed.shape[0])
-            noise = _batch_noise(self.noise_std, self.observed.shape)
-            log_z, marginals, predicted, entropy, _, _ = jax.vmap(
-                bernoulli_transfer_posterior,
-                in_axes=(0, 0, None, None, 0, 0),
-            )(
-                jnp.asarray(self.observed),
-                jnp.asarray(prior),
-                jnp.asarray(self.window_weights),
-                jnp.asarray(self.observation_starts),
-                jnp.asarray(noise),
-                jnp.asarray(self.finite_mask),
-            )
+        prior = _batch_loading_prior(self.prior_probabilities, self.observed.shape[0])
+        noise = _batch_noise(self.noise_std, self.observed.shape)
+        log_z, marginals, predicted, entropy, _, _ = jax.vmap(
+            bernoulli_transfer_posterior,
+            in_axes=(0, 0, None, None, 0, 0),
+        )(
+            jnp.asarray(self.observed),
+            jnp.asarray(prior),
+            jnp.asarray(self.window_weights),
+            jnp.asarray(self.observation_starts),
+            jnp.asarray(noise),
+            jnp.asarray(self.finite_mask),
+        )
         self.objective_value = np.asarray(np.sum(np.asarray(log_z)), dtype=FLOAT_DTYPE)
         self.load_probabilities = np.asarray(marginals, dtype=FLOAT_DTYPE)
         self.predicted_signal = np.asarray(predicted, dtype=FLOAT_DTYPE)
@@ -694,41 +676,29 @@ class PolymeraseLoadings(VariationalNode):
     def _update_mean_field(self) -> None:
         if self.design_matrix is None:
             raise ValueError("design_matrix is required for mean-field Pol2 loading updates.")
-        if self.observed.ndim == 1:
-            result = fit_mean_field_bernoulli(
-                observed=self.observed,
-                prior_probabilities=self.prior_probabilities,
+        prior = _batch_loading_prior(self.prior_probabilities, self.observed.shape[0])
+        noise = _batch_noise(self.noise_std, self.observed.shape)
+        results = [
+            fit_mean_field_bernoulli(
+                observed=observed,
+                prior_probabilities=prior_trace,
                 design_matrix=self.design_matrix,
-                noise_std=float(np.ravel(self.noise_std)[0]),
-                mask=self.finite_mask,
+                noise_std=float(np.ravel(noise_trace)[0]),
+                mask=mask,
             )
-            load_probabilities = result.load_probabilities
-            predicted_signal = result.predicted_signal
-            objective_value = result.elbo
-        else:
-            prior = _batch_loading_prior(self.prior_probabilities, self.observed.shape[0])
-            noise = _batch_noise(self.noise_std, self.observed.shape)
-            results = [
-                fit_mean_field_bernoulli(
-                    observed=observed,
-                    prior_probabilities=prior_trace,
-                    design_matrix=self.design_matrix,
-                    noise_std=float(np.ravel(noise_trace)[0]),
-                    mask=mask,
-                )
-                for observed, prior_trace, noise_trace, mask in zip(
-                    self.observed,
-                    prior,
-                    noise,
-                    self.finite_mask,
-                )
-            ]
-            load_probabilities = np.stack(
-                [result.load_probabilities for result in results],
-                axis=0,
+            for observed, prior_trace, noise_trace, mask in zip(
+                self.observed,
+                prior,
+                noise,
+                self.finite_mask,
             )
-            predicted_signal = np.stack([result.predicted_signal for result in results], axis=0)
-            objective_value = np.sum([result.elbo for result in results], dtype=FLOAT_DTYPE)
+        ]
+        load_probabilities = np.stack(
+            [result.load_probabilities for result in results],
+            axis=0,
+        )
+        predicted_signal = np.stack([result.predicted_signal for result in results], axis=0)
+        objective_value = np.sum([result.elbo for result in results], dtype=FLOAT_DTYPE)
         self.load_probabilities = np.asarray(load_probabilities, dtype=FLOAT_DTYPE)
         self.predicted_signal = np.asarray(predicted_signal, dtype=FLOAT_DTYPE)
         self.objective_value = np.asarray(objective_value, dtype=FLOAT_DTYPE)
@@ -743,7 +713,10 @@ class PolymeraseLoadings(VariationalNode):
         if self.sampling_times is None or self.fine_grid is None:
             raise ValueError("sampling_times and fine_grid are required for sampler mode.")
         if self.sampler_rates_on_grid is None:
-            self.posterior_rate = np.zeros(self._infer_n_loadings(), dtype=FLOAT_DTYPE)
+            self.posterior_rate = np.zeros(
+                (self.observed.shape[0], self._infer_n_loadings()),
+                dtype=FLOAT_DTYPE,
+            )
             self.expected_loading_counts = None
             self.load_probabilities = None
             self.predicted_signal = np.zeros_like(self.observed, dtype=FLOAT_DTYPE)
