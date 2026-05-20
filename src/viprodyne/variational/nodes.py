@@ -55,6 +55,12 @@ class LoadingRate(GammaNode):
 
     state_index: int | None = None
 
+    def moments(self) -> MomentDict:
+        moments = super().moments()
+        if self.state_index is not None:
+            moments["state_index"] = np.asarray(self.state_index, dtype=np.int32)
+        return moments
+
     def update(self, context: UpdateContext) -> None:
         counts = _sum_child_stat(context, "loading_counts")
         exposure = _sum_child_stat(context, "loading_exposure")
@@ -260,9 +266,13 @@ class PromoterState(VariationalNode):
         posterior = np.asarray(self.solution.posterior, dtype=FLOAT_DTYPE)
         occupancy = np.asarray(self.solution.expected_occupancy(), dtype=FLOAT_DTYPE)
         jumps = np.asarray(self.solution.expected_jumps(), dtype=FLOAT_DTYPE)
+        interval_durations = np.diff(self.time_grid).astype(FLOAT_DTYPE)
+        interval_state_probabilities = occupancy / interval_durations[None, :, None]
         moments: MomentDict = {
             "posterior": posterior,
             "expected_occupancy": occupancy,
+            "interval_durations": interval_durations,
+            "interval_state_probabilities": interval_state_probabilities.astype(FLOAT_DTYPE),
             "expected_jumps": jumps,
             "transition_counts": np.sum(jumps, axis=1, dtype=FLOAT_DTYPE),
             "transition_exposure": np.sum(occupancy, axis=1, dtype=FLOAT_DTYPE),
@@ -401,7 +411,7 @@ class PolymeraseLoadings(VariationalNode):
 
     name: str
     observed: np.ndarray
-    prior_probabilities: np.ndarray
+    prior_probabilities: np.ndarray | None = None
     design_matrix: np.ndarray | None = None
     noise_std: np.ndarray | float = 1.0
     finite_mask: np.ndarray | None = None
@@ -418,9 +428,16 @@ class PolymeraseLoadings(VariationalNode):
     def __post_init__(self) -> None:
         VariationalNode.__init__(self, self.name)
         self.observed = np.asarray(self.observed, dtype=FLOAT_DTYPE)
-        self.prior_probabilities = np.asarray(self.prior_probabilities, dtype=FLOAT_DTYPE)
         if self.design_matrix is not None:
             self.design_matrix = np.asarray(self.design_matrix, dtype=FLOAT_DTYPE)
+        if self.prior_probabilities is None:
+            self.prior_probabilities = np.full(
+                self._infer_n_loadings(),
+                0.5,
+                dtype=FLOAT_DTYPE,
+            )
+        else:
+            self.prior_probabilities = np.asarray(self.prior_probabilities, dtype=FLOAT_DTYPE)
         self.noise_std = np.asarray(self.noise_std, dtype=FLOAT_DTYPE)
         if self.finite_mask is None:
             self.finite_mask = np.isfinite(self.observed)
@@ -434,6 +451,12 @@ class PolymeraseLoadings(VariationalNode):
 
     def update(self, context: UpdateContext) -> None:
         parent_moments = context.parent_moments()
+        derived_prior = _load_prior_probabilities_from_parents(
+            parent_moments,
+            self.prior_probabilities.size,
+        )
+        if derived_prior is not None:
+            self.prior_probabilities = derived_prior
         for moments in parent_moments.values():
             if "load_prior_probabilities" in moments:
                 self.prior_probabilities = np.asarray(
@@ -555,6 +578,18 @@ class PolymeraseLoadings(VariationalNode):
             dtype=FLOAT_DTYPE,
         )
 
+    def _infer_n_loadings(self) -> int:
+        if self.design_matrix is not None:
+            return int(self.design_matrix.shape[1])
+        if self.window_weights is not None and self.observation_starts is not None:
+            window_weights = np.asarray(self.window_weights, dtype=FLOAT_DTYPE)
+            observation_starts = np.asarray(self.observation_starts, dtype=np.int32)
+            return int(np.max(observation_starts) + window_weights.size)
+        raise ValueError(
+            "prior_probabilities can only be omitted when design_matrix or transfer "
+            "window_weights/observation_starts define the loading grid."
+        )
+
 
 @dataclass
 class RcNode(VariationalNode):
@@ -632,6 +667,75 @@ def _interval_drive_probability(moments: MomentDict, n_intervals: int) -> np.nda
     elif values.shape[-1] != n_intervals:
         raise ValueError("drive probability last axis must match intervals or grid points.")
     return np.clip(values, 0.0, 1.0).astype(FLOAT_DTYPE)
+
+
+def _load_prior_probabilities_from_parents(
+    parent_moments: dict[str, MomentDict],
+    n_loadings: int,
+) -> np.ndarray | None:
+    promoter = next(
+        (moments for moments in parent_moments.values() if "interval_state_probabilities" in moments),
+        None,
+    )
+    if promoter is None:
+        return None
+    loading_rates = _state_loading_rates_from_parent_moments(parent_moments)
+    if loading_rates is None:
+        return None
+    state_probabilities = np.asarray(
+        promoter["interval_state_probabilities"],
+        dtype=FLOAT_DTYPE,
+    )
+    interval_durations = np.asarray(promoter["interval_durations"], dtype=FLOAT_DTYPE)
+    if state_probabilities.ndim == 3:
+        if state_probabilities.shape[0] != 1:
+            raise NotImplementedError("batched Pol2 loading priors are not implemented yet.")
+        state_probabilities = state_probabilities[0]
+    if state_probabilities.shape[-1] != loading_rates.size:
+        raise ValueError("number of loading-rate parents must match promoter states.")
+    if state_probabilities.shape[0] < n_loadings:
+        raise ValueError("promoter interval grid is shorter than the Pol2 loading grid.")
+    state_probabilities = state_probabilities[:n_loadings]
+    interval_durations = interval_durations[:n_loadings]
+    per_state_load_probability = 1.0 - np.exp(
+        -interval_durations[:, None] * loading_rates[None, :]
+    )
+    probabilities = np.sum(
+        state_probabilities * per_state_load_probability,
+        axis=-1,
+        dtype=FLOAT_DTYPE,
+    )
+    return np.clip(probabilities, 1e-7, 1.0 - 1e-7).astype(FLOAT_DTYPE)
+
+
+def _state_loading_rates_from_parent_moments(
+    parent_moments: dict[str, MomentDict],
+) -> np.ndarray | None:
+    rates: list[tuple[int, np.ndarray]] = []
+    fallback: list[np.ndarray] = []
+    for name, moments in parent_moments.items():
+        if "mean" not in moments:
+            continue
+        if "state_index" in moments:
+            rates.append(
+                (
+                    int(np.asarray(moments["state_index"])),
+                    np.asarray(moments["mean"], dtype=FLOAT_DTYPE),
+                )
+            )
+        elif name.rsplit(":", 1)[-1].startswith("r"):
+            fallback.append(np.asarray(moments["mean"], dtype=FLOAT_DTYPE))
+    if rates:
+        rates.sort(key=lambda item: item[0])
+        values = [value for _, value in rates]
+    elif fallback:
+        values = fallback
+    else:
+        return None
+    rate_array = np.asarray(values, dtype=FLOAT_DTYPE)
+    if rate_array.ndim != 1:
+        raise NotImplementedError("plated loading-rate priors are not implemented yet.")
+    return rate_array
 
 
 def _broadcast_parameter_over_intervals(

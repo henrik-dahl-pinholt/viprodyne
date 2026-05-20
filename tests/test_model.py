@@ -10,7 +10,6 @@ def make_dataset(name, offset=0.0):
         observed=np.array([0.1 + offset, 0.8 + offset], dtype=np.float32),
         noise_std=np.float32(0.5),
         design_matrix=np.eye(2, dtype=np.float32),
-        prior_load_probabilities=np.array([0.25, 0.6], dtype=np.float32),
     )
 
 
@@ -67,7 +66,6 @@ def test_model_uses_transfer_pol2_mode_when_window_inputs_are_available():
         name="d0",
         observed=np.array([0.1, np.nan, 0.9], dtype=np.float32),
         noise_std=np.float32(0.5),
-        prior_load_probabilities=np.array([0.25, 0.6, 0.4], dtype=np.float32),
         window_weights=np.array([1.0], dtype=np.float32),
         observation_starts=np.arange(3, dtype=np.int32),
     )
@@ -83,6 +81,68 @@ def test_model_uses_transfer_pol2_mode_when_window_inputs_are_available():
     moments = model.graph.moments.get("d0:tau")
     assert moments["elbo"].dtype == np.float32
     assert np.isfinite(moments["elbo"])
+
+
+def test_model_derives_pol2_prior_from_promoter_and_loading_rates():
+    model = ViprodyneModel(
+        datasets=(make_dataset("d0"),),
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+        ),
+    )
+    model.graph.nodes["d0:r0"].pin(np.float32(0.5))
+    model.graph.nodes["d0:r1"].pin(np.float32(1.0))
+    model.graph.moments.publish("d0:r0", model.graph.nodes["d0:r0"].moments())
+    model.graph.moments.publish("d0:r1", model.graph.nodes["d0:r1"].moments())
+
+    model.run_schedule(["d0:s", "d0:tau"])
+
+    promoter_moments = model.graph.moments.get("d0:s")
+    state_probabilities = promoter_moments["interval_state_probabilities"][0]
+    dt = promoter_moments["interval_durations"]
+    loading_rates = np.array(
+        [
+            model.graph.moments.get("d0:r0")["mean"],
+            model.graph.moments.get("d0:r1")["mean"],
+        ],
+        dtype=np.float32,
+    )
+    expected_prior = np.sum(
+        state_probabilities * (1.0 - np.exp(-dt[:, None] * loading_rates[None, :])),
+        axis=-1,
+    )
+    polymerase = model.graph.nodes["d0:tau"]
+
+    np.testing.assert_allclose(polymerase.prior_probabilities, expected_prior, rtol=2e-6)
+
+
+def test_model_accepts_dataset_specific_time_grids():
+    d0 = MS2Dataset(
+        name="d0",
+        observed=np.array([0.1, 0.8], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+        design_matrix=np.eye(2, dtype=np.float32),
+    )
+    d1 = MS2Dataset(
+        name="d1",
+        observed=np.array([0.2, 0.5, 0.9], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        time_grid=np.array([0.0, 0.25, 0.75, 1.5], dtype=np.float32),
+        design_matrix=np.eye(3, dtype=np.float32),
+    )
+    model = ViprodyneModel(
+        datasets=(d0, d1),
+        config=ModelConfig(n_states=2),
+    )
+
+    model.run_schedule(["d0:s", "d1:s"])
+
+    assert model.graph.nodes["d0:s"].time_grid.shape == (3,)
+    assert model.graph.nodes["d1:s"].time_grid.shape == (4,)
+    assert model.graph.moments.get("d0:s")["posterior"].shape == (1, 3, 2)
+    assert model.graph.moments.get("d1:s")["posterior"].shape == (1, 4, 2)
 
 
 def test_model_builds_driven_transition_with_dataset_contact_drive():

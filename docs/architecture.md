@@ -45,6 +45,19 @@ diagonal potential carries local Feynman-Kac corrections.
   from `log_Z` derivative identities. It avoids a materialized joint posterior,
   but it is more expensive than the log-likelihood-only transfer pass.
 
+`viprodyne.core.pol2_sampler` contains the continuous-time reversible-jump Pol2
+loading sampler and thermodynamic-integration log-partition estimator. This is
+the sampler-style backend for continuous loading events rather than binary
+loading variables on a fixed observation grid.
+
+The dense `design_matrix` representation is the linear map from loading
+variables to expected MS2 intensity, `I_mean = design_matrix @ tau`. It is useful
+for tiny exact enumeration tests and generic mean-field checks, but it scales as
+`O(n_observations * n_loadings)`. For regular MS2 kernels, prefer the transfer
+representation (`window_weights` plus `observation_starts`) or the sampler,
+which keep memory tied to kernel support and grid size instead of a full dense
+convolution matrix.
+
 `viprodyne.core.contact_survival` implements the corrected contact-survival
 profile for driven rates. The discrete survival factor is
 
@@ -88,6 +101,17 @@ Domain nodes:
 
 Pinned parameter nodes emit deterministic moments and have zero entropy.
 
+`PolymeraseLoadings` does not take a dataset-level Pol2 prior in model-built
+graphs. Its Bernoulli loading prior is derived during updates from promoter
+interval state probabilities and loading-rate moments:
+
+```text
+P(tau_i = 1) = sum_s q_i(s) * (1 - exp(-E[r_s] * dt_i))
+```
+
+The initial value inside the node is only a placeholder until graph messages
+from `PromoterState` and `LoadingRate` are available.
+
 ## Promoter-State Construction
 
 For each transition edge, `PromoterState` builds `Q_tilde` and the diagonal
@@ -129,7 +153,6 @@ dataset = MS2Dataset(
     name="condition_0",
     observed=np.array([0.1, np.nan, 0.8], dtype=np.float32),
     noise_std=np.float32(0.5),
-    prior_load_probabilities=np.array([0.2, 0.4, 0.6], dtype=np.float32),
     design_matrix=np.eye(3, dtype=np.float32),
 )
 
@@ -146,6 +169,10 @@ model = ViprodyneModel(
 model.run_schedule(model.default_schedule())
 posterior_state = model.graph.moments.get("condition_0:s")["posterior"]
 ```
+
+Datasets can either inherit `ModelConfig.time_grid` or provide their own
+`MS2Dataset.time_grid`. Per-dataset grids are the right representation when
+conditions have different frame timing or different trace lengths.
 
 Driven transitions are selected by transition index. For a two-state model,
 index `1` is `0 -> 1`.
@@ -184,6 +211,8 @@ Tests cover:
 - missing-data masking and finite gradients;
 - exact Pol2 enumeration, transfer likelihood, transfer marginals, and entropy
   against exhaustive enumeration;
+- continuous Pol2 sampler setup, missing-data sampler smoke tests, and
+  thermodynamic-integration log-partition smoke tests;
 - non-interacting Pol2 theory when the kernel is shorter than the sampling
   interval;
 - large Pol2 batches with 200 tracks and 1000 timepoints;

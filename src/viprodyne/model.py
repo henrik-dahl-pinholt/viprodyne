@@ -29,8 +29,8 @@ class MS2Dataset:
     name: str
     observed: np.ndarray
     noise_std: np.ndarray | float
+    time_grid: np.ndarray | None = None
     design_matrix: np.ndarray | None = None
-    prior_load_probabilities: np.ndarray | None = None
     finite_mask: np.ndarray | None = None
     window_weights: np.ndarray | None = None
     observation_starts: np.ndarray | None = None
@@ -39,11 +39,8 @@ class MS2Dataset:
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("dataset name must be non-empty.")
-        if self.prior_load_probabilities is not None and self.design_matrix is None:
-            if self.window_weights is None or self.observation_starts is None:
-                raise ValueError(
-                    "Pol2 datasets need design_matrix or transfer window_weights/observation_starts."
-                )
+        if self.time_grid is not None:
+            _validate_time_grid(self.time_grid, "dataset.time_grid")
 
 
 @dataclass(frozen=True)
@@ -51,7 +48,7 @@ class ModelConfig:
     """Graph-construction options for :class:`ViprodyneModel`."""
 
     n_states: int
-    time_grid: np.ndarray
+    time_grid: np.ndarray | None = None
     initial_concentration: np.ndarray | None = None
     transition_prior_shape: np.ndarray | float = np.float32(1.0)
     transition_prior_rate: np.ndarray | float = np.float32(1.0)
@@ -59,7 +56,7 @@ class ModelConfig:
     loading_prior_rate: np.ndarray | float = np.float32(1.0)
     shared_transition_rates: bool = False
     shared_loading_rates: bool = False
-    pol2_mode: str = "mean_field"
+    pol2_mode: str = "auto"
     driven_transition_indices: tuple[int, ...] = ()
     driven_rate_initial: np.ndarray | float = np.float32(1.0)
     driven_rate_bounds: tuple[float, float] = (1e-6, 1.0)
@@ -69,11 +66,8 @@ class ModelConfig:
     def __post_init__(self) -> None:
         if self.n_states < 2:
             raise ValueError("n_states must be at least 2.")
-        time_grid = np.asarray(self.time_grid, dtype=FLOAT_DTYPE)
-        if time_grid.ndim != 1 or time_grid.size < 2:
-            raise ValueError("time_grid must be one-dimensional with at least two entries.")
-        if np.any(np.diff(time_grid) <= 0):
-            raise ValueError("time_grid must be strictly increasing.")
+        if self.time_grid is not None:
+            _validate_time_grid(self.time_grid, "time_grid")
         n_edges = self.n_states * (self.n_states - 1)
         driven_indices = tuple(int(index) for index in self.driven_transition_indices)
         if any(index < 0 or index >= n_edges for index in driven_indices):
@@ -103,6 +97,8 @@ class ViprodyneModel:
             raise ValueError("at least one dataset is required.")
         if len({dataset.name for dataset in self.datasets}) != len(self.datasets):
             raise ValueError("dataset names must be unique.")
+        for dataset in self.datasets:
+            self._time_grid(dataset)
         self._build_graph()
 
     def run_schedule(self, schedule: list[str] | tuple[str, ...] | None = None, rho: float = 1.0) -> None:
@@ -139,6 +135,7 @@ class ViprodyneModel:
         shared_transition_names: list[str] | None,
         shared_loading_names: list[str] | None,
     ) -> dict[str, str | list[str]]:
+        time_grid = self._time_grid(dataset)
         initial_name = f"{dataset.name}:pi"
         initial = InitialStateProb(
             name=initial_name,
@@ -157,7 +154,7 @@ class ViprodyneModel:
         promoter_name = f"{dataset.name}:s"
         promoter = PromoterState(
             name=promoter_name,
-            time_grid=self.config.time_grid,
+            time_grid=time_grid,
             n_states=self.config.n_states,
             rate_edges=rate_edges,
             initial_probability_node=initial_name,
@@ -183,12 +180,11 @@ class ViprodyneModel:
             loading_names = self._add_loading_rates(dataset.name)
 
         polymerase_name = None
-        if dataset.prior_load_probabilities is not None:
+        if self._has_pol2_observation_model(dataset):
             polymerase_name = f"{dataset.name}:tau"
             polymerase = PolymeraseLoadings(
                 name=polymerase_name,
                 observed=dataset.observed,
-                prior_probabilities=dataset.prior_load_probabilities,
                 design_matrix=dataset.design_matrix,
                 noise_std=dataset.noise_std,
                 finite_mask=dataset.finite_mask,
@@ -277,6 +273,10 @@ class ViprodyneModel:
         return concentration
 
     def _pol2_mode(self, dataset: MS2Dataset) -> str:
+        if self.config.pol2_mode == "auto":
+            if dataset.window_weights is not None and dataset.observation_starts is not None:
+                return "transfer"
+            return "mean_field"
         if self.config.pol2_mode != "transfer":
             return self.config.pol2_mode
         if dataset.window_weights is None or dataset.observation_starts is None:
@@ -309,7 +309,8 @@ class ViprodyneModel:
         if dataset.contact_probability is None:
             raise ValueError("driven transition models require dataset.contact_probability.")
         contact = np.asarray(dataset.contact_probability, dtype=FLOAT_DTYPE)
-        n_intervals = np.asarray(self.config.time_grid).size - 1
+        time_grid = self._time_grid(dataset)
+        n_intervals = time_grid.size - 1
         if contact.ndim == 0 or contact.shape[-1] not in (n_intervals, n_intervals + 1):
             raise ValueError("contact_probability last axis must match intervals or grid points.")
         contact_name = f"{dataset.name}:rc"
@@ -322,9 +323,29 @@ class ViprodyneModel:
             RcNode(
                 name=contact_name,
                 value=np.float32(1.0),
-                time_grid=self.config.time_grid,
+                time_grid=time_grid,
                 contact_probability_fn=fixed_contact_probability,
                 pinned=True,
             )
         )
         return contact_name
+
+    def _time_grid(self, dataset: MS2Dataset) -> np.ndarray:
+        if dataset.time_grid is not None:
+            return _validate_time_grid(dataset.time_grid, f"{dataset.name}.time_grid")
+        if self.config.time_grid is not None:
+            return _validate_time_grid(self.config.time_grid, "time_grid")
+        raise ValueError("each dataset needs time_grid, or ModelConfig.time_grid must be set.")
+
+    def _has_pol2_observation_model(self, dataset: MS2Dataset) -> bool:
+        has_transfer = dataset.window_weights is not None and dataset.observation_starts is not None
+        return dataset.design_matrix is not None or has_transfer
+
+
+def _validate_time_grid(time_grid: np.ndarray, name: str) -> np.ndarray:
+    time_grid = np.asarray(time_grid, dtype=FLOAT_DTYPE)
+    if time_grid.ndim != 1 or time_grid.size < 2:
+        raise ValueError(f"{name} must be one-dimensional with at least two entries.")
+    if np.any(np.diff(time_grid) <= 0):
+        raise ValueError(f"{name} must be strictly increasing.")
+    return time_grid
