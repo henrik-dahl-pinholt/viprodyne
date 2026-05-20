@@ -8,11 +8,13 @@ import numpy as np
 
 from viprodyne.core.rate_edges import RateEdge, transition_states
 from viprodyne.variational import (
+    DrivenRateMap,
     InitialStateProb,
     LoadingRate,
     ObservedIntensity,
     PolymeraseLoadings,
     PromoterState,
+    RcNode,
     TransitionRate,
     VariationalGraph,
 )
@@ -32,6 +34,7 @@ class MS2Dataset:
     finite_mask: np.ndarray | None = None
     window_weights: np.ndarray | None = None
     observation_starts: np.ndarray | None = None
+    contact_probability: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -57,6 +60,11 @@ class ModelConfig:
     shared_transition_rates: bool = False
     shared_loading_rates: bool = False
     pol2_mode: str = "mean_field"
+    driven_transition_indices: tuple[int, ...] = ()
+    driven_rate_initial: np.ndarray | float = np.float32(1.0)
+    driven_rate_bounds: tuple[float, float] = (1e-6, 1.0)
+    driven_prior_shape: float = 1.0
+    driven_prior_rate: float = 0.0
 
     def __post_init__(self) -> None:
         if self.n_states < 2:
@@ -66,6 +74,18 @@ class ModelConfig:
             raise ValueError("time_grid must be one-dimensional with at least two entries.")
         if np.any(np.diff(time_grid) <= 0):
             raise ValueError("time_grid must be strictly increasing.")
+        n_edges = self.n_states * (self.n_states - 1)
+        driven_indices = tuple(int(index) for index in self.driven_transition_indices)
+        if any(index < 0 or index >= n_edges for index in driven_indices):
+            raise ValueError("driven_transition_indices must be valid transition indices.")
+        object.__setattr__(self, "driven_transition_indices", driven_indices)
+        lo_rate, hi_rate = self.driven_rate_bounds
+        if not 0 < lo_rate < hi_rate:
+            raise ValueError("driven_rate_bounds must satisfy 0 < lower < upper.")
+        if self.driven_prior_shape <= 0:
+            raise ValueError("driven_prior_shape must be positive.")
+        if self.driven_prior_rate < 0:
+            raise ValueError("driven_prior_rate must be non-negative.")
 
 
 @dataclass
@@ -96,6 +116,8 @@ class ViprodyneModel:
             schedule.extend(nodes["transition_rates"])
             schedule.extend(nodes["loading_rates"])
             schedule.append(nodes["initial"])
+            if nodes["contact_drive"] is not None:
+                schedule.append(nodes["contact_drive"])
             schedule.append(nodes["promoter"])
             if nodes["polymerase"] is not None:
                 schedule.append(nodes["polymerase"])
@@ -127,14 +149,9 @@ class ViprodyneModel:
         transition_names = shared_transition_names
         if transition_names is None:
             transition_names = self._add_transition_rates(dataset.name)
+        contact_drive_name = self._add_contact_drive(dataset)
         rate_edges = tuple(
-            RateEdge(
-                n_states=self.config.n_states,
-                to_state=transition_states(self.config.n_states, index)[0],
-                from_state=transition_states(self.config.n_states, index)[1],
-                rate_node=transition_name,
-                transition_index=index,
-            )
+            self._rate_edge(index, transition_name, contact_drive_name)
             for index, transition_name in enumerate(transition_names)
         )
         promoter_name = f"{dataset.name}:s"
@@ -149,6 +166,8 @@ class ViprodyneModel:
         self.graph.add_edge(initial_name, promoter_name)
         for transition_name in transition_names:
             self.graph.add_edge(transition_name, promoter_name)
+        if contact_drive_name is not None:
+            self.graph.add_edge(contact_drive_name, promoter_name)
 
         observed_name = f"{dataset.name}:I"
         observed = ObservedIntensity(
@@ -188,6 +207,7 @@ class ViprodyneModel:
             "promoter": promoter_name,
             "observed": observed_name,
             "polymerase": polymerase_name,
+            "contact_drive": contact_drive_name,
             "transition_rates": transition_names,
             "loading_rates": loading_names,
         }
@@ -203,16 +223,27 @@ class ViprodyneModel:
             to_state, from_state = transition_states(self.config.n_states, index)
             name = f"{prefix}:R{index}"
             if name not in self.graph.nodes:
-                self.graph.add_node(
-                    TransitionRate(
-                        name=name,
-                        prior_shape=self.config.transition_prior_shape,
-                        prior_rate=self.config.transition_prior_rate,
-                        n_states=self.config.n_states,
-                        to_state=to_state,
-                        from_state=from_state,
+                if self._is_driven_transition(index):
+                    self.graph.add_node(
+                        DrivenRateMap(
+                            name=name,
+                            initial_rate=self.config.driven_rate_initial,
+                            rate_bounds=self.config.driven_rate_bounds,
+                            prior_shape=self.config.driven_prior_shape,
+                            prior_rate=self.config.driven_prior_rate,
+                        )
                     )
-                )
+                else:
+                    self.graph.add_node(
+                        TransitionRate(
+                            name=name,
+                            prior_shape=self.config.transition_prior_shape,
+                            prior_rate=self.config.transition_prior_rate,
+                            n_states=self.config.n_states,
+                            to_state=to_state,
+                            from_state=from_state,
+                        )
+                    )
             names.append(name)
         return names
 
@@ -251,3 +282,49 @@ class ViprodyneModel:
         if dataset.window_weights is None or dataset.observation_starts is None:
             return "mean_field"
         return "transfer"
+
+    def _is_driven_transition(self, transition_index: int) -> bool:
+        return transition_index in self.config.driven_transition_indices
+
+    def _rate_edge(
+        self,
+        transition_index: int,
+        transition_name: str,
+        contact_drive_name: str | None,
+    ) -> RateEdge:
+        to_state, from_state = transition_states(self.config.n_states, transition_index)
+        drive_node = contact_drive_name if self._is_driven_transition(transition_index) else None
+        return RateEdge(
+            n_states=self.config.n_states,
+            to_state=to_state,
+            from_state=from_state,
+            rate_node=transition_name,
+            drive_node=drive_node,
+            transition_index=transition_index,
+        )
+
+    def _add_contact_drive(self, dataset: MS2Dataset) -> str | None:
+        if not self.config.driven_transition_indices:
+            return None
+        if dataset.contact_probability is None:
+            raise ValueError("driven transition models require dataset.contact_probability.")
+        contact = np.asarray(dataset.contact_probability, dtype=FLOAT_DTYPE)
+        n_intervals = np.asarray(self.config.time_grid).size - 1
+        if contact.ndim == 0 or contact.shape[-1] not in (n_intervals, n_intervals + 1):
+            raise ValueError("contact_probability last axis must match intervals or grid points.")
+        contact_name = f"{dataset.name}:rc"
+
+        def fixed_contact_probability(times, rc):
+            del times, rc
+            return contact
+
+        self.graph.add_node(
+            RcNode(
+                name=contact_name,
+                value=np.float32(1.0),
+                time_grid=self.config.time_grid,
+                contact_probability_fn=fixed_contact_probability,
+                pinned=True,
+            )
+        )
+        return contact_name

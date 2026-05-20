@@ -1,6 +1,7 @@
 import numpy as np
+import pytest
 
-from viprodyne import MS2Dataset, ModelConfig, ViprodyneModel
+from viprodyne import DrivenRateMap, MS2Dataset, ModelConfig, RcNode, ViprodyneModel
 
 
 def make_dataset(name, offset=0.0):
@@ -82,3 +83,57 @@ def test_model_uses_transfer_pol2_mode_when_window_inputs_are_available():
     moments = model.graph.moments.get("d0:tau")
     assert moments["elbo"].dtype == np.float32
     assert np.isfinite(moments["elbo"])
+
+
+def test_model_builds_driven_transition_with_dataset_contact_drive():
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.array([0.1, 0.9], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        contact_probability=np.array([0.25, 0.75], dtype=np.float32),
+    )
+    model = ViprodyneModel(
+        datasets=(dataset,),
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+            driven_transition_indices=(1,),
+            driven_rate_initial=np.float32(0.8),
+            driven_rate_bounds=(1e-4, 10.0),
+        ),
+    )
+
+    assert isinstance(model.graph.nodes["d0:R1"], DrivenRateMap)
+    assert isinstance(model.graph.nodes["d0:rc"], RcNode)
+    assert model.dataset_nodes["d0"]["contact_drive"] == "d0:rc"
+    promoter = model.graph.nodes["d0:s"]
+    assert promoter.rate_edges[1].drive_node == "d0:rc"
+
+    model.run_schedule(["d0:s"])
+    moments = model.graph.moments.get("d0:s")
+
+    assert "contact_survival_stats_by_rate" in moments
+    assert "d0:R1" in moments["contact_survival_stats_by_rate"]
+    np.testing.assert_allclose(
+        promoter.tilted_generator[:, 1, 0],
+        np.array([0.2, 0.6], dtype=np.float32),
+        rtol=2e-6,
+    )
+    np.testing.assert_allclose(
+        np.sum(promoter.tilted_generator, axis=-2),
+        np.zeros((2, 2), dtype=np.float32),
+        atol=2e-7,
+    )
+    assert "d0:rc" in model.default_schedule()
+
+
+def test_model_requires_contact_probability_for_driven_transitions():
+    with pytest.raises(ValueError, match="contact_probability"):
+        ViprodyneModel(
+            datasets=(make_dataset("d0"),),
+            config=ModelConfig(
+                n_states=2,
+                time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+                driven_transition_indices=(1,),
+            ),
+        )
