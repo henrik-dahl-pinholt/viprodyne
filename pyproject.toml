@@ -13,6 +13,7 @@ authors = [
   { name = "Henrik Dahl Pinholt" },
 ]
 dependencies = [
+  "jax>=0.4",
   "numpy>=1.24",
   "scipy>=1.10",
 ]

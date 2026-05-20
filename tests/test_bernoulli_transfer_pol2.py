@@ -1,11 +1,14 @@
 import numpy as np
 import pytest
+import jax
+import jax.numpy as jnp
 from scipy.special import logsumexp
 
 from viprodyne.core.bernoulli_transfer_pol2 import (
     build_ms2_design_matrix,
     enumerate_binary_configurations,
     exact_bernoulli_posterior,
+    exact_bernoulli_posterior_jax,
     mean_field_bernoulli_elbo,
 )
 
@@ -80,9 +83,9 @@ def test_two_loading_posterior_matches_manual_enumeration():
     expected_pairwise = np.einsum("c,ci,cj->ij", weights, configs, configs)
 
     assert posterior.log_evidence == pytest.approx(logsumexp(log_joint))
-    np.testing.assert_allclose(posterior.posterior_probabilities, weights)
-    np.testing.assert_allclose(posterior.marginal_probabilities, weights @ configs)
-    np.testing.assert_allclose(posterior.pairwise_probabilities, expected_pairwise)
+    np.testing.assert_allclose(posterior.posterior_probabilities, weights, rtol=1e-6, atol=1e-7)
+    np.testing.assert_allclose(posterior.marginal_probabilities, weights @ configs, rtol=1e-6)
+    np.testing.assert_allclose(posterior.pairwise_probabilities, expected_pairwise, rtol=1e-6)
     assert mean_field_bernoulli_elbo(
         posterior.marginal_probabilities,
         observed,
@@ -90,6 +93,33 @@ def test_two_loading_posterior_matches_manual_enumeration():
         design,
         noise,
     ) <= posterior.log_evidence + 1e-12
+
+
+def test_exact_posterior_jax_kernel_matches_wrapper():
+    prior = np.array([0.25, 0.6])
+    design = np.array([[1.0, 2.0]])
+    observed = np.array([1.3])
+    noise = 0.7
+    configs = jnp.asarray(enumerate_binary_configurations(2))
+    wrapper = exact_bernoulli_posterior(observed, prior, design, noise)
+
+    logz, marginal, pairwise, predicted, weights = exact_bernoulli_posterior_jax(
+        jnp.asarray(observed),
+        jnp.asarray(prior),
+        jnp.asarray(design),
+        jnp.asarray(noise),
+        jnp.asarray(np.isfinite(observed)),
+        configs,
+    )
+
+    assert isinstance(logz, jax.Array)
+    assert logz.dtype == jnp.float32
+    assert float(logz) == pytest.approx(wrapper.log_evidence)
+    assert wrapper.marginal_probabilities.dtype == np.float32
+    np.testing.assert_allclose(np.asarray(marginal), wrapper.marginal_probabilities)
+    np.testing.assert_allclose(np.asarray(pairwise), wrapper.pairwise_probabilities)
+    np.testing.assert_allclose(np.asarray(predicted), wrapper.predicted_signal)
+    np.testing.assert_allclose(np.asarray(weights), wrapper.posterior_probabilities)
 
 
 def test_missing_observations_leave_independent_prior_unchanged():
@@ -103,9 +133,9 @@ def test_missing_observations_leave_independent_prior_unchanged():
 
     expected_pairwise = np.outer(prior, prior)
     np.fill_diagonal(expected_pairwise, prior)
-    assert posterior.log_evidence == pytest.approx(0.0)
-    np.testing.assert_allclose(posterior.marginal_probabilities, prior)
-    np.testing.assert_allclose(posterior.pairwise_probabilities, expected_pairwise)
+    assert posterior.log_evidence == pytest.approx(0.0, abs=2e-7)
+    np.testing.assert_allclose(posterior.marginal_probabilities, prior, rtol=1e-6)
+    np.testing.assert_allclose(posterior.pairwise_probabilities, expected_pairwise, rtol=1e-6)
 
 
 def test_exact_enumeration_guard_is_explicit():

@@ -5,8 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
+import jax
+import jax.numpy as jnp
 import numpy as np
-from scipy.special import logsumexp
 
 
 @dataclass(frozen=True)
@@ -68,33 +69,64 @@ def exact_bernoulli_posterior(
             f"exact enumeration requested for {n_loadings} variables; "
             f"max_loadings is {max_loadings}."
         )
-    configurations = enumerate_binary_configurations(n_loadings)
-    log_prior = _log_bernoulli_prior(configurations, prior_probabilities)
-    log_likelihood = _gaussian_log_likelihood(
-        configurations,
-        observed,
-        design_matrix,
-        float(noise_std),
-        finite_mask,
+    configurations = jnp.asarray(enumerate_binary_configurations(n_loadings))
+    log_evidence, marginals, pairwise, predicted, posterior_probabilities = (
+        exact_bernoulli_posterior_jax(
+            jnp.asarray(observed),
+            jnp.asarray(prior_probabilities),
+            jnp.asarray(design_matrix),
+            jnp.asarray(float(noise_std)),
+            jnp.asarray(finite_mask),
+            configurations,
+        )
     )
+    return ExactBernoulliPosterior(
+        log_evidence=float(log_evidence),
+        marginal_probabilities=np.asarray(marginals, dtype=np.float32),
+        pairwise_probabilities=np.asarray(pairwise, dtype=np.float32),
+        predicted_signal=np.asarray(predicted, dtype=np.float32),
+        configurations=np.asarray(configurations, dtype=np.float32),
+        posterior_probabilities=np.asarray(posterior_probabilities, dtype=np.float32),
+    )
+
+
+@jax.jit
+def exact_bernoulli_posterior_jax(
+    observed: jnp.ndarray,
+    prior_probabilities: jnp.ndarray,
+    design_matrix: jnp.ndarray,
+    noise_std: jnp.ndarray,
+    finite_mask: jnp.ndarray,
+    configurations: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """JAX exact posterior over binary Pol2 loading configurations."""
+    prior = jnp.clip(prior_probabilities, 1e-12, 1.0 - 1e-12)
+    log_prior = configurations @ jnp.log(prior)
+    log_prior = log_prior + (1.0 - configurations) @ jnp.log1p(-prior)
+    means = configurations @ design_matrix.T
+    safe_observed = jnp.where(finite_mask, observed, 0.0)
+    residuals = safe_observed[None, :] - means
+    obs_terms = -0.5 * (
+        jnp.log(2.0 * jnp.pi * noise_std**2) + residuals * residuals / noise_std**2
+    )
+    log_likelihood = jnp.sum(jnp.where(finite_mask[None, :], obs_terms, 0.0), axis=1)
     log_joint = log_prior + log_likelihood
-    log_evidence = float(logsumexp(log_joint))
-    posterior_probabilities = np.exp(log_joint - log_evidence)
+    log_evidence = jax.scipy.special.logsumexp(log_joint)
+    posterior_probabilities = jnp.exp(log_joint - log_evidence)
     marginal_probabilities = posterior_probabilities @ configurations
-    pairwise_probabilities = np.einsum(
+    pairwise_probabilities = jnp.einsum(
         "c,ci,cj->ij",
         posterior_probabilities,
         configurations,
         configurations,
     )
     predicted_signal = design_matrix @ marginal_probabilities
-    return ExactBernoulliPosterior(
-        log_evidence=log_evidence,
-        marginal_probabilities=marginal_probabilities,
-        pairwise_probabilities=pairwise_probabilities,
-        predicted_signal=predicted_signal,
-        configurations=configurations,
-        posterior_probabilities=posterior_probabilities,
+    return (
+        log_evidence,
+        marginal_probabilities,
+        pairwise_probabilities,
+        predicted_signal,
+        posterior_probabilities,
     )
 
 
@@ -129,21 +161,41 @@ def mean_field_bernoulli_elbo(
     if np.any((load_probabilities < 0.0) | (load_probabilities > 1.0)):
         raise ValueError("load_probabilities must lie in [0, 1].")
 
-    q = np.clip(load_probabilities, 1e-12, 1.0 - 1e-12)
-    prior = np.clip(prior_probabilities, 1e-12, 1.0 - 1e-12)
+    return float(
+        mean_field_bernoulli_elbo_jax(
+            jnp.asarray(load_probabilities),
+            jnp.asarray(observed),
+            jnp.asarray(prior_probabilities),
+            jnp.asarray(design_matrix),
+            jnp.asarray(float(noise_std)),
+            jnp.asarray(finite_mask),
+        )
+    )
+
+
+@jax.jit
+def mean_field_bernoulli_elbo_jax(
+    load_probabilities: jnp.ndarray,
+    observed: jnp.ndarray,
+    prior_probabilities: jnp.ndarray,
+    design_matrix: jnp.ndarray,
+    noise_std: jnp.ndarray,
+    finite_mask: jnp.ndarray,
+) -> jnp.ndarray:
+    """JAX independent-Bernoulli variational ELBO for one trajectory."""
+    q = jnp.clip(load_probabilities, 1e-12, 1.0 - 1e-12)
+    prior = jnp.clip(prior_probabilities, 1e-12, 1.0 - 1e-12)
     mean_signal = design_matrix @ q
     variance_signal = (design_matrix * design_matrix) @ (q * (1.0 - q))
     residual = observed - mean_signal
-    obs_term = -0.5 * np.sum(
-        finite_mask
-        * (
-            np.log(2.0 * np.pi * noise_std**2)
-            + (residual * residual + variance_signal) / noise_std**2
-        )
+    obs_terms = -0.5 * (
+        jnp.log(2.0 * jnp.pi * noise_std**2)
+        + (residual * residual + variance_signal) / noise_std**2
     )
-    prior_term = np.sum(q * np.log(prior) + (1.0 - q) * np.log1p(-prior))
-    entropy = -np.sum(q * np.log(q) + (1.0 - q) * np.log1p(-q))
-    return float(obs_term + prior_term + entropy)
+    obs_term = jnp.sum(jnp.where(finite_mask, obs_terms, 0.0))
+    prior_term = jnp.sum(q * jnp.log(prior) + (1.0 - q) * jnp.log1p(-prior))
+    entropy = -jnp.sum(q * jnp.log(q) + (1.0 - q) * jnp.log1p(-q))
+    return obs_term + prior_term + entropy
 
 
 def _prepare_inputs(
@@ -153,9 +205,9 @@ def _prepare_inputs(
     noise_std: float,
     mask: np.ndarray | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    observed = np.asarray(observed, dtype=float)
-    prior_probabilities = np.asarray(prior_probabilities, dtype=float)
-    design_matrix = np.asarray(design_matrix, dtype=float)
+    observed = np.asarray(observed, dtype=np.float32)
+    prior_probabilities = np.asarray(prior_probabilities, dtype=np.float32)
+    design_matrix = np.asarray(design_matrix, dtype=np.float32)
     if observed.ndim != 1:
         raise ValueError("observed must be one-dimensional.")
     if prior_probabilities.ndim != 1:
@@ -174,28 +226,3 @@ def _prepare_inputs(
         finite_mask = finite_mask & mask
     observed = np.where(finite_mask, observed, 0.0)
     return observed, prior_probabilities, design_matrix, finite_mask
-
-
-def _log_bernoulli_prior(
-    configurations: np.ndarray,
-    prior_probabilities: np.ndarray,
-) -> np.ndarray:
-    prior = np.clip(prior_probabilities, 1e-12, 1.0 - 1e-12)
-    return configurations @ np.log(prior) + (1.0 - configurations) @ np.log1p(-prior)
-
-
-def _gaussian_log_likelihood(
-    configurations: np.ndarray,
-    observed: np.ndarray,
-    design_matrix: np.ndarray,
-    noise_std: float,
-    finite_mask: np.ndarray,
-) -> np.ndarray:
-    if not np.any(finite_mask):
-        return np.zeros(configurations.shape[0], dtype=float)
-    means = configurations @ design_matrix[finite_mask].T
-    residuals = observed[finite_mask][None, :] - means
-    return -0.5 * np.sum(
-        np.log(2.0 * np.pi * noise_std**2) + residuals * residuals / noise_std**2,
-        axis=1,
-    )
