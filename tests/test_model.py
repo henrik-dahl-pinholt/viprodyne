@@ -2,7 +2,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from viprodyne import DrivenRateMap, MS2Dataset, MS2Kernel, ModelConfig, RcNode, ViprodyneModel
+from viprodyne import DrivenRateMap, MS2Dataset, ModelConfig, ProximalKernel, RcNode, ViprodyneModel
 
 
 def make_dataset(name, offset=0.0):
@@ -36,6 +36,34 @@ def test_model_builds_dataset_plates_with_shared_parameter_nodes():
     assert model.graph.children_of("d0:tau") == ("d0:I",)
     assert model.dataset_nodes["d0"]["transition_rates"] == ["shared:R0", "shared:R1"]
     assert model.dataset_nodes["d1"]["loading_rates"] == ["shared:r0", "shared:r1"]
+
+
+def test_model_can_share_selected_rates_only():
+    model = ViprodyneModel(
+        datasets=(make_dataset("d0"), make_dataset("d1", offset=0.2)),
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+            shared_transition_rate_indices=(1,),
+            shared_loading_rate_states=(0,),
+        ),
+    )
+
+    assert "shared:R1" in model.graph.nodes
+    assert "d0:R0" in model.graph.nodes
+    assert "d1:R0" in model.graph.nodes
+    assert "shared:R0" not in model.graph.nodes
+    assert "d0:R1" not in model.graph.nodes
+    assert "d1:R1" not in model.graph.nodes
+    assert "shared:r0" in model.graph.nodes
+    assert "d0:r1" in model.graph.nodes
+    assert "d1:r1" in model.graph.nodes
+    assert "shared:r1" not in model.graph.nodes
+
+    assert set(model.graph.parents_of("d0:s")) == {"d0:pi", "d0:R0", "shared:R1"}
+    assert set(model.graph.parents_of("d1:s")) == {"d1:pi", "d1:R0", "shared:R1"}
+    assert set(model.graph.parents_of("d0:tau")) == {"d0:s", "shared:r0", "d0:r1"}
+    assert set(model.graph.parents_of("d1:tau")) == {"d1:s", "shared:r0", "d1:r1"}
 
 
 def test_model_schedule_runs_promoter_and_pol2_nodes():
@@ -125,8 +153,7 @@ def test_model_accepts_kernel_dataclass():
         config=ModelConfig(
             n_states=2,
             time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
-            ms2_kernel=MS2Kernel(
-                name="ms2posterior",
+            ms2_kernel=ProximalKernel(
                 t_rise=np.float32(0.25),
                 t_plateau=np.float32(0.5),
                 rna_intensity=np.float32(3.0),

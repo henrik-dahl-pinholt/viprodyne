@@ -13,23 +13,14 @@ KernelFunction = Callable[[jnp.ndarray], jnp.ndarray]
 
 
 @dataclass(frozen=True)
-class MS2Kernel:
-    """User-facing MS2 kernel specification.
+class ProximalKernel:
+    """Ramp-then-plateau MS2 kernel for a proximal MS2 cassette."""
 
-    ``name`` selects a parameterized kernel from the internal registry. A custom
-    JAX-compatible ``function`` can be supplied instead; it should accept time
-    offsets and return MS2 weights.
-    """
-
-    name: str = "ms2posterior"
     t_rise: np.ndarray | float = np.float32(1.0)
     t_plateau: np.ndarray | float = np.float32(0.0)
     rna_intensity: np.ndarray | float = np.float32(1.0)
-    function: KernelFunction | None = None
 
     def __post_init__(self) -> None:
-        name = str(self.name).lower()
-        object.__setattr__(self, "name", name)
         object.__setattr__(self, "t_rise", np.asarray(self.t_rise, dtype=FLOAT_DTYPE))
         object.__setattr__(self, "t_plateau", np.asarray(self.t_plateau, dtype=FLOAT_DTYPE))
         object.__setattr__(
@@ -37,18 +28,20 @@ class MS2Kernel:
             "rna_intensity",
             np.asarray(self.rna_intensity, dtype=FLOAT_DTYPE),
         )
-        if self.function is None and name not in {"ms2posterior", "proximal"}:
-            raise ValueError("unknown MS2 kernel name.")
-        if self.function is None:
-            if np.any(np.asarray(self.t_rise) <= 0.0):
-                raise ValueError("t_rise must be positive.")
-            if np.any(np.asarray(self.t_plateau) < 0.0):
-                raise ValueError("t_plateau must be non-negative.")
-            if np.any(np.asarray(self.rna_intensity) < 0.0):
-                raise ValueError("rna_intensity must be non-negative.")
+        if np.any(np.asarray(self.t_rise) <= 0.0):
+            raise ValueError("t_rise must be positive.")
+        if np.any(np.asarray(self.t_plateau) < 0.0):
+            raise ValueError("t_plateau must be non-negative.")
+        if np.any(np.asarray(self.rna_intensity) < 0.0):
+            raise ValueError("rna_intensity must be non-negative.")
 
     def __call__(self, time_offsets: jnp.ndarray) -> jnp.ndarray:
-        return evaluate_ms2_kernel(time_offsets, self)
+        return proximal_kernel(
+            time_offsets,
+            jnp.asarray(self.t_rise, dtype=jnp.float32),
+            jnp.asarray(self.t_plateau, dtype=jnp.float32),
+            jnp.asarray(self.rna_intensity, dtype=jnp.float32),
+        )
 
 
 @dataclass(frozen=True)
@@ -63,13 +56,13 @@ class MS2ObservationModel:
     observation_starts: np.ndarray | None = None
 
 
-def ms2posterior_kernel(
+def proximal_kernel(
     time_offsets: jnp.ndarray,
     t_rise: jnp.ndarray,
     t_plateau: jnp.ndarray,
     rna_intensity: jnp.ndarray = jnp.asarray(1.0, dtype=jnp.float32),
 ) -> jnp.ndarray:
-    """Ramp-then-plateau MS2 kernel used by MS2Posterior."""
+    """Evaluate the proximal ramp-then-plateau MS2 kernel."""
     time_offsets = jnp.asarray(time_offsets, dtype=jnp.float32)
     t_rise = jnp.asarray(t_rise, dtype=jnp.float32)
     t_plateau = jnp.asarray(t_plateau, dtype=jnp.float32)
@@ -83,40 +76,29 @@ def ms2posterior_kernel(
     return values.astype(jnp.float32)
 
 
-def evaluate_ms2_kernel(time_offsets: jnp.ndarray, kernel: MS2Kernel) -> jnp.ndarray:
+def evaluate_ms2_kernel(time_offsets: jnp.ndarray, kernel: KernelFunction) -> jnp.ndarray:
     """Evaluate a configured MS2 kernel on time offsets."""
     offsets = jnp.asarray(time_offsets, dtype=jnp.float32)
-    if kernel.function is not None:
-        return jnp.asarray(kernel.function(offsets), dtype=jnp.float32)
-    return ms2posterior_kernel(
-        offsets,
-        jnp.asarray(kernel.t_rise, dtype=jnp.float32),
-        jnp.asarray(kernel.t_plateau, dtype=jnp.float32),
-        jnp.asarray(kernel.rna_intensity, dtype=jnp.float32),
-    )
+    return jnp.asarray(kernel(offsets), dtype=jnp.float32)
 
 
 def resolve_ms2_kernel(
-    kernel: MS2Kernel | str | KernelFunction | None,
+    kernel: ProximalKernel | str | KernelFunction | None,
     t_rise: np.ndarray | float,
     t_plateau: np.ndarray | float,
     rna_intensity: np.ndarray | float,
-) -> MS2Kernel | None:
-    """Normalize public kernel configuration to an :class:`MS2Kernel`."""
+) -> KernelFunction | None:
+    """Normalize public kernel configuration to a JAX-compatible callable."""
     if kernel is None:
         return None
-    if isinstance(kernel, MS2Kernel):
+    if isinstance(kernel, ProximalKernel):
         return kernel
     if callable(kernel):
-        return MS2Kernel(
-            name="custom",
-            t_rise=t_rise,
-            t_plateau=t_plateau,
-            rna_intensity=rna_intensity,
-            function=kernel,
-        )
-    return MS2Kernel(
-        name=str(kernel),
+        return kernel
+    name = str(kernel).lower()
+    if name not in {"proximal", "ms2posterior"}:
+        raise ValueError("unknown MS2 kernel name.")
+    return ProximalKernel(
         t_rise=t_rise,
         t_plateau=t_plateau,
         rna_intensity=rna_intensity,
@@ -126,7 +108,7 @@ def resolve_ms2_kernel(
 def build_ms2_observation_model(
     time_grid: np.ndarray,
     n_observations: int,
-    kernel: MS2Kernel,
+    kernel: KernelFunction,
     sampling_times: np.ndarray | None = None,
     mode: str = "transfer",
     tolerance: float = 1e-7,
@@ -203,7 +185,7 @@ def transfer_windows_from_design(
 def transfer_windows_from_kernel(
     sampling_times: np.ndarray,
     loading_times: np.ndarray,
-    kernel: MS2Kernel,
+    kernel: KernelFunction,
     tolerance: float = 1e-7,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build row-specific transfer windows without materializing a dense matrix."""
@@ -245,7 +227,7 @@ def transfer_windows_from_kernel(
 def _kernel_row(
     sample_time: np.ndarray | float,
     loading_times: np.ndarray,
-    kernel: MS2Kernel,
+    kernel: KernelFunction,
 ) -> np.ndarray:
     offsets = np.asarray(sample_time, dtype=FLOAT_DTYPE) - loading_times
     return np.asarray(evaluate_ms2_kernel(jnp.asarray(offsets), kernel), dtype=FLOAT_DTYPE)
@@ -254,7 +236,7 @@ def _kernel_row(
 def _kernel_design_matrix(
     sampling_times: np.ndarray,
     loading_times: np.ndarray,
-    kernel: MS2Kernel,
+    kernel: KernelFunction,
 ) -> np.ndarray:
     offsets = sampling_times[:, None] - loading_times[None, :]
     return np.asarray(evaluate_ms2_kernel(jnp.asarray(offsets), kernel), dtype=FLOAT_DTYPE)

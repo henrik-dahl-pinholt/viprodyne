@@ -8,8 +8,8 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from viprodyne.core.ms2_kernels import (
-    MS2Kernel,
     MS2ObservationModel,
+    ProximalKernel,
     build_ms2_observation_model,
     resolve_ms2_kernel,
 )
@@ -68,8 +68,10 @@ class ModelConfig:
     loading_prior_rate: np.ndarray | float = np.float32(1.0)
     shared_transition_rates: bool = False
     shared_loading_rates: bool = False
+    shared_transition_rate_indices: tuple[int, ...] = ()
+    shared_loading_rate_states: tuple[int, ...] = ()
     pol2_mode: str = "auto"
-    ms2_kernel: MS2Kernel | str | Callable | None = "ms2posterior"
+    ms2_kernel: ProximalKernel | str | Callable | None = "proximal"
     t_rise: np.ndarray | float = np.float32(1.0)
     t_plateau: np.ndarray | float = np.float32(0.0)
     rna_intensity: np.ndarray | float = np.float32(1.0)
@@ -96,6 +98,24 @@ class ModelConfig:
             self.rna_intensity,
         )
         n_edges = self.n_states * (self.n_states - 1)
+        object.__setattr__(
+            self,
+            "shared_transition_rate_indices",
+            _validate_index_tuple(
+                self.shared_transition_rate_indices,
+                n_edges,
+                "shared_transition_rate_indices",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "shared_loading_rate_states",
+            _validate_index_tuple(
+                self.shared_loading_rate_states,
+                self.n_states,
+                "shared_loading_rate_states",
+            ),
+        )
         driven_indices = tuple(int(index) for index in self.driven_transition_indices)
         if any(index < 0 or index >= n_edges for index in driven_indices):
             raise ValueError("driven_transition_indices must be valid transition indices.")
@@ -147,20 +167,14 @@ class ViprodyneModel:
         return tuple(dict.fromkeys(schedule))
 
     def _build_graph(self) -> None:
-        shared_transition_names = self._add_shared_transition_rates()
-        shared_loading_names = self._add_shared_loading_rates()
         for dataset in self.datasets:
             self.dataset_nodes[dataset.name] = self._add_dataset_plate(
                 dataset,
-                shared_transition_names=shared_transition_names,
-                shared_loading_names=shared_loading_names,
             )
 
     def _add_dataset_plate(
         self,
         dataset: MS2Dataset,
-        shared_transition_names: list[str] | None,
-        shared_loading_names: list[str] | None,
     ) -> dict[str, str | list[str]]:
         time_grid = self._time_grid(dataset)
         initial_name = f"{dataset.name}:pi"
@@ -170,9 +184,7 @@ class ViprodyneModel:
         )
         self.graph.add_node(initial)
 
-        transition_names = shared_transition_names
-        if transition_names is None:
-            transition_names = self._add_transition_rates(dataset.name)
+        transition_names = self._add_transition_rates(dataset.name)
         contact_drive_name = self._add_contact_drive(dataset)
         rate_edges = tuple(
             self._rate_edge(index, transition_name, contact_drive_name)
@@ -202,9 +214,7 @@ class ViprodyneModel:
         )
         self.graph.add_node(observed)
 
-        loading_names = shared_loading_names
-        if loading_names is None:
-            loading_names = self._add_loading_rates(dataset.name)
+        loading_names = self._add_loading_rates(dataset.name)
 
         pol2_observation = self._pol2_observation_model(dataset)
         polymerase_name = None
@@ -236,14 +246,11 @@ class ViprodyneModel:
             "loading_rates": loading_names,
         }
 
-    def _add_shared_transition_rates(self) -> list[str] | None:
-        if not self.config.shared_transition_rates:
-            return None
-        return self._add_transition_rates("shared")
-
-    def _add_transition_rates(self, prefix: str) -> list[str]:
+    def _add_transition_rates(self, dataset_name: str) -> list[str]:
         names = []
+        shared_indices = self._shared_transition_indices()
         for index in range(self.config.n_states * (self.config.n_states - 1)):
+            prefix = "shared" if index in shared_indices else dataset_name
             to_state, from_state = transition_states(self.config.n_states, index)
             name = f"{prefix}:R{index}"
             if name not in self.graph.nodes:
@@ -271,14 +278,11 @@ class ViprodyneModel:
             names.append(name)
         return names
 
-    def _add_shared_loading_rates(self) -> list[str] | None:
-        if not self.config.shared_loading_rates:
-            return None
-        return self._add_loading_rates("shared")
-
-    def _add_loading_rates(self, prefix: str) -> list[str]:
+    def _add_loading_rates(self, dataset_name: str) -> list[str]:
         names = []
+        shared_states = self._shared_loading_states()
         for state in range(self.config.n_states):
+            prefix = "shared" if state in shared_states else dataset_name
             name = f"{prefix}:r{state}"
             if name not in self.graph.nodes:
                 self.graph.add_node(
@@ -291,6 +295,16 @@ class ViprodyneModel:
                 )
             names.append(name)
         return names
+
+    def _shared_transition_indices(self) -> set[int]:
+        if self.config.shared_transition_rates:
+            return set(range(self.config.n_states * (self.config.n_states - 1)))
+        return set(self.config.shared_transition_rate_indices)
+
+    def _shared_loading_states(self) -> set[int]:
+        if self.config.shared_loading_rates:
+            return set(range(self.config.n_states))
+        return set(self.config.shared_loading_rate_states)
 
     def _initial_concentration(self) -> np.ndarray:
         if self.config.initial_concentration is None:
@@ -387,3 +401,12 @@ def _validate_time_grid(time_grid: np.ndarray, name: str) -> np.ndarray:
     if np.any(np.diff(time_grid) <= 0):
         raise ValueError(f"{name} must be strictly increasing.")
     return time_grid
+
+
+def _validate_index_tuple(indices: tuple[int, ...], upper_bound: int, name: str) -> tuple[int, ...]:
+    values = tuple(int(index) for index in indices)
+    if len(set(values)) != len(values):
+        raise ValueError(f"{name} must not contain duplicates.")
+    if any(index < 0 or index >= upper_bound for index in values):
+        raise ValueError(f"{name} contains an out-of-range index.")
+    return values

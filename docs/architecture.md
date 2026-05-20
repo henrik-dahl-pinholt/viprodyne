@@ -52,10 +52,11 @@ loading kernels:
 `viprodyne.core.ms2_kernels` owns the public MS2 kernel specification and the
 internal conversion from user timing inputs to Pol2 observation representations:
 
-- `MS2Kernel` can select a named parameterized kernel or wrap a custom
-  JAX-compatible kernel function.
-- `ms2posterior_kernel` is the current built-in parameterized kernel. It uses
+- `ProximalKernel` is the current built-in parameterized kernel. It uses
   `t_rise`, `t_plateau`, and `rna_intensity`.
+- `ModelConfig.ms2_kernel` can also take `"proximal"` or a custom
+  JAX-compatible kernel function. The legacy string `"ms2posterior"` is accepted
+  as an alias for the proximal kernel.
 - `build_ms2_observation_model` derives the dense or transfer representation
   used by `PolymeraseLoadings`. The transfer path extracts row-specific windows
   from the kernel without storing a full dense observation-by-loading matrix.
@@ -193,7 +194,7 @@ model = ViprodyneModel(
         shared_transition_rates=False,
         shared_loading_rates=False,
         pol2_mode="auto",
-        ms2_kernel="ms2posterior",
+        ms2_kernel="proximal",
         t_rise=np.float32(0.25),
         t_plateau=np.float32(0.75),
         rna_intensity=np.float32(1.0),
@@ -213,9 +214,10 @@ By default, observations are assumed to occur at interval ends,
 `time_grid[1:len(observed) + 1]`. Use `MS2Dataset.sampling_times` when frame
 times are not the interval ends.
 
-`ModelConfig.ms2_kernel` can be a named kernel string, an `MS2Kernel` instance,
-or a custom JAX-compatible callable. The current built-in parameterized kernel is
-`"ms2posterior"` and uses `t_rise`, `t_plateau`, and `rna_intensity`.
+`ModelConfig.ms2_kernel` can be a named kernel string, a `ProximalKernel`
+instance, or a custom JAX-compatible callable. The current built-in
+parameterized kernel is `"proximal"` and uses `t_rise`, `t_plateau`, and
+`rna_intensity`.
 
 `ModelConfig.pol2_mode="auto"` chooses the transfer backend from the kernel
 configuration. `pol2_mode="mean_field"` or `"exact"` asks the builder to create
@@ -277,9 +279,12 @@ model = ViprodyneModel(
 )
 ```
 
-Shared rate nodes are enabled with `shared_transition_rates=True` or
-`shared_loading_rates=True`. Driven transition rates can be shared across
-datasets while the contact-drive node remains per dataset.
+Shared rate nodes are enabled globally with `shared_transition_rates=True` or
+`shared_loading_rates=True`. To share only selected parameters, use
+`shared_transition_rate_indices=(...)` for transition-rate indices or
+`shared_loading_rate_states=(...)` for loading-rate state indices. Driven
+transition rates can be shared across datasets while the contact-drive node
+remains per dataset.
 
 ## Current Gaps
 

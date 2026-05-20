@@ -2,14 +2,14 @@ import jax.numpy as jnp
 import numpy as np
 
 from viprodyne.core.ms2_kernels import (
-    MS2Kernel,
+    ProximalKernel,
     build_ms2_observation_model,
-    ms2posterior_kernel,
+    proximal_kernel,
 )
 
 
-def test_ms2posterior_kernel_is_float32_ramp_then_plateau():
-    values = ms2posterior_kernel(
+def test_proximal_kernel_is_float32_ramp_then_plateau():
+    values = proximal_kernel(
         jnp.asarray([-0.5, 0.0, 0.5, 1.0, 2.5, 3.1], dtype=jnp.float32),
         jnp.asarray(1.0, dtype=jnp.float32),
         jnp.asarray(2.0, dtype=jnp.float32),
@@ -27,7 +27,7 @@ def test_observation_model_builds_transfer_windows_from_kernel():
     model = build_ms2_observation_model(
         time_grid=np.array([0.0, 1.0, 2.0], dtype=np.float32),
         n_observations=2,
-        kernel=MS2Kernel(
+        kernel=ProximalKernel(
             t_rise=np.float32(0.5),
             t_plateau=np.float32(1.5),
             rna_intensity=np.float32(2.0),
@@ -47,7 +47,7 @@ def test_observation_model_builds_dense_inputs_for_mean_field_mode():
     model = build_ms2_observation_model(
         time_grid=np.array([0.0, 1.0, 2.0], dtype=np.float32),
         n_observations=2,
-        kernel=MS2Kernel(
+        kernel=ProximalKernel(
             t_rise=np.float32(0.5),
             t_plateau=np.float32(0.5),
             rna_intensity=np.float32(3.0),
