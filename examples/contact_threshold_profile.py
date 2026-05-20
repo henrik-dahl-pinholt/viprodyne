@@ -18,6 +18,8 @@ def main() -> None:
     n_traces = 8
     dt = np.float32(0.5)
     time_grid = np.arange(n_observations + 1, dtype=np.float32) * dt
+    observation_times = time_grid[1:]
+    loading_times = time_grid[:-1]
     contact_score = (
         0.5 + 0.5 * np.sin(np.linspace(0.0, 2.0 * np.pi, n_observations, dtype=np.float32))
     ).astype(np.float32)
@@ -34,8 +36,8 @@ def main() -> None:
         rna_intensity=np.float32(1.0),
     )
     clean_signal = _expected_ms2_signal(
-        sampling_times=time_grid[:-1],
-        loading_times=time_grid[:-1],
+        sampling_times=observation_times,
+        loading_times=loading_times,
         loading_probability=loading_probability,
         kernel=kernel,
     )

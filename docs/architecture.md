@@ -454,6 +454,8 @@ Tests cover:
 - non-interacting Pol2 theory when the kernel is shorter than the sampling
   interval;
 - large Pol2 batches with 200 tracks and 1000 timepoints;
+- synthetic contact-threshold recovery against latent Pol2 loadings, predicted
+  signal, and promoter state probabilities;
 - Gamma/Dirichlet parameter entropy and pinned-node behavior;
 - driven contact-survival MAP profiles and driven promoter tilts;
 - contact-threshold profile plumbing;
