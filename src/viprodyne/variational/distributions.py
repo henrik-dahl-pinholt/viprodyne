@@ -4,22 +4,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import jax.numpy as jnp
 import numpy as np
-from scipy.special import digamma, gammaln
+from jax.scipy.special import digamma, gammaln
 
 from viprodyne.variational.base import MomentDict, VariationalNode
 
+FLOAT_DTYPE = np.float32
+
 
 def _deterministic_sample(value: np.ndarray, size=None) -> np.ndarray:
-    value = np.asarray(value, dtype=float)
+    value = np.asarray(value, dtype=FLOAT_DTYPE)
     if size is None:
         return value.copy()
     size = (size,) if isinstance(size, int) else tuple(size)
-    return np.broadcast_to(value, size + value.shape).copy()
+    return np.broadcast_to(value, size + value.shape).astype(FLOAT_DTYPE, copy=True)
 
 
 def _as_positive_array(value, name: str) -> np.ndarray:
-    array = np.asarray(value, dtype=float)
+    array = np.asarray(value, dtype=FLOAT_DTYPE)
     if np.any(array <= 0):
         raise ValueError(f"{name} must be strictly positive.")
     return array
@@ -50,16 +53,16 @@ class GammaNode(VariationalNode):
         prior_shape, prior_rate = _broadcast_pair(
             self.prior_shape, self.prior_rate, "prior_shape", "prior_rate"
         )
-        self.prior_shape = prior_shape.astype(float)
-        self.prior_rate = prior_rate.astype(float)
+        self.prior_shape = prior_shape.astype(FLOAT_DTYPE)
+        self.prior_rate = prior_rate.astype(FLOAT_DTYPE)
         if self.shape is None:
             self.shape = self.prior_shape.copy()
         if self.rate is None:
             self.rate = self.prior_rate.copy()
         self.shape, self.rate = _broadcast_pair(self.shape, self.rate, "shape", "rate")
         if self.shape.shape != self.prior_shape.shape:
-            self.shape = np.broadcast_to(self.shape, self.prior_shape.shape).astype(float)
-            self.rate = np.broadcast_to(self.rate, self.prior_shape.shape).astype(float)
+            self.shape = np.broadcast_to(self.shape, self.prior_shape.shape).astype(FLOAT_DTYPE)
+            self.rate = np.broadcast_to(self.rate, self.prior_shape.shape).astype(FLOAT_DTYPE)
         if self.pinned_value is not None:
             self.pin(self.pinned_value)
 
@@ -69,7 +72,7 @@ class GammaNode(VariationalNode):
 
     def pin(self, value) -> None:
         pinned = _as_positive_array(value, "pinned_value")
-        self.pinned_value = np.broadcast_to(pinned, self.prior_shape.shape).astype(float)
+        self.pinned_value = np.broadcast_to(pinned, self.prior_shape.shape).astype(FLOAT_DTYPE)
 
     def unpin(self) -> None:
         self.pinned_value = None
@@ -80,42 +83,48 @@ class GammaNode(VariationalNode):
             return
         if not 0 < rho <= 1:
             raise ValueError("rho must be in (0, 1].")
-        counts = np.asarray(counts, dtype=float)
-        exposure = np.asarray(exposure, dtype=float)
+        counts = np.asarray(counts, dtype=FLOAT_DTYPE)
+        exposure = np.asarray(exposure, dtype=FLOAT_DTYPE)
         if np.any(counts < 0) or np.any(exposure < 0):
             raise ValueError("counts and exposure must be non-negative.")
         target_shape = self.prior_shape + np.broadcast_to(counts, self.prior_shape.shape)
         target_rate = self.prior_rate + np.broadcast_to(exposure, self.prior_shape.shape)
-        self.shape = (1.0 - rho) * self.shape + rho * target_shape
-        self.rate = (1.0 - rho) * self.rate + rho * target_rate
+        self.shape = ((1.0 - rho) * self.shape + rho * target_shape).astype(FLOAT_DTYPE)
+        self.rate = ((1.0 - rho) * self.rate + rho * target_rate).astype(FLOAT_DTYPE)
 
     def moments(self) -> MomentDict:
         if self.is_pinned:
-            value = np.asarray(self.pinned_value, dtype=float)
-            return {"mean": value, "expected_log": np.log(value)}
-        shape = np.asarray(self.shape, dtype=float)
-        rate = np.asarray(self.rate, dtype=float)
-        return {"mean": shape / rate, "expected_log": digamma(shape) - np.log(rate)}
+            value = np.asarray(self.pinned_value, dtype=FLOAT_DTYPE)
+            return {"mean": value, "expected_log": np.log(value).astype(FLOAT_DTYPE)}
+        shape = np.asarray(self.shape, dtype=FLOAT_DTYPE)
+        rate = np.asarray(self.rate, dtype=FLOAT_DTYPE)
+        expected_log = np.asarray(
+            digamma(jnp.asarray(shape)) - jnp.log(jnp.asarray(rate)),
+            dtype=FLOAT_DTYPE,
+        )
+        return {"mean": (shape / rate).astype(FLOAT_DTYPE), "expected_log": expected_log}
 
     def entropy(self) -> float:
         if self.is_pinned:
             return 0.0
-        shape = np.asarray(self.shape, dtype=float)
-        rate = np.asarray(self.rate, dtype=float)
-        entropy = shape - np.log(rate) + gammaln(shape) + (1.0 - shape) * digamma(shape)
-        return float(np.sum(entropy))
+        shape = jnp.asarray(self.shape, dtype=jnp.float32)
+        rate = jnp.asarray(self.rate, dtype=jnp.float32)
+        entropy = shape - jnp.log(rate) + gammaln(shape) + (1.0 - shape) * digamma(shape)
+        return float(jnp.sum(entropy))
 
     def expected_log_prior(self) -> float:
         if self.is_pinned:
             return 0.0
         moments = self.moments()
+        prior_shape = jnp.asarray(self.prior_shape, dtype=jnp.float32)
+        prior_rate = jnp.asarray(self.prior_rate, dtype=jnp.float32)
         value = (
-            self.prior_shape * np.log(self.prior_rate)
-            - gammaln(self.prior_shape)
-            + (self.prior_shape - 1.0) * moments["expected_log"]
-            - self.prior_rate * moments["mean"]
+            prior_shape * jnp.log(prior_rate)
+            - gammaln(prior_shape)
+            + (prior_shape - 1.0) * jnp.asarray(moments["expected_log"], dtype=jnp.float32)
+            - prior_rate * jnp.asarray(moments["mean"], dtype=jnp.float32)
         )
-        return float(np.sum(value))
+        return float(jnp.sum(value))
 
     def elbo_contribution(self) -> float:
         return self.expected_log_prior() + self.entropy()
@@ -123,14 +132,24 @@ class GammaNode(VariationalNode):
     def sample(self, rng: np.random.Generator | None = None, size=None):
         rng = np.random.default_rng() if rng is None else rng
         if self.is_pinned:
-            return _deterministic_sample(np.asarray(self.pinned_value, dtype=float), size)
-        return rng.gamma(shape=self.shape, scale=1.0 / self.rate, size=size)
+            return _deterministic_sample(np.asarray(self.pinned_value, dtype=FLOAT_DTYPE), size)
+        return np.asarray(
+            rng.gamma(shape=self.shape, scale=1.0 / self.rate, size=size),
+            dtype=FLOAT_DTYPE,
+        )
 
     def sample_prior(self, rng: np.random.Generator | None = None, size=None):
         rng = np.random.default_rng() if rng is None else rng
         if self.is_pinned:
-            return _deterministic_sample(np.asarray(self.pinned_value, dtype=float), size)
-        return rng.gamma(shape=self.prior_shape, scale=1.0 / self.prior_rate, size=size)
+            return _deterministic_sample(np.asarray(self.pinned_value, dtype=FLOAT_DTYPE), size)
+        return np.asarray(
+            rng.gamma(
+                shape=self.prior_shape,
+                scale=1.0 / self.prior_rate,
+                size=size,
+            ),
+            dtype=FLOAT_DTYPE,
+        )
 
 
 @dataclass
@@ -162,7 +181,7 @@ class DirichletNode(VariationalNode):
         return self.pinned_value is not None
 
     def pin(self, value) -> None:
-        value = np.asarray(value, dtype=float)
+        value = np.asarray(value, dtype=FLOAT_DTYPE)
         if value.shape != self.prior_concentration.shape:
             raise ValueError("pinned_value must have the same shape as prior_concentration.")
         if np.any(value < 0):
@@ -170,7 +189,7 @@ class DirichletNode(VariationalNode):
         total = np.sum(value, axis=-1, keepdims=True)
         if np.any(total <= 0):
             raise ValueError("pinned probabilities must have positive mass.")
-        self.pinned_value = value / total
+        self.pinned_value = (value / total).astype(FLOAT_DTYPE)
 
     def unpin(self) -> None:
         self.pinned_value = None
@@ -180,44 +199,54 @@ class DirichletNode(VariationalNode):
             return
         if not 0 < rho <= 1:
             raise ValueError("rho must be in (0, 1].")
-        counts = np.asarray(counts, dtype=float)
+        counts = np.asarray(counts, dtype=FLOAT_DTYPE)
         if counts.shape != self.prior_concentration.shape:
             raise ValueError("counts must have the same shape as prior_concentration.")
         if np.any(counts < 0):
             raise ValueError("counts must be non-negative.")
         target = self.prior_concentration + counts
-        self.concentration = (1.0 - rho) * self.concentration + rho * target
+        self.concentration = ((1.0 - rho) * self.concentration + rho * target).astype(
+            FLOAT_DTYPE
+        )
 
     def moments(self) -> MomentDict:
         if self.is_pinned:
-            probs = np.asarray(self.pinned_value, dtype=float)
-            return {"mean": probs, "expected_log": np.log(probs)}
-        concentration = np.asarray(self.concentration, dtype=float)
+            probs = np.asarray(self.pinned_value, dtype=FLOAT_DTYPE)
+            return {"mean": probs, "expected_log": np.log(probs).astype(FLOAT_DTYPE)}
+        concentration = np.asarray(self.concentration, dtype=FLOAT_DTYPE)
         total = np.sum(concentration, axis=-1, keepdims=True)
+        expected_log = np.asarray(
+            digamma(jnp.asarray(concentration)) - digamma(jnp.asarray(total)),
+            dtype=FLOAT_DTYPE,
+        )
         return {
-            "mean": concentration / total,
-            "expected_log": digamma(concentration) - digamma(total),
+            "mean": (concentration / total).astype(FLOAT_DTYPE),
+            "expected_log": expected_log,
         }
 
     def entropy(self) -> float:
         if self.is_pinned:
             return 0.0
-        concentration = np.asarray(self.concentration, dtype=float)
-        total = np.sum(concentration, axis=-1)
+        concentration = jnp.asarray(self.concentration, dtype=jnp.float32)
+        total = jnp.sum(concentration, axis=-1)
         k = concentration.shape[-1]
-        log_beta = np.sum(gammaln(concentration), axis=-1) - gammaln(total)
+        log_beta = jnp.sum(gammaln(concentration), axis=-1) - gammaln(total)
         entropy = log_beta + (total - k) * digamma(total)
-        entropy -= np.sum((concentration - 1.0) * digamma(concentration), axis=-1)
-        return float(np.sum(entropy))
+        entropy -= jnp.sum((concentration - 1.0) * digamma(concentration), axis=-1)
+        return float(jnp.sum(entropy))
 
     def expected_log_prior(self) -> float:
         if self.is_pinned:
             return 0.0
         moments = self.moments()
-        prior_total = np.sum(self.prior_concentration, axis=-1)
-        log_norm = gammaln(prior_total) - np.sum(gammaln(self.prior_concentration), axis=-1)
-        value = log_norm + np.sum((self.prior_concentration - 1.0) * moments["expected_log"], axis=-1)
-        return float(np.sum(value))
+        prior = jnp.asarray(self.prior_concentration, dtype=jnp.float32)
+        prior_total = jnp.sum(prior, axis=-1)
+        log_norm = gammaln(prior_total) - jnp.sum(gammaln(prior), axis=-1)
+        value = log_norm + jnp.sum(
+            (prior - 1.0) * jnp.asarray(moments["expected_log"], dtype=jnp.float32),
+            axis=-1,
+        )
+        return float(jnp.sum(value))
 
     def elbo_contribution(self) -> float:
         return self.expected_log_prior() + self.entropy()
@@ -225,14 +254,18 @@ class DirichletNode(VariationalNode):
     def sample(self, rng: np.random.Generator | None = None, size=None):
         rng = np.random.default_rng() if rng is None else rng
         if self.is_pinned:
-            return _deterministic_sample(np.asarray(self.pinned_value, dtype=float), size)
-        return _sample_dirichlet(rng, np.asarray(self.concentration, dtype=float), size=size)
+            return _deterministic_sample(np.asarray(self.pinned_value, dtype=FLOAT_DTYPE), size)
+        return _sample_dirichlet(rng, np.asarray(self.concentration, dtype=FLOAT_DTYPE), size=size)
 
     def sample_prior(self, rng: np.random.Generator | None = None, size=None):
         rng = np.random.default_rng() if rng is None else rng
         if self.is_pinned:
-            return _deterministic_sample(np.asarray(self.pinned_value, dtype=float), size)
-        return _sample_dirichlet(rng, np.asarray(self.prior_concentration, dtype=float), size=size)
+            return _deterministic_sample(np.asarray(self.pinned_value, dtype=FLOAT_DTYPE), size)
+        return _sample_dirichlet(
+            rng,
+            np.asarray(self.prior_concentration, dtype=FLOAT_DTYPE),
+            size=size,
+        )
 
 
 @dataclass
@@ -245,15 +278,15 @@ class DeltaNode(VariationalNode):
 
     def __post_init__(self) -> None:
         VariationalNode.__init__(self, self.name)
-        self.value = np.asarray(self.value, dtype=float)
+        self.value = np.asarray(self.value, dtype=FLOAT_DTYPE)
 
     def set_value(self, value) -> None:
-        self.value = np.asarray(value, dtype=float)
+        self.value = np.asarray(value, dtype=FLOAT_DTYPE)
 
     def moments(self) -> MomentDict:
         moments: MomentDict = {"mean": self.value}
         if self.log_safe and np.all(self.value > 0):
-            moments["expected_log"] = np.log(self.value)
+            moments["expected_log"] = np.log(self.value).astype(FLOAT_DTYPE)
         return moments
 
     def entropy(self) -> float:
@@ -262,7 +295,7 @@ class DeltaNode(VariationalNode):
     def sample(self, rng: np.random.Generator | None = None, size=None):
         if size is None:
             return np.asarray(self.value).copy()
-        return _deterministic_sample(np.asarray(self.value, dtype=float), size)
+        return _deterministic_sample(np.asarray(self.value, dtype=FLOAT_DTYPE), size)
 
 
 def _sample_dirichlet(
@@ -271,9 +304,9 @@ def _sample_dirichlet(
     size=None,
 ) -> np.ndarray:
     """Sample from possibly plated Dirichlet distributions along the last axis."""
-    concentration = np.asarray(concentration, dtype=float)
+    concentration = np.asarray(concentration, dtype=FLOAT_DTYPE)
     if concentration.ndim == 1:
-        return rng.dirichlet(concentration, size=size)
+        return rng.dirichlet(concentration, size=size).astype(FLOAT_DTYPE)
     size = () if size is None else ((size,) if isinstance(size, int) else tuple(size))
     gamma = rng.gamma(shape=concentration, scale=1.0, size=size + concentration.shape)
-    return gamma / np.sum(gamma, axis=-1, keepdims=True)
+    return (gamma / np.sum(gamma, axis=-1, keepdims=True)).astype(FLOAT_DTYPE)

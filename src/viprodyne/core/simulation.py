@@ -9,6 +9,8 @@ import numpy as np
 
 from viprodyne.core.rate_edges import validate_column_generator
 
+FLOAT_DTYPE = np.float32
+
 
 @dataclass(frozen=True)
 class CTMCPath:
@@ -24,7 +26,7 @@ class CTMCPath:
     stop_time: float
 
     def __post_init__(self) -> None:
-        times = np.asarray(self.times, dtype=float)
+        times = np.asarray(self.times, dtype=FLOAT_DTYPE)
         states = np.asarray(self.states, dtype=int)
         if times.ndim != 1 or states.ndim != 1:
             raise ValueError("times and states must be one-dimensional.")
@@ -40,12 +42,12 @@ class CTMCPath:
             raise ValueError("state-entry times cannot exceed stop_time.")
         object.__setattr__(self, "times", times)
         object.__setattr__(self, "states", states)
-        object.__setattr__(self, "stop_time", float(self.stop_time))
+        object.__setattr__(self, "stop_time", float(np.float32(self.stop_time)))
 
     @property
     def segment_ends(self) -> np.ndarray:
         """Return end time for each state segment."""
-        return np.concatenate([self.times[1:], np.array([self.stop_time])])
+        return np.concatenate([self.times[1:], np.asarray([self.stop_time], dtype=FLOAT_DTYPE)])
 
     @property
     def durations(self) -> np.ndarray:
@@ -54,7 +56,7 @@ class CTMCPath:
 
     def state_at(self, query_times: np.ndarray | float) -> np.ndarray:
         """Return active state at one or more times."""
-        query_times = np.asarray(query_times, dtype=float)
+        query_times = np.asarray(query_times, dtype=FLOAT_DTYPE)
         if np.any(query_times < 0) or np.any(query_times > self.stop_time):
             raise ValueError("query_times must lie within [0, stop_time].")
         indices = np.searchsorted(self.times, query_times, side="right") - 1
@@ -64,7 +66,7 @@ class CTMCPath:
         """Return total dwell time in each state."""
         if n_states is None:
             n_states = int(np.max(self.states)) + 1
-        dwell = np.zeros(n_states, dtype=float)
+        dwell = np.zeros(n_states, dtype=FLOAT_DTYPE)
         np.add.at(dwell, self.states, self.durations)
         return dwell
 
@@ -72,7 +74,7 @@ class CTMCPath:
         """Return transition counts using ``counts[to_state, from_state]``."""
         if n_states is None:
             n_states = int(np.max(self.states)) + 1
-        counts = np.zeros((n_states, n_states), dtype=float)
+        counts = np.zeros((n_states, n_states), dtype=FLOAT_DTYPE)
         from_states = self.states[:-1]
         to_states = self.states[1:]
         np.add.at(counts, (to_states, from_states), 1.0)
@@ -93,15 +95,15 @@ def stationary_distribution(generator: np.ndarray) -> np.ndarray:
     """Compute the stationary distribution of a column-sum-zero CTMC."""
     generator = validate_column_generator(generator)
     n_states = generator.shape[0]
-    matrix = np.vstack([generator, np.ones((1, n_states))])
-    rhs = np.zeros(n_states + 1, dtype=float)
+    matrix = np.vstack([generator, np.ones((1, n_states), dtype=FLOAT_DTYPE)])
+    rhs = np.zeros(n_states + 1, dtype=FLOAT_DTYPE)
     rhs[-1] = 1.0
     stationary, *_ = np.linalg.lstsq(matrix, rhs, rcond=None)
     stationary = np.clip(stationary, 0.0, np.inf)
     total = np.sum(stationary)
     if total <= 0:
         raise FloatingPointError("stationary distribution has no positive mass.")
-    return stationary / total
+    return (stationary / total).astype(FLOAT_DTYPE)
 
 
 def sample_ctmc_path(
@@ -145,7 +147,11 @@ def sample_ctmc_path(
         times.append(time)
         states.append(next_state)
         current_state = next_state
-    return CTMCPath(times=np.asarray(times), states=np.asarray(states), stop_time=stop_time)
+    return CTMCPath(
+        times=np.asarray(times, dtype=FLOAT_DTYPE),
+        states=np.asarray(states),
+        stop_time=stop_time,
+    )
 
 
 def sample_loading_events(
@@ -155,7 +161,7 @@ def sample_loading_events(
 ) -> np.ndarray:
     """Sample Poisson loading events conditional on a promoter path."""
     rng = np.random.default_rng() if rng is None else rng
-    loading_rates = np.asarray(loading_rates, dtype=float)
+    loading_rates = np.asarray(loading_rates, dtype=FLOAT_DTYPE)
     if loading_rates.ndim != 1:
         raise ValueError("loading_rates must be one-dimensional.")
     if np.any(loading_rates < 0):
@@ -165,11 +171,11 @@ def sample_loading_events(
     intensities = loading_rates[path.states] * path.durations
     event_counts = rng.poisson(intensities)
     if np.sum(event_counts) == 0:
-        return np.empty(0, dtype=float)
+        return np.empty(0, dtype=FLOAT_DTYPE)
     segment_ids = np.repeat(np.arange(event_counts.size), event_counts)
-    uniforms = rng.uniform(size=int(np.sum(event_counts)))
+    uniforms = rng.uniform(size=int(np.sum(event_counts))).astype(FLOAT_DTYPE)
     event_times = path.times[segment_ids] + path.durations[segment_ids] * uniforms
-    return np.sort(event_times)
+    return np.sort(event_times).astype(FLOAT_DTYPE)
 
 
 def proximal_ms2_kernel(
@@ -179,14 +185,14 @@ def proximal_ms2_kernel(
     max_intensity: float = 1.0,
 ) -> np.ndarray:
     """Evaluate a ramp-then-plateau MS2 kernel."""
-    time_offsets = np.asarray(time_offsets, dtype=float)
+    time_offsets = np.asarray(time_offsets, dtype=FLOAT_DTYPE)
     if rise_time <= 0 or plateau_time < 0:
         raise ValueError("rise_time must be positive and plateau_time non-negative.")
-    out = np.zeros_like(time_offsets, dtype=float)
+    out = np.zeros_like(time_offsets, dtype=FLOAT_DTYPE)
     rising = (time_offsets >= 0.0) & (time_offsets < rise_time)
     plateau = (time_offsets >= rise_time) & (time_offsets <= rise_time + plateau_time)
     out[rising] = max_intensity * time_offsets[rising] / rise_time
-    out[plateau] = max_intensity
+    out[plateau] = np.float32(max_intensity)
     return out
 
 
@@ -198,17 +204,20 @@ def generate_ms2_signal(
     rng: np.random.Generator | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Generate clean and noisy MS2 signals from loading events."""
-    sampling_times = np.asarray(sampling_times, dtype=float)
-    loading_times = np.asarray(loading_times, dtype=float)
+    sampling_times = np.asarray(sampling_times, dtype=FLOAT_DTYPE)
+    loading_times = np.asarray(loading_times, dtype=FLOAT_DTYPE)
     if noise_std < 0:
         raise ValueError("noise_std must be non-negative.")
     if loading_times.size == 0:
-        clean = np.zeros_like(sampling_times, dtype=float)
+        clean = np.zeros_like(sampling_times, dtype=FLOAT_DTYPE)
     else:
-        clean = kernel(sampling_times[:, None] - loading_times[None, :]).sum(axis=-1)
+        clean = np.asarray(
+            kernel(sampling_times[:, None] - loading_times[None, :]).sum(axis=-1),
+            dtype=FLOAT_DTYPE,
+        )
     rng = np.random.default_rng() if rng is None else rng
-    noise = rng.normal(0.0, noise_std, size=sampling_times.shape)
-    return clean, clean + noise
+    noise = rng.normal(0.0, noise_std, size=sampling_times.shape).astype(FLOAT_DTYPE)
+    return clean, (clean + noise).astype(FLOAT_DTYPE)
 
 
 def simulate_ms2_trajectory(
@@ -224,7 +233,7 @@ def simulate_ms2_trajectory(
 ) -> MS2Trajectory:
     """Simulate promoter states, Pol2 loading events, and an MS2 trace."""
     rng = np.random.default_rng() if rng is None else rng
-    sampling_times = np.asarray(sampling_times, dtype=float)
+    sampling_times = np.asarray(sampling_times, dtype=FLOAT_DTYPE)
     if sampling_times.ndim != 1 or sampling_times.size == 0:
         raise ValueError("sampling_times must be a non-empty one-dimensional array.")
     stop_time = float(np.max(sampling_times) + pad_time)
@@ -246,7 +255,7 @@ def simulate_ms2_trajectory(
 
 
 def _normalize_probabilities(probabilities: np.ndarray, n_states: int) -> np.ndarray:
-    probabilities = np.asarray(probabilities, dtype=float)
+    probabilities = np.asarray(probabilities, dtype=FLOAT_DTYPE)
     if probabilities.shape != (n_states,):
         raise ValueError("initial_probabilities must have shape (n_states,).")
     if np.any(probabilities < 0):
@@ -254,4 +263,4 @@ def _normalize_probabilities(probabilities: np.ndarray, n_states: int) -> np.nda
     total = np.sum(probabilities)
     if total <= 0:
         raise ValueError("initial_probabilities must have positive mass.")
-    return probabilities / total
+    return (probabilities / total).astype(FLOAT_DTYPE)

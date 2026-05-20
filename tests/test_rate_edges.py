@@ -47,7 +47,10 @@ def test_wrap_column_generator_uses_column_sum_zero_convention():
     generator = wrap_column_generator(np.arange(6.0), n_states=3)
 
     expected = np.array([[-6.0, 0.0, 1.0], [2.0, -5.0, 3.0], [4.0, 5.0, -4.0]])
+    assert generator.dtype == np.float32
     np.testing.assert_allclose(generator, expected)
     np.testing.assert_allclose(np.sum(generator, axis=0), np.zeros(3))
-    np.testing.assert_allclose(unwrap_column_generator(generator), np.arange(6.0))
+    unwrapped = unwrap_column_generator(generator)
+    assert unwrapped.dtype == np.float32
+    np.testing.assert_allclose(unwrapped, np.arange(6.0))
     validate_column_generator(generator)

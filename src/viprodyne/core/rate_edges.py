@@ -12,6 +12,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+FLOAT_DTYPE = np.float32
+
 
 def ordered_transition_index(n_states: int, to_state: int, from_state: int) -> int:
     """Return the row-major off-diagonal index for ``Q[to_state, from_state]``."""
@@ -41,7 +43,7 @@ def transition_states(n_states: int, transition_index: int) -> tuple[int, int]:
 
 def wrap_column_generator(offdiag_rates: np.ndarray, n_states: int | None = None) -> np.ndarray:
     """Fill a column-sum-zero generator from row-major off-diagonal rates."""
-    rates = np.asarray(offdiag_rates, dtype=float)
+    rates = np.asarray(offdiag_rates, dtype=FLOAT_DTYPE)
     if rates.ndim != 1:
         raise ValueError("offdiag_rates must be one-dimensional.")
     if np.any(rates < 0):
@@ -50,7 +52,7 @@ def wrap_column_generator(offdiag_rates: np.ndarray, n_states: int | None = None
         n_states = int(0.5 * (1.0 + np.sqrt(1.0 + 4.0 * rates.size)))
     if rates.size != n_states * (n_states - 1):
         raise ValueError("offdiag_rates length must equal n_states * (n_states - 1).")
-    generator = np.zeros((n_states, n_states), dtype=float)
+    generator = np.zeros((n_states, n_states), dtype=FLOAT_DTYPE)
     for index, rate in enumerate(rates):
         to_state, from_state = transition_states(n_states, index)
         generator[to_state, from_state] = rate
@@ -61,7 +63,7 @@ def wrap_column_generator(offdiag_rates: np.ndarray, n_states: int | None = None
 
 def unwrap_column_generator(generator: np.ndarray) -> np.ndarray:
     """Return row-major off-diagonal entries from a column-sum-zero generator."""
-    generator = np.asarray(generator, dtype=float)
+    generator = np.asarray(generator, dtype=FLOAT_DTYPE)
     if generator.ndim != 2 or generator.shape[0] != generator.shape[1]:
         raise ValueError("generator must be a square matrix.")
     n_states = generator.shape[0]
@@ -72,13 +74,13 @@ def unwrap_column_generator(generator: np.ndarray) -> np.ndarray:
             for from_state in range(n_states)
             if to_state != from_state
         ],
-        dtype=float,
+        dtype=FLOAT_DTYPE,
     )
 
 
-def validate_column_generator(generator: np.ndarray, atol: float = 1e-10) -> np.ndarray:
+def validate_column_generator(generator: np.ndarray, atol: float = 1e-6) -> np.ndarray:
     """Validate and return a column-sum-zero CTMC generator."""
-    generator = np.asarray(generator, dtype=float)
+    generator = np.asarray(generator, dtype=FLOAT_DTYPE)
     if generator.ndim != 2 or generator.shape[0] != generator.shape[1]:
         raise ValueError("generator must be a square matrix.")
     offdiag = generator.copy()

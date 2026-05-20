@@ -8,6 +8,7 @@ import numpy as np
 from scipy.optimize import minimize_scalar
 
 CONTACT_PROB_FLOOR = 1e-20
+FLOAT_DTYPE = np.float32
 
 
 @dataclass(frozen=True)
@@ -29,8 +30,8 @@ class ContactSurvivalStats:
     log_contact_jump: float = 0.0
 
     def __post_init__(self) -> None:
-        gamma_from = np.asarray(self.gamma_from, dtype=float)
-        p_contact = np.asarray(self.p_contact, dtype=float)
+        gamma_from = np.asarray(self.gamma_from, dtype=FLOAT_DTYPE)
+        p_contact = np.asarray(self.p_contact, dtype=FLOAT_DTYPE)
         if gamma_from.shape != p_contact.shape:
             raise ValueError("gamma_from and p_contact must have the same shape.")
         if self.dt <= 0:
@@ -38,7 +39,7 @@ class ContactSurvivalStats:
         if self.expected_jumps < 0:
             raise ValueError("expected_jumps must be non-negative.")
         object.__setattr__(self, "gamma_from", gamma_from)
-        object.__setattr__(self, "p_contact", np.clip(p_contact, 0.0, 1.0))
+        object.__setattr__(self, "p_contact", np.clip(p_contact, 0.0, 1.0).astype(FLOAT_DTYPE))
 
     @classmethod
     def from_posteriors(
@@ -50,8 +51,8 @@ class ContactSurvivalStats:
         contact_prob_floor: float = CONTACT_PROB_FLOOR,
     ) -> "ContactSurvivalStats":
         """Build stats from posterior jump density and source-state occupancy arrays."""
-        gamma_jump = np.nan_to_num(np.asarray(gamma_jump, dtype=float), nan=0.0)
-        p_contact = np.asarray(p_contact, dtype=float)
+        gamma_jump = np.nan_to_num(np.asarray(gamma_jump, dtype=FLOAT_DTYPE), nan=0.0)
+        p_contact = np.asarray(p_contact, dtype=FLOAT_DTYPE)
         if gamma_jump.shape != p_contact.shape:
             raise ValueError("gamma_jump and p_contact must have the same shape.")
         expected_jumps = float(np.sum(gamma_jump) * dt)
@@ -60,7 +61,7 @@ class ContactSurvivalStats:
         )
         return cls(
             expected_jumps=expected_jumps,
-            gamma_from=np.nan_to_num(gamma_from, nan=0.0),
+            gamma_from=np.nan_to_num(gamma_from, nan=0.0).astype(FLOAT_DTYPE),
             p_contact=p_contact,
             dt=dt,
             log_contact_jump=log_contact_jump,
@@ -100,13 +101,15 @@ def contact_survival_log_profile(
 
 def _log_contact_survival(rate: float, dt: float, p_contact: np.ndarray) -> np.ndarray:
     """Compute log(1 - p * (1 - exp(-rate * dt))) without p=1 cancellation."""
-    p_contact = np.asarray(p_contact, dtype=float)
-    survival = np.empty_like(p_contact, dtype=float)
+    p_contact = np.asarray(p_contact, dtype=FLOAT_DTYPE)
+    survival = np.empty_like(p_contact, dtype=FLOAT_DTYPE)
     always_contact = p_contact >= 1.0
     survival[always_contact] = -float(rate) * float(dt)
     if np.any(~always_contact):
         p = p_contact[~always_contact]
-        survival[~always_contact] = np.log1p(-p * (-np.expm1(-float(rate) * float(dt))))
+        survival[~always_contact] = np.log1p(
+            -p * (-np.expm1(-float(rate) * float(dt)))
+        ).astype(FLOAT_DTYPE)
     return survival
 
 

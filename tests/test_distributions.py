@@ -15,6 +15,10 @@ def test_gamma_node_moments_entropy_and_prior_term():
     )
 
     moments = node.moments()
+    assert node.prior_shape.dtype == np.float32
+    assert node.prior_rate.dtype == np.float32
+    assert moments["mean"].dtype == np.float32
+    assert moments["expected_log"].dtype == np.float32
     assert moments["mean"] == pytest.approx(5.0 / 7.0)
     assert moments["expected_log"] == pytest.approx(float(digamma(5.0) - np.log(7.0)))
 
@@ -27,7 +31,10 @@ def test_gamma_node_moments_entropy_and_prior_term():
     )
     assert node.entropy() == pytest.approx(float(entropy))
     assert node.expected_log_prior() == pytest.approx(float(expected_log_prior))
-    assert node.elbo_contribution() == pytest.approx(float(entropy + expected_log_prior))
+    assert node.elbo_contribution() == pytest.approx(
+        float(entropy + expected_log_prior),
+        rel=2e-6,
+    )
 
 
 def test_gamma_node_conjugate_update_and_pinning():
@@ -36,10 +43,14 @@ def test_gamma_node_conjugate_update_and_pinning():
 
     np.testing.assert_allclose(node.shape, [6.0, 8.0])
     np.testing.assert_allclose(node.rate, [5.0, 6.0])
+    assert node.shape.dtype == np.float32
+    assert node.rate.dtype == np.float32
 
     node.pin([0.1, 0.2])
     node.set_posterior_from_sufficient_statistics(counts=np.array([10.0, 10.0]), exposure=10.0)
     moments = node.moments()
+    assert moments["mean"].dtype == np.float32
+    assert moments["expected_log"].dtype == np.float32
     np.testing.assert_allclose(moments["mean"], [0.1, 0.2])
     np.testing.assert_allclose(moments["expected_log"], np.log([0.1, 0.2]))
     assert node.entropy() == 0.0
@@ -54,8 +65,16 @@ def test_dirichlet_node_moments_entropy_and_update():
     concentration = np.array([3.0, 2.0, 4.0])
     total = np.sum(concentration)
     moments = node.moments()
+    assert node.prior_concentration.dtype == np.float32
+    assert node.concentration.dtype == np.float32
+    assert moments["mean"].dtype == np.float32
+    assert moments["expected_log"].dtype == np.float32
     np.testing.assert_allclose(moments["mean"], concentration / total)
-    np.testing.assert_allclose(moments["expected_log"], digamma(concentration) - digamma(total))
+    np.testing.assert_allclose(
+        moments["expected_log"],
+        digamma(concentration) - digamma(total),
+        rtol=5e-6,
+    )
 
     log_beta = np.sum(gammaln(concentration)) - gammaln(total)
     entropy = log_beta + (total - len(concentration)) * digamma(total)
@@ -81,15 +100,22 @@ def test_plated_dirichlet_sampling_returns_one_simplex_per_plate():
     prior_sample = node.sample_prior(rng, size=4)
 
     assert sample.shape == (2, 3)
+    assert sample.dtype == np.float32
     np.testing.assert_allclose(np.sum(sample, axis=-1), np.ones(2))
     assert prior_sample.shape == (4, 2, 3)
+    assert prior_sample.dtype == np.float32
     np.testing.assert_allclose(np.sum(prior_sample, axis=-1), np.ones((4, 2)))
 
 
 def test_delta_node_emits_deterministic_moments():
     node = DeltaNode(name="rc", value=np.array([2.0, 3.0]))
 
+    assert node.value.dtype == np.float32
+    assert node.moments()["mean"].dtype == np.float32
+    assert node.moments()["expected_log"].dtype == np.float32
     np.testing.assert_allclose(node.moments()["mean"], [2.0, 3.0])
     np.testing.assert_allclose(node.moments()["expected_log"], np.log([2.0, 3.0]))
     assert node.entropy() == 0.0
-    np.testing.assert_allclose(node.sample(size=2), [[2.0, 3.0], [2.0, 3.0]])
+    sample = node.sample(size=2)
+    assert sample.dtype == np.float32
+    np.testing.assert_allclose(sample, [[2.0, 3.0], [2.0, 3.0]])

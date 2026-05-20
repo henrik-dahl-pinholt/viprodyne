@@ -17,6 +17,8 @@ def test_contact_survival_reduces_to_poisson_process_when_contact_is_one():
         dt=0.5,
     )
 
+    assert stats.gamma_from.dtype == np.float32
+    assert stats.p_contact.dtype == np.float32
     prior_shape = 2.0
     prior_rate = 1.5
     expected_map = (stats.expected_jumps + prior_shape - 1.0) / (
@@ -57,6 +59,8 @@ def test_contact_survival_stats_from_posteriors_scales_jump_density_by_dt():
 
     stats = ContactSurvivalStats.from_posteriors(gamma_jump, gamma_from, p_contact, dt=0.25)
 
+    assert stats.gamma_from.dtype == np.float32
+    assert stats.p_contact.dtype == np.float32
     assert stats.expected_jumps == pytest.approx(0.75)
     assert stats.log_contact_jump == pytest.approx(0.25 * (np.log(0.2) + 2.0 * np.log(0.4)))
 
@@ -64,4 +68,3 @@ def test_contact_survival_stats_from_posteriors_scales_jump_density_by_dt():
 def test_contact_survival_stats_validate_shapes():
     with pytest.raises(ValueError, match="same shape"):
         ContactSurvivalStats(expected_jumps=1.0, gamma_from=np.ones(2), p_contact=np.ones(3), dt=1.0)
-

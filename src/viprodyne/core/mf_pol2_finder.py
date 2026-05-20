@@ -106,7 +106,7 @@ def fit_mean_field_bernoulli(
         options={"maxiter": int(maxiter), "gtol": float(gtol), "ftol": 1e-7, "maxls": 50},
     )
     logits = np.asarray(result.x, dtype=np.float32)
-    load_probabilities = np.asarray(jax.nn.sigmoid(jnp.asarray(logits)), dtype=float)
+    load_probabilities = np.asarray(jax.nn.sigmoid(jnp.asarray(logits)), dtype=np.float32)
     _, observed_arr, prior, design_arr, finite_mask_arr = _prepare_inputs(
         logits, observed, prior_probabilities, design_matrix, noise_std, mask
     )

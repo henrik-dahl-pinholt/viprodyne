@@ -26,8 +26,9 @@ def test_stationary_distribution_two_state_column_generator():
 
     stationary = stationary_distribution(generator)
 
+    assert stationary.dtype == np.float32
     np.testing.assert_allclose(stationary, [koff / (kon + koff), kon / (kon + koff)])
-    np.testing.assert_allclose(generator @ stationary, np.zeros(2), atol=1e-14)
+    np.testing.assert_allclose(generator @ stationary, np.zeros(2), atol=1e-7)
 
 
 def test_ctmc_path_summaries_use_to_from_transition_counts():
@@ -38,9 +39,15 @@ def test_ctmc_path_summaries_use_to_from_transition_counts():
     )
 
     np.testing.assert_array_equal(path.state_at([0.0, 0.3, 1.25]), [0, 1, 1])
+    assert path.times.dtype == np.float32
+    assert path.durations.dtype == np.float32
     np.testing.assert_allclose(path.durations, [0.25, 0.5, 0.25, 0.5])
-    np.testing.assert_allclose(path.dwell_times(n_states=2), [0.5, 1.0])
-    np.testing.assert_allclose(path.transition_counts(n_states=2), [[0.0, 1.0], [2.0, 0.0]])
+    dwell = path.dwell_times(n_states=2)
+    counts = path.transition_counts(n_states=2)
+    assert dwell.dtype == np.float32
+    assert counts.dtype == np.float32
+    np.testing.assert_allclose(dwell, [0.5, 1.0])
+    np.testing.assert_allclose(counts, [[0.0, 1.0], [2.0, 0.0]])
 
 
 def test_sample_ctmc_path_final_state_matches_two_state_analytic_distribution():
@@ -82,6 +89,8 @@ def test_loading_events_are_sorted_and_within_active_segments():
     empty = sample_loading_events(path, loading_rates=np.array([0.0, 0.0]), rng=np.random.default_rng(2))
     events = sample_loading_events(path, loading_rates=np.array([4.0, 7.0]), rng=np.random.default_rng(2))
 
+    assert empty.dtype == np.float32
+    assert events.dtype == np.float32
     assert empty.size == 0
     assert np.all(np.diff(events) >= 0)
     assert np.all(events >= 0.0)
@@ -91,6 +100,7 @@ def test_loading_events_are_sorted_and_within_active_segments():
 def test_proximal_kernel_and_ms2_signal_without_noise_are_exact():
     offsets = np.array([-1.0, 0.0, 0.5, 1.0, 2.5, 3.1])
     kernel_values = proximal_ms2_kernel(offsets, rise_time=1.0, plateau_time=2.0, max_intensity=4.0)
+    assert kernel_values.dtype == np.float32
     np.testing.assert_allclose(kernel_values, [0.0, 0.0, 2.0, 4.0, 4.0, 0.0])
 
     sampling_times = np.array([0.0, 1.0, 2.0])
@@ -103,6 +113,8 @@ def test_proximal_kernel_and_ms2_signal_without_noise_are_exact():
         rng=np.random.default_rng(3),
     )
 
+    assert clean.dtype == np.float32
+    assert noisy.dtype == np.float32
     np.testing.assert_allclose(clean, [0.0, 1.0, 2.0])
     np.testing.assert_allclose(noisy, clean)
 
@@ -123,6 +135,9 @@ def test_simulate_ms2_trajectory_shapes_and_hidden_variables():
 
     assert trajectory.clean_signal.shape == sampling_times.shape
     assert trajectory.noisy_signal.shape == sampling_times.shape
+    assert trajectory.clean_signal.dtype == np.float32
+    assert trajectory.noisy_signal.dtype == np.float32
+    assert trajectory.loading_times.dtype == np.float32
     assert trajectory.promoter_path.stop_time == pytest.approx(4.5)
     assert np.all(trajectory.loading_times >= 0.0)
     assert np.all(trajectory.loading_times <= trajectory.promoter_path.stop_time)
