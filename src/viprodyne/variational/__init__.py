@@ -3,6 +3,7 @@
 from viprodyne.variational.base import MomentStore, UpdateContext, VariationalGraph, VariationalNode
 from viprodyne.variational.distributions import DeltaNode, DirichletNode, GammaNode
 from viprodyne.variational.nodes import (
+    DrivenRateMap,
     InitialStateProb,
     LoadingRate,
     ObservedIntensity,
@@ -15,6 +16,7 @@ from viprodyne.variational.nodes import (
 __all__ = [
     "DeltaNode",
     "DirichletNode",
+    "DrivenRateMap",
     "GammaNode",
     "InitialStateProb",
     "LoadingRate",

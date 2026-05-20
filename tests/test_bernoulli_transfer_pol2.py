@@ -162,6 +162,52 @@ def test_missing_observations_leave_independent_prior_unchanged():
     np.testing.assert_allclose(np.asarray(pairwise), expected_pairwise, rtol=1e-6)
 
 
+def test_missing_observations_do_not_create_nan_values_or_gradients():
+    prior = jnp.asarray([0.25, 0.6, 0.4], dtype=jnp.float32)
+    design = jnp.asarray([[1.0, 0.5, 0.0], [0.0, 0.2, 1.0]], dtype=jnp.float32)
+    observed = jnp.asarray([jnp.nan, 0.9], dtype=jnp.float32)
+    finite_mask = jnp.asarray([False, True])
+    noise = jnp.asarray(0.7, dtype=jnp.float32)
+    q = jnp.asarray([0.3, 0.5, 0.8], dtype=jnp.float32)
+
+    def mean_field_objective(load_probabilities):
+        return mean_field_bernoulli_elbo(
+            load_probabilities,
+            observed,
+            prior,
+            design,
+            noise,
+            finite_mask,
+        )
+
+    elbo = mean_field_objective(q)
+    gradient = jax.grad(mean_field_objective)(q)
+
+    assert jnp.isfinite(elbo)
+    assert jnp.all(jnp.isfinite(gradient))
+
+    transfer_observed = jnp.asarray([jnp.nan, 0.8, jnp.nan], dtype=jnp.float32)
+    transfer_mask = jnp.asarray([False, True, False])
+    starts = jnp.arange(3, dtype=jnp.int32)
+    window_weights = jnp.asarray([1.0], dtype=jnp.float32)
+
+    def transfer_objective(load_prior):
+        return bernoulli_transfer_log_likelihood(
+            transfer_observed,
+            load_prior,
+            window_weights,
+            starts,
+            noise,
+            transfer_mask,
+        )
+
+    log_likelihood = transfer_objective(prior)
+    transfer_gradient = jax.jacfwd(transfer_objective)(prior)
+
+    assert jnp.isfinite(log_likelihood)
+    assert jnp.all(jnp.isfinite(transfer_gradient))
+
+
 def test_transfer_log_likelihood_matches_exact_contiguous_windows():
     prior = np.array([0.2, 0.55, 0.3, 0.75, 0.4], dtype=np.float32)
     window_weights = np.array([0.25, 1.0, 0.5], dtype=np.float32)

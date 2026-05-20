@@ -59,6 +59,7 @@ def bernoulli_transfer_log_likelihood(
         observed.shape,
     )
     finite_mask = jnp.asarray(finite_mask, dtype=bool)
+    safe_observed = jnp.where(finite_mask, observed, 0.0)
 
     window_size = window_weights.shape[0]
     n_states = 1 << window_size
@@ -110,7 +111,7 @@ def bernoulli_transfer_log_likelihood(
     (_, loglik), _ = jax.lax.scan(
         step,
         (alpha, jnp.asarray(0.0, dtype=jnp.float32)),
-        (observed, finite_mask, shifts, starts, noise_by_observation),
+        (safe_observed, finite_mask, shifts, starts, noise_by_observation),
     )
     return loglik
 
@@ -211,6 +212,7 @@ def mean_field_bernoulli_elbo(
     design_matrix = jnp.asarray(design_matrix, dtype=jnp.float32)
     noise_std = jnp.asarray(noise_std, dtype=jnp.float32)
     finite_mask = jnp.asarray(finite_mask, dtype=bool)
+    safe_observed = jnp.where(finite_mask, observed, 0.0)
 
     mean_signal = jnp.matmul(design_matrix, q, precision=MATMUL_PRECISION)
     variance_signal = jnp.matmul(
@@ -218,7 +220,7 @@ def mean_field_bernoulli_elbo(
         q * (1.0 - q),
         precision=MATMUL_PRECISION,
     )
-    residual = observed - mean_signal
+    residual = safe_observed - mean_signal
     obs_terms = -0.5 * (
         jnp.log(2.0 * jnp.pi * noise_std**2)
         + (residual * residual + variance_signal) / noise_std**2

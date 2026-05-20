@@ -1,12 +1,15 @@
 import numpy as np
 import pytest
 
+from viprodyne.core.contact_survival import ContactSurvivalStats
 from viprodyne.variational import (
+    DrivenRateMap,
     InitialStateProb,
     LoadingRate,
     ObservedIntensity,
     PolymeraseLoadings,
     PromoterState,
+    RcNode,
     TransitionRate,
     VariationalGraph,
     VariationalNode,
@@ -89,6 +92,68 @@ def test_parameter_nodes_update_from_graph_child_statistics():
     assert loading.rate == pytest.approx(np.float32(4.0))
     assert transition.shape == pytest.approx(np.float32(7.0))
     assert transition.rate == pytest.approx(np.float32(13.0))
+
+
+def test_driven_rate_map_updates_from_contact_survival_stats():
+    gamma_from = np.array([0.5, 1.0, 0.5], dtype=np.float32)
+    stats = ContactSurvivalStats(
+        expected_jumps=3.0,
+        gamma_from=gamma_from,
+        p_contact=np.ones_like(gamma_from),
+        dt=0.25,
+    )
+    driven = DrivenRateMap(
+        name="R_contact",
+        initial_rate=np.float32(1.0),
+        rate_bounds=(1e-4, 100.0),
+        prior_shape=2.0,
+        prior_rate=1.5,
+    )
+    child = StatsNode("contact_stats", {"contact_survival_stats": stats})
+    graph = VariationalGraph()
+    graph.add_node(driven)
+    graph.add_node(child)
+    graph.add_edge("R_contact", "contact_stats")
+
+    graph.run_schedule(["R_contact"])
+
+    expected_map = (3.0 + 2.0 - 1.0) / (1.5 + np.sum(gamma_from) * 0.25)
+    moments = driven.moments()
+    assert moments["mean"].dtype == np.float32
+    assert moments["expected_log"].dtype == np.float32
+    assert moments["is_driven"] is True
+    assert driven.sample().dtype == np.float32
+    assert moments["mean"] == pytest.approx(expected_map, rel=5e-4)
+
+
+def test_rc_node_emits_contact_probability_and_can_optimize_map_value():
+    time_grid = np.linspace(0.0, 3.0, 4, dtype=np.float32)
+
+    def contact_probability(times, rc):
+        return np.exp(-times / rc).astype(np.float32)
+
+    def objective(rc, context):
+        del context
+        return -float((rc - np.float32(2.0)) ** 2)
+
+    node = RcNode(
+        name="rc",
+        value=np.float32(1.0),
+        time_grid=time_grid,
+        contact_probability_fn=contact_probability,
+        bounds=(0.25, 5.0),
+        objective_fn=objective,
+    )
+    graph = VariationalGraph()
+    graph.add_node(node)
+
+    graph.run_schedule(["rc"])
+    moments = node.moments()
+
+    assert moments["mean"].dtype == np.float32
+    assert moments["p_contact"].dtype == np.float32
+    assert moments["mean"] == pytest.approx(2.0, rel=1e-4)
+    np.testing.assert_allclose(moments["p_contact"], np.exp(-time_grid / np.float32(2.0)))
 
 
 def test_promoter_state_uses_parent_rates_and_emits_sufficient_statistics():

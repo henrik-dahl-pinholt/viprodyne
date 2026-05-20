@@ -3,21 +3,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Callable, Literal
 
 import jax.numpy as jnp
 import numpy as np
+from scipy.optimize import minimize_scalar
 
 from viprodyne.core.bernoulli_transfer_pol2 import (
     bernoulli_transfer_log_likelihood,
     enumerate_binary_configurations,
     exact_bernoulli_posterior,
 )
+from viprodyne.core.contact_survival import (
+    ContactSurvivalStats,
+    optimize_contact_survival_rate_map,
+)
 from viprodyne.core.mf_pol2_finder import fit_mean_field_bernoulli
 from viprodyne.core.rate_edges import RateEdge, wrap_column_generator
 from viprodyne.core.tilted_ctmc import TiltedCTMC, TiltedCTMCSolution
 from viprodyne.variational.base import MomentDict, UpdateContext, VariationalNode
-from viprodyne.variational.distributions import DeltaNode, DirichletNode, GammaNode
+from viprodyne.variational.distributions import DirichletNode, GammaNode
 
 FLOAT_DTYPE = np.float32
 
@@ -86,6 +91,81 @@ class TransitionRate(GammaNode):
         counts = _match_parameter_shape(counts, np.asarray(self.prior_shape).shape)
         exposure = _match_parameter_shape(exposure, np.asarray(self.prior_rate).shape)
         self.set_posterior_from_sufficient_statistics(counts, exposure, rho=context.rho)
+
+
+@dataclass
+class DrivenRateMap(VariationalNode):
+    """MAP node for a contact-driven transition rate with bounded support."""
+
+    name: str
+    initial_rate: np.ndarray | float
+    rate_bounds: tuple[float, float]
+    prior_shape: float = 1.0
+    prior_rate: float = 0.0
+    pinned_value: np.ndarray | float | None = None
+    xatol: float = 1e-4
+    maxiter: int = 80
+
+    def __post_init__(self) -> None:
+        VariationalNode.__init__(self, self.name)
+        lo_rate, hi_rate = self.rate_bounds
+        if not 0 < lo_rate < hi_rate:
+            raise ValueError("rate_bounds must satisfy 0 < lower < upper.")
+        self.rate = np.asarray(self.initial_rate, dtype=FLOAT_DTYPE)
+        self.log_profile_value = np.asarray(0.0, dtype=FLOAT_DTYPE)
+        self.optimizer_info: dict[str, float | bool] = {}
+        if self.pinned_value is not None:
+            self.pin(self.pinned_value)
+
+    @property
+    def is_pinned(self) -> bool:
+        return self.pinned_value is not None
+
+    def pin(self, value) -> None:
+        value = np.asarray(value, dtype=FLOAT_DTYPE)
+        if np.any(value <= 0.0):
+            raise ValueError("pinned driven rates must be positive.")
+        self.pinned_value = value
+        self.rate = value
+
+    def unpin(self) -> None:
+        self.pinned_value = None
+
+    def update(self, context: UpdateContext) -> None:
+        if self.is_pinned:
+            return
+        stats = _collect_contact_survival_stats(context)
+        if not stats:
+            return
+        result = optimize_contact_survival_rate_map(
+            stats,
+            rate_bounds=self.rate_bounds,
+            prior_shape=self.prior_shape,
+            prior_rate=self.prior_rate,
+            xatol=self.xatol,
+            maxiter=self.maxiter,
+        )
+        self.rate = np.asarray(result["rate"], dtype=FLOAT_DTYPE)
+        self.log_profile_value = np.asarray(result["value"], dtype=FLOAT_DTYPE)
+        self.optimizer_info = result
+
+    def moments(self) -> MomentDict:
+        rate = np.asarray(self.rate, dtype=FLOAT_DTYPE)
+        return {
+            "mean": rate,
+            "expected_log": np.log(rate).astype(FLOAT_DTYPE),
+            "map_rate": rate,
+            "is_driven": True,
+        }
+
+    def entropy(self) -> float:
+        return 0.0
+
+    def elbo_contribution(self) -> float:
+        return 0.0 if self.is_pinned else float(self.log_profile_value)
+
+    def sample(self, rng: np.random.Generator | None = None, size=None):
+        return _deterministic_sample(np.asarray(self.rate, dtype=FLOAT_DTYPE), size)
 
 
 @dataclass
@@ -354,8 +434,66 @@ class PolymeraseLoadings(VariationalNode):
         self.objective_value = np.asarray(result.elbo, dtype=FLOAT_DTYPE)
 
 
-class RcNode(DeltaNode):
+@dataclass
+class RcNode(VariationalNode):
     """MAP-only node for the contact-drive hyperparameter ``rc``."""
+
+    name: str
+    value: np.ndarray | float
+    time_grid: np.ndarray
+    contact_probability_fn: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None
+    bounds: tuple[float, float] | None = None
+    objective_fn: Callable[[np.ndarray, UpdateContext], float] | None = None
+    pinned: bool = False
+    xatol: float = 1e-4
+    maxiter: int = 80
+
+    def __post_init__(self) -> None:
+        VariationalNode.__init__(self, self.name)
+        self.value = np.asarray(self.value, dtype=FLOAT_DTYPE)
+        self.time_grid = np.asarray(self.time_grid, dtype=FLOAT_DTYPE)
+        if np.any(self.value <= 0.0):
+            raise ValueError("rc must be positive.")
+
+    def update(self, context: UpdateContext) -> None:
+        if self.pinned or self.objective_fn is None or self.bounds is None:
+            return
+        lo, hi = self.bounds
+        if not 0 < lo < hi:
+            raise ValueError("bounds must satisfy 0 < lower < upper.")
+
+        def objective(rc_value):
+            return -self.objective_fn(np.asarray(rc_value, dtype=FLOAT_DTYPE), context)
+
+        result = minimize_scalar(
+            objective,
+            bounds=(lo, hi),
+            method="bounded",
+            options={"xatol": self.xatol, "maxiter": int(self.maxiter)},
+        )
+        candidates = [(lo, -objective(lo)), (hi, -objective(hi)), (result.x, -result.fun)]
+        best_value, _ = max(candidates, key=lambda item: item[1])
+        self.value = np.asarray(best_value, dtype=FLOAT_DTYPE)
+
+    def moments(self) -> MomentDict:
+        value = np.asarray(self.value, dtype=FLOAT_DTYPE)
+        moments: MomentDict = {
+            "mean": value,
+            "expected_log": np.log(value).astype(FLOAT_DTYPE),
+            "rc": value,
+        }
+        if self.contact_probability_fn is not None:
+            moments["p_contact"] = np.asarray(
+                self.contact_probability_fn(self.time_grid, value),
+                dtype=FLOAT_DTYPE,
+            )
+        return moments
+
+    def entropy(self) -> float:
+        return 0.0
+
+    def sample(self, rng: np.random.Generator | None = None, size=None):
+        return _deterministic_sample(np.asarray(self.value, dtype=FLOAT_DTYPE), size)
 
 
 def _sum_child_stat(context: UpdateContext, key: str) -> np.ndarray | None:
@@ -406,6 +544,37 @@ def _match_parameter_shape(value: np.ndarray, target_shape: tuple[int, ...]) -> 
     if target_shape == ():
         return np.asarray(np.sum(value, dtype=FLOAT_DTYPE), dtype=FLOAT_DTYPE)
     return np.broadcast_to(value, target_shape).astype(FLOAT_DTYPE)
+
+
+def _collect_contact_survival_stats(context: UpdateContext) -> list[ContactSurvivalStats]:
+    stats: list[ContactSurvivalStats] = []
+    for moments in context.child_moments().values():
+        if "contact_survival_stats" in moments:
+            value = moments["contact_survival_stats"]
+            if isinstance(value, ContactSurvivalStats):
+                stats.append(value)
+            elif isinstance(value, (list, tuple)):
+                stats.extend(value)
+        elif {"expected_jumps", "gamma_from", "p_contact", "dt"} <= moments.keys():
+            stats.append(
+                ContactSurvivalStats(
+                    expected_jumps=float(moments["expected_jumps"]),
+                    gamma_from=np.asarray(moments["gamma_from"], dtype=FLOAT_DTYPE),
+                    p_contact=np.asarray(moments["p_contact"], dtype=FLOAT_DTYPE),
+                    dt=float(moments["dt"]),
+                    log_contact_jump=float(moments.get("log_contact_jump", 0.0)),
+                )
+            )
+        elif {"gamma_jump", "gamma_from", "p_contact", "dt"} <= moments.keys():
+            stats.append(
+                ContactSurvivalStats.from_posteriors(
+                    gamma_jump=np.asarray(moments["gamma_jump"], dtype=FLOAT_DTYPE),
+                    gamma_from=np.asarray(moments["gamma_from"], dtype=FLOAT_DTYPE),
+                    p_contact=np.asarray(moments["p_contact"], dtype=FLOAT_DTYPE),
+                    dt=float(moments["dt"]),
+                )
+            )
+    return stats
 
 
 def _deterministic_sample(value: np.ndarray, size=None) -> np.ndarray:
