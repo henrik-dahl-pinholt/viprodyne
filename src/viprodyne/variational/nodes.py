@@ -19,7 +19,7 @@ from viprodyne.core.contact_survival import (
     optimize_contact_survival_rate_map,
 )
 from viprodyne.core.mf_pol2_finder import fit_mean_field_bernoulli
-from viprodyne.core.rate_edges import RateEdge, wrap_column_generator
+from viprodyne.core.rate_edges import RateEdge
 from viprodyne.core.tilted_ctmc import TiltedCTMC, TiltedCTMCSolution
 from viprodyne.variational.base import MomentDict, UpdateContext, VariationalNode
 from viprodyne.variational.distributions import DirichletNode, GammaNode
@@ -134,7 +134,7 @@ class DrivenRateMap(VariationalNode):
     def update(self, context: UpdateContext) -> None:
         if self.is_pinned:
             return
-        stats = _collect_contact_survival_stats(context)
+        stats = _collect_contact_survival_stats(context, rate_node_name=self.name)
         if not stats:
             return
         result = optimize_contact_survival_rate_map(
@@ -215,6 +215,9 @@ class PromoterState(VariationalNode):
     initial_probabilities: np.ndarray | None = None
     potentials: np.ndarray | None = None
     solution: TiltedCTMCSolution | None = field(default=None, init=False)
+    tilted_generator: np.ndarray | None = field(default=None, init=False)
+    tilt_potentials: np.ndarray | None = field(default=None, init=False)
+    drive_probabilities: dict[str, np.ndarray] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         VariationalNode.__init__(self, self.name)
@@ -233,12 +236,16 @@ class PromoterState(VariationalNode):
     def update(self, context: UpdateContext) -> None:
         parent_moments = context.parent_moments()
         initial = self._initial_probabilities_from_parents(parent_moments)
-        generator = self._generator_from_parent_rates(parent_moments)
+        generator, potentials = self._generator_and_potentials_from_parent_rates(parent_moments)
+        if self.potentials is not None:
+            potentials = _add_user_potentials(potentials, self.potentials)
+        self.tilted_generator = np.asarray(generator, dtype=FLOAT_DTYPE)
+        self.tilt_potentials = np.asarray(potentials, dtype=FLOAT_DTYPE)
         self.solution = TiltedCTMC(
             generator=generator,
             time_grid=self.time_grid,
             initial_probabilities=initial,
-            potentials=self.potentials,
+            potentials=potentials,
         ).solve()
 
     def moments(self) -> MomentDict:
@@ -253,7 +260,7 @@ class PromoterState(VariationalNode):
         posterior = np.asarray(self.solution.posterior, dtype=FLOAT_DTYPE)
         occupancy = np.asarray(self.solution.expected_occupancy(), dtype=FLOAT_DTYPE)
         jumps = np.asarray(self.solution.expected_jumps(), dtype=FLOAT_DTYPE)
-        return {
+        moments: MomentDict = {
             "posterior": posterior,
             "expected_occupancy": occupancy,
             "expected_jumps": jumps,
@@ -262,6 +269,10 @@ class PromoterState(VariationalNode):
             "initial_state_counts": posterior[:, 0],
             "log_partition": np.asarray(self.solution.log_partition, dtype=FLOAT_DTYPE),
         }
+        stats_by_rate = self._contact_survival_stats(occupancy, jumps)
+        if stats_by_rate:
+            moments["contact_survival_stats_by_rate"] = stats_by_rate
+        return moments
 
     def entropy(self) -> float:
         return 0.0
@@ -288,26 +299,100 @@ class PromoterState(VariationalNode):
                 f"initial_probability_node {self.initial_probability_node!r} is not a parent."
             ) from exc
 
-    def _generator_from_parent_rates(self, parent_moments: dict[str, MomentDict]) -> np.ndarray:
+    def _generator_and_potentials_from_parent_rates(
+        self,
+        parent_moments: dict[str, MomentDict],
+    ) -> tuple[np.ndarray, np.ndarray]:
         n_edges = self.n_states * (self.n_states - 1)
-        rate_values = []
+        n_intervals = self.time_grid.size - 1
+        edge_values = []
+        batch_shapes = []
+        self.drive_probabilities = {}
         for edge in self.rate_edges:
             try:
-                rate_values.append(np.asarray(parent_moments[edge.rate_node]["mean"], dtype=FLOAT_DTYPE))
+                moments = parent_moments[edge.rate_node]
             except KeyError as exc:
                 raise KeyError(f"rate node {edge.rate_node!r} is not a parent.") from exc
-        batch_shape = np.broadcast_shapes(*(value.shape for value in rate_values))
-        offdiag = np.zeros(batch_shape + (n_edges,), dtype=FLOAT_DTYPE)
-        for edge, value in zip(self.rate_edges, rate_values, strict=True):
-            offdiag[..., edge.transition_index] = np.broadcast_to(value, batch_shape)
+            mean = np.asarray(moments["mean"], dtype=FLOAT_DTYPE)
+            if "expected_log" in moments:
+                tilted_rate = np.exp(np.asarray(moments["expected_log"], dtype=FLOAT_DTYPE)).astype(
+                    FLOAT_DTYPE
+                )
+            else:
+                tilted_rate = np.asarray(np.clip(mean, 1e-20, None), dtype=FLOAT_DTYPE)
+            drive = None
+            if edge.drive_node is not None:
+                try:
+                    drive = _interval_drive_probability(
+                        parent_moments[edge.drive_node],
+                        n_intervals,
+                    )
+                except KeyError as exc:
+                    raise KeyError(f"drive node {edge.drive_node!r} is not a parent.") from exc
+                batch_shapes.append(drive.shape[:-1])
+            batch_shapes.extend([mean.shape, tilted_rate.shape])
+            edge_values.append((edge, mean, tilted_rate, drive))
+        batch_shape = np.broadcast_shapes(*batch_shapes)
+        offdiag = np.zeros(batch_shape + (n_intervals, n_edges), dtype=FLOAT_DTYPE)
+        potentials = np.zeros(batch_shape + (n_intervals, self.n_states), dtype=FLOAT_DTYPE)
+        dt = np.broadcast_to(
+            np.diff(self.time_grid).astype(FLOAT_DTYPE),
+            batch_shape + (n_intervals,),
+        )
+        for edge, mean, tilted_rate, drive in edge_values:
+            mean_interval = _broadcast_parameter_over_intervals(mean, batch_shape, n_intervals)
+            tilted_interval = _broadcast_parameter_over_intervals(
+                tilted_rate,
+                batch_shape,
+                n_intervals,
+            )
+            if drive is None:
+                q_rate = tilted_interval
+                effective_exit = mean_interval
+            else:
+                drive_interval = np.broadcast_to(drive, batch_shape + (n_intervals,)).astype(
+                    FLOAT_DTYPE
+                )
+                q_rate = drive_interval * tilted_interval
+                effective_exit = _contact_survival_effective_rate(
+                    mean_interval,
+                    drive_interval,
+                    dt,
+                )
+                self.drive_probabilities[edge.rate_node] = drive_interval.reshape(
+                    (-1, n_intervals)
+                )
+            offdiag[..., :, edge.transition_index] = q_rate
+            potentials[..., :, edge.from_state] += q_rate - effective_exit
+        generator = _wrap_interval_generators(offdiag, self.rate_edges, self.n_states)
         if batch_shape == ():
-            return wrap_column_generator(offdiag, self.n_states)
-        flat = offdiag.reshape((-1, n_edges))
-        generators = np.stack(
-            [wrap_column_generator(row, self.n_states) for row in flat],
-            axis=0,
-        ).reshape(batch_shape + (self.n_states, self.n_states))
-        return generators.reshape((-1, 1, self.n_states, self.n_states))
+            return generator, potentials
+        return (
+            generator.reshape((-1, n_intervals, self.n_states, self.n_states)),
+            potentials.reshape((-1, n_intervals, self.n_states)),
+        )
+
+    def _contact_survival_stats(
+        self,
+        occupancy: np.ndarray,
+        jumps: np.ndarray,
+    ) -> dict[str, ContactSurvivalStats]:
+        if not self.drive_probabilities:
+            return {}
+        dt = _constant_interval_duration(self.time_grid)
+        stats: dict[str, ContactSurvivalStats] = {}
+        for edge in self.rate_edges:
+            if edge.rate_node not in self.drive_probabilities:
+                continue
+            p_contact = self.drive_probabilities[edge.rate_node]
+            p_contact = np.broadcast_to(p_contact, occupancy.shape[:2]).astype(FLOAT_DTYPE)
+            stats[edge.rate_node] = ContactSurvivalStats.from_posteriors(
+                gamma_jump=jumps[..., edge.to_state, edge.from_state] / dt,
+                gamma_from=occupancy[..., edge.from_state] / dt,
+                p_contact=p_contact,
+                dt=dt,
+            )
+        return stats
 
 
 @dataclass
@@ -533,6 +618,78 @@ class RcNode(VariationalNode):
         return _deterministic_sample(np.asarray(self.value, dtype=FLOAT_DTYPE), size)
 
 
+def _interval_drive_probability(moments: MomentDict, n_intervals: int) -> np.ndarray:
+    for key in ("p_contact", "drive_probability", "probability"):
+        if key in moments:
+            values = np.asarray(moments[key], dtype=FLOAT_DTYPE)
+            break
+    else:
+        raise KeyError("drive moments must include p_contact, drive_probability, or probability.")
+    if values.ndim == 0:
+        return np.full((n_intervals,), values, dtype=FLOAT_DTYPE)
+    if values.shape[-1] == n_intervals + 1:
+        values = values[..., 1:]
+    elif values.shape[-1] != n_intervals:
+        raise ValueError("drive probability last axis must match intervals or grid points.")
+    return np.clip(values, 0.0, 1.0).astype(FLOAT_DTYPE)
+
+
+def _broadcast_parameter_over_intervals(
+    value: np.ndarray,
+    batch_shape: tuple[int, ...],
+    n_intervals: int,
+) -> np.ndarray:
+    value = np.asarray(value, dtype=FLOAT_DTYPE)
+    return np.broadcast_to(value[..., None], batch_shape + (n_intervals,)).astype(FLOAT_DTYPE)
+
+
+def _contact_survival_effective_rate(
+    rate: np.ndarray,
+    p_contact: np.ndarray,
+    dt: np.ndarray,
+) -> np.ndarray:
+    rate = np.asarray(rate, dtype=FLOAT_DTYPE)
+    p_contact = np.clip(np.asarray(p_contact, dtype=FLOAT_DTYPE), 0.0, 1.0)
+    dt = np.asarray(dt, dtype=FLOAT_DTYPE)
+    log_survival = np.where(
+        p_contact >= 1.0,
+        -rate * dt,
+        np.log1p(-p_contact * (-np.expm1(-rate * dt))),
+    )
+    return (-log_survival / dt).astype(FLOAT_DTYPE)
+
+
+def _wrap_interval_generators(
+    offdiag: np.ndarray,
+    rate_edges: tuple[RateEdge, ...],
+    n_states: int,
+) -> np.ndarray:
+    generator = np.zeros(offdiag.shape[:-1] + (n_states, n_states), dtype=FLOAT_DTYPE)
+    for edge in rate_edges:
+        generator[..., edge.to_state, edge.from_state] = offdiag[..., edge.transition_index]
+    exit_rates = np.sum(generator, axis=-2, dtype=FLOAT_DTYPE)
+    for state in range(n_states):
+        generator[..., state, state] = -exit_rates[..., state]
+    return generator
+
+
+def _add_user_potentials(base: np.ndarray, user_potentials: np.ndarray) -> np.ndarray:
+    base = np.asarray(base, dtype=FLOAT_DTYPE)
+    user = np.asarray(user_potentials, dtype=FLOAT_DTYPE)
+    if base.ndim == 2:
+        return (base + np.broadcast_to(user, base.shape)).astype(FLOAT_DTYPE)
+    if user.ndim == 2:
+        user = user[None, :, :]
+    return (base + np.broadcast_to(user, base.shape)).astype(FLOAT_DTYPE)
+
+
+def _constant_interval_duration(time_grid: np.ndarray) -> float:
+    dt = np.diff(np.asarray(time_grid, dtype=FLOAT_DTYPE))
+    if not np.allclose(dt, dt[0], rtol=1e-6, atol=1e-7):
+        raise ValueError("contact-survival rate updates currently require a uniform time grid.")
+    return float(dt[0])
+
+
 def _sum_child_stat(context: UpdateContext, key: str) -> np.ndarray | None:
     values = [
         np.asarray(moments[key], dtype=FLOAT_DTYPE)
@@ -583,9 +740,20 @@ def _match_parameter_shape(value: np.ndarray, target_shape: tuple[int, ...]) -> 
     return np.broadcast_to(value, target_shape).astype(FLOAT_DTYPE)
 
 
-def _collect_contact_survival_stats(context: UpdateContext) -> list[ContactSurvivalStats]:
+def _collect_contact_survival_stats(
+    context: UpdateContext,
+    rate_node_name: str | None = None,
+) -> list[ContactSurvivalStats]:
     stats: list[ContactSurvivalStats] = []
     for moments in context.child_moments().values():
+        if rate_node_name is not None and "contact_survival_stats_by_rate" in moments:
+            keyed = moments["contact_survival_stats_by_rate"]
+            if isinstance(keyed, dict) and rate_node_name in keyed:
+                value = keyed[rate_node_name]
+                if isinstance(value, ContactSurvivalStats):
+                    stats.append(value)
+                elif isinstance(value, (list, tuple)):
+                    stats.extend(value)
         if "contact_survival_stats" in moments:
             value = moments["contact_survival_stats"]
             if isinstance(value, ContactSurvivalStats):

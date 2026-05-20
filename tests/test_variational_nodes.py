@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from viprodyne.core.contact_survival import ContactSurvivalStats
+from viprodyne.core.rate_edges import RateEdge
 from viprodyne.variational import (
     DrivenRateMap,
     InitialStateProb,
@@ -131,6 +132,38 @@ def test_driven_rate_map_updates_from_contact_survival_stats():
     assert moments["mean"] == pytest.approx(expected_map, rel=5e-4)
 
 
+def test_driven_rate_map_reads_contact_survival_stats_keyed_by_rate_name():
+    stats = ContactSurvivalStats(
+        expected_jumps=3.0,
+        gamma_from=np.array([0.5, 1.0, 0.5], dtype=np.float32),
+        p_contact=np.ones(3, dtype=np.float32),
+        dt=0.25,
+    )
+    driven = DrivenRateMap(
+        name="R_contact",
+        initial_rate=np.float32(1.0),
+        rate_bounds=(1e-4, 100.0),
+        prior_shape=2.0,
+        prior_rate=1.5,
+    )
+    child = StatsNode("contact_stats", {"contact_survival_stats_by_rate": {"other": stats}})
+    graph = VariationalGraph()
+    graph.add_node(driven)
+    graph.add_node(child)
+    graph.add_edge("R_contact", "contact_stats")
+
+    graph.run_schedule(["R_contact"])
+
+    assert driven.moments()["mean"] == pytest.approx(1.0)
+
+    child.stats = {"contact_survival_stats_by_rate": {"R_contact": stats}}
+    graph.moments.publish("contact_stats", child.moments())
+    graph.run_schedule(["R_contact"])
+
+    expected_map = (3.0 + 2.0 - 1.0) / (1.5 + np.sum(stats.gamma_from) * 0.25)
+    assert driven.moments()["mean"] == pytest.approx(expected_map, rel=5e-4)
+
+
 def test_rc_node_emits_contact_probability_and_can_optimize_map_value():
     time_grid = np.linspace(0.0, 3.0, 4, dtype=np.float32)
 
@@ -211,6 +244,129 @@ def test_promoter_state_uses_parent_rates_and_emits_sufficient_statistics():
     assert moments["posterior"][0, -1, 1] == pytest.approx(expected_on, rel=3e-6)
     assert moments["transition_counts"].shape == (1, 2, 2)
     assert moments["transition_exposure"].shape == (1, 2)
+
+
+def test_promoter_state_uses_expected_log_rates_and_exit_potentials():
+    graph = VariationalGraph()
+    pi = InitialStateProb(
+        name="pi",
+        prior_concentration=np.ones(2, dtype=np.float32),
+        pinned_value=np.array([1.0, 0.0], dtype=np.float32),
+    )
+    kon = TransitionRate(
+        name="kon",
+        prior_shape=2.0,
+        prior_rate=4.0,
+        n_states=2,
+        to_state=1,
+        from_state=0,
+    )
+    koff = TransitionRate(
+        name="koff",
+        prior_shape=1.0,
+        prior_rate=1.0,
+        pinned_value=np.float32(0.2),
+        n_states=2,
+        to_state=0,
+        from_state=1,
+    )
+    promoter = PromoterState(
+        name="s",
+        time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+        n_states=2,
+        rate_edges=(kon.edge, koff.edge),
+        initial_probability_node="pi",
+    )
+    for node in [pi, kon, koff, promoter]:
+        graph.add_node(node)
+    graph.add_edge("pi", "s")
+    graph.add_edge("kon", "s")
+    graph.add_edge("koff", "s")
+
+    graph.run_schedule(["s"])
+
+    kon_tilde = np.exp(graph.moments.get("kon")["expected_log"])
+    kon_mean = graph.moments.get("kon")["mean"]
+    generator = promoter.tilted_generator
+    potentials = promoter.tilt_potentials
+    assert generator.dtype == np.float32
+    assert potentials.dtype == np.float32
+    np.testing.assert_allclose(generator[:, 1, 0], kon_tilde, rtol=2e-6)
+    np.testing.assert_allclose(generator[:, 0, 1], 0.2, rtol=2e-6)
+    np.testing.assert_allclose(np.sum(generator, axis=-2), np.zeros((2, 2)), atol=2e-7)
+    np.testing.assert_allclose(potentials[:, 0], kon_tilde - kon_mean, rtol=2e-6)
+    np.testing.assert_allclose(potentials[:, 1], 0.0, atol=2e-7)
+
+
+def test_promoter_state_applies_contact_drive_and_emits_survival_stats():
+    graph = VariationalGraph()
+    pi = InitialStateProb(
+        name="pi",
+        prior_concentration=np.ones(2, dtype=np.float32),
+        pinned_value=np.array([1.0, 0.0], dtype=np.float32),
+    )
+    kon = DrivenRateMap(
+        name="kon_contact",
+        initial_rate=np.float32(0.8),
+        rate_bounds=(1e-4, 10.0),
+        pinned_value=np.float32(0.8),
+    )
+    koff = TransitionRate(
+        name="koff",
+        prior_shape=1.0,
+        prior_rate=1.0,
+        pinned_value=np.float32(0.2),
+        n_states=2,
+        to_state=0,
+        from_state=1,
+    )
+    drive = StatsNode("rc", {"p_contact": np.array([0.25, 0.75], dtype=np.float32)})
+    promoter = PromoterState(
+        name="s",
+        time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+        n_states=2,
+        rate_edges=(
+            RateEdge(
+                n_states=2,
+                to_state=1,
+                from_state=0,
+                rate_node="kon_contact",
+                drive_node="rc",
+            ),
+            koff.edge,
+        ),
+        initial_probability_node="pi",
+    )
+    for node in [pi, kon, koff, drive, promoter]:
+        graph.add_node(node)
+    graph.add_edge("pi", "s")
+    graph.add_edge("kon_contact", "s")
+    graph.add_edge("koff", "s")
+    graph.add_edge("rc", "s")
+
+    graph.run_schedule(["s"])
+
+    p_contact = np.array([0.25, 0.75], dtype=np.float32)
+    dt = np.float32(0.5)
+    q_rate = p_contact * np.float32(0.8)
+    effective_rate = -np.log1p(-p_contact * (-np.expm1(-np.float32(0.8) * dt))) / dt
+    np.testing.assert_allclose(promoter.tilted_generator[:, 1, 0], q_rate, rtol=2e-6)
+    np.testing.assert_allclose(
+        promoter.tilt_potentials[:, 0],
+        q_rate - effective_rate,
+        rtol=2e-6,
+        atol=2e-7,
+    )
+    np.testing.assert_allclose(
+        np.sum(promoter.tilted_generator, axis=-2),
+        np.zeros((2, 2), dtype=np.float32),
+        atol=2e-7,
+    )
+    stats = graph.moments.get("s")["contact_survival_stats_by_rate"]["kon_contact"]
+    assert stats.p_contact.dtype == np.float32
+    assert stats.p_contact.shape == (1, 2)
+    np.testing.assert_allclose(stats.p_contact[0], p_contact)
+    assert np.isfinite(stats.expected_jumps)
 
 
 def test_polymerase_loadings_exact_and_mean_field_match_independent_theory():
