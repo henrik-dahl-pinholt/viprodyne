@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from scipy.optimize import minimize
 
-from viprodyne.core.bernoulli_transfer_pol2 import mean_field_bernoulli_elbo_jax
+from viprodyne.core.bernoulli_transfer_pol2 import mean_field_bernoulli_elbo
 
 
 @dataclass(frozen=True)
@@ -25,36 +25,8 @@ class MeanFieldBernoulliResult:
     n_iterations: int
 
 
-def mean_field_bernoulli_elbo_and_gradient(
-    logits: np.ndarray,
-    observed: np.ndarray,
-    prior_probabilities: np.ndarray,
-    design_matrix: np.ndarray,
-    noise_std: float,
-    mask: np.ndarray | None = None,
-) -> tuple[float, np.ndarray]:
-    """Return JAX-computed ELBO and gradient with respect to Bernoulli logits."""
-    logits, observed, prior, design_matrix, finite_mask = _prepare_inputs(
-        logits,
-        observed,
-        prior_probabilities,
-        design_matrix,
-        noise_std,
-        mask,
-    )
-    elbo, gradient = mean_field_bernoulli_elbo_and_gradient_jax(
-        jnp.asarray(logits),
-        jnp.asarray(observed),
-        jnp.asarray(prior),
-        jnp.asarray(design_matrix),
-        jnp.asarray(float(noise_std)),
-        jnp.asarray(finite_mask),
-    )
-    return float(elbo), np.asarray(gradient, dtype=float)
-
-
 @jax.jit
-def mean_field_bernoulli_elbo_from_logits_jax(
+def mean_field_bernoulli_elbo_from_logits(
     logits: jnp.ndarray,
     observed: jnp.ndarray,
     prior_probabilities: jnp.ndarray,
@@ -63,7 +35,7 @@ def mean_field_bernoulli_elbo_from_logits_jax(
     finite_mask: jnp.ndarray,
 ) -> jnp.ndarray:
     """JAX mean-field Bernoulli ELBO parameterized by logits."""
-    return mean_field_bernoulli_elbo_jax(
+    return mean_field_bernoulli_elbo(
         jax.nn.sigmoid(logits),
         observed,
         prior_probabilities,
@@ -73,8 +45,8 @@ def mean_field_bernoulli_elbo_from_logits_jax(
     )
 
 
-mean_field_bernoulli_elbo_and_gradient_jax = jax.jit(
-    jax.value_and_grad(mean_field_bernoulli_elbo_from_logits_jax)
+mean_field_bernoulli_elbo_and_gradient = jax.jit(
+    jax.value_and_grad(mean_field_bernoulli_elbo_from_logits)
 )
 
 
@@ -113,15 +85,18 @@ def fit_mean_field_bernoulli(
         )
 
     def objective(x: np.ndarray) -> tuple[float, np.ndarray]:
-        elbo, gradient = mean_field_bernoulli_elbo_and_gradient(
-            x,
-            observed,
-            prior_probabilities,
-            design_matrix,
-            noise_std,
-            mask,
+        _, observed_arr, prior, design_arr, finite_mask_arr = _prepare_inputs(
+            x, observed, prior_probabilities, design_matrix, noise_std, mask
         )
-        return -elbo, -gradient
+        elbo, gradient = mean_field_bernoulli_elbo_and_gradient(
+            jnp.asarray(x, dtype=jnp.float32),
+            jnp.asarray(observed_arr),
+            jnp.asarray(prior),
+            jnp.asarray(design_arr),
+            jnp.asarray(float(noise_std), dtype=jnp.float32),
+            jnp.asarray(finite_mask_arr),
+        )
+        return -float(elbo), -np.asarray(gradient, dtype=np.float32)
 
     result = minimize(
         objective,
@@ -132,29 +107,32 @@ def fit_mean_field_bernoulli(
     )
     logits = np.asarray(result.x, dtype=np.float32)
     load_probabilities = np.asarray(jax.nn.sigmoid(jnp.asarray(logits)), dtype=float)
+    _, observed_arr, prior, design_arr, finite_mask_arr = _prepare_inputs(
+        logits, observed, prior_probabilities, design_matrix, noise_std, mask
+    )
     elbo, _ = mean_field_bernoulli_elbo_and_gradient(
-        logits,
-        observed,
-        prior_probabilities,
-        design_matrix,
-        noise_std,
-        mask,
+        jnp.asarray(logits),
+        jnp.asarray(observed_arr),
+        jnp.asarray(prior),
+        jnp.asarray(design_arr),
+        jnp.asarray(float(noise_std), dtype=jnp.float32),
+        jnp.asarray(finite_mask_arr),
     )
     success = bool(result.success)
     if not success:
         _, final_gradient = mean_field_bernoulli_elbo_and_gradient(
-            logits,
-            observed,
-            prior_probabilities,
-            design_matrix,
-            noise_std,
-            mask,
+            jnp.asarray(logits),
+            jnp.asarray(observed_arr),
+            jnp.asarray(prior),
+            jnp.asarray(design_arr),
+            jnp.asarray(float(noise_std), dtype=jnp.float32),
+            jnp.asarray(finite_mask_arr),
         )
-        success = bool(np.linalg.norm(final_gradient, ord=np.inf) <= 10.0 * gtol)
+        success = bool(np.linalg.norm(np.asarray(final_gradient), ord=np.inf) <= 10.0 * gtol)
     return MeanFieldBernoulliResult(
         load_probabilities=load_probabilities.astype(np.float32),
         logits=logits.astype(np.float32),
-        elbo=elbo,
+        elbo=float(elbo),
         predicted_signal=(
             np.asarray(design_matrix, dtype=np.float32) @ load_probabilities.astype(np.float32)
         ),
@@ -199,5 +177,5 @@ def _prepare_inputs(
 
 
 def _logit(probabilities: np.ndarray) -> np.ndarray:
-    probabilities = np.asarray(probabilities, dtype=float)
+    probabilities = np.asarray(probabilities, dtype=np.float32)
     return np.log(probabilities) - np.log1p(-probabilities)
