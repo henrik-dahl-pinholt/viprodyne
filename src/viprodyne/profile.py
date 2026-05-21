@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+import warnings
 
 import numpy as np
 
@@ -93,6 +94,20 @@ def profile_contact_threshold(
             )
             for dataset in datasets
         }
+        contact_mass = sum(
+            float(np.sum(np.asarray(drive.probability, dtype=FLOAT_DTYPE)))
+            for drive in contact_drive.values()
+            if drive.probability is not None
+        )
+        if contact_mass <= 0.0:
+            warnings.warn(
+                "contact threshold candidate "
+                f"{float(candidate):.6g} produced zero contact probability across "
+                "all datasets; driven transitions are disabled and driven rates are "
+                "unidentifiable for this candidate.",
+                UserWarning,
+                stacklevel=2,
+            )
         model = ViprodyneModel(datasets, config, contact_drive=contact_drive)
         fit = model.run_inference(config=fit_config)
         if fit.cavi is None or fit.cavi.elbo is None:

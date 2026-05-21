@@ -66,13 +66,14 @@ def test_profile_contact_threshold_allows_candidates_with_no_contact():
         driven_transition_indices=(1,),
     )
 
-    profile = profile_contact_threshold(
-        datasets=(dataset,),
-        config=config,
-        contact_scores=np.array([0.2, 0.6], dtype=np.float32),
-        candidate_values=np.array([0.1, 0.5], dtype=np.float32),
-        fit_config=CAVIConfig(max_iterations=1, min_iterations=1),
-    )
+    with pytest.warns(UserWarning, match="zero contact probability"):
+        profile = profile_contact_threshold(
+            datasets=(dataset,),
+            config=config,
+            contact_scores=np.array([0.2, 0.6], dtype=np.float32),
+            candidate_values=np.array([0.1, 0.5], dtype=np.float32),
+            fit_config=CAVIConfig(max_iterations=1, min_iterations=1),
+        )
 
     assert len(profile.fits) == 2
     assert np.all(np.isfinite(profile.elbos))
