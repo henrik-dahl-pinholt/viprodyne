@@ -109,6 +109,75 @@ def test_profile_contact_threshold_uses_dataset_score_mapping():
     assert profile.best_fit.datasets["toy"].state_posterior.shape == (1, 3, 2)
 
 
+def test_profile_contact_threshold_accepts_probability_function():
+    dataset = MS2Dataset(
+        name="toy",
+        observed=np.array([[0.1, 0.4]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+    )
+    config = ModelConfig(
+        n_states=2,
+        pol2_mode="transfer",
+        t_rise=np.float32(0.5),
+        t_plateau=np.float32(0.0),
+        driven_transition_indices=(1,),
+    )
+
+    def contact_from_rc(rc):
+        return np.array([rc, np.float32(1.0) - rc], dtype=np.float32)
+
+    profile = profile_contact_threshold(
+        datasets=(dataset,),
+        config=config,
+        contact_scores=contact_from_rc,
+        candidate_values=np.array([0.25, 0.75], dtype=np.float32),
+        fit_config=CAVIConfig(max_iterations=1, min_iterations=1),
+    )
+
+    assert len(profile.fits) == 2
+    np.testing.assert_allclose(
+        profile.fits[0].datasets["toy"].contact_probability,
+        np.array([0.25, 0.75], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        profile.fits[1].datasets["toy"].contact_probability,
+        np.array([0.75, 0.25], dtype=np.float32),
+    )
+
+
+def test_profile_contact_threshold_accepts_time_grid_probability_function_mapping():
+    dataset = MS2Dataset(
+        name="toy",
+        observed=np.array([[0.1, 0.4]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+    )
+    config = ModelConfig(
+        n_states=2,
+        pol2_mode="transfer",
+        t_rise=np.float32(0.5),
+        t_plateau=np.float32(0.0),
+        driven_transition_indices=(1,),
+    )
+
+    def contact_from_grid(time_grid, rc):
+        return np.where(time_grid[1:] <= rc, np.float32(1.0), np.float32(0.0))
+
+    profile = profile_contact_threshold(
+        datasets=(dataset,),
+        config=config,
+        contact_scores={"toy": contact_from_grid},
+        candidate_values=np.array([0.5], dtype=np.float32),
+        fit_config=CAVIConfig(max_iterations=1, min_iterations=1),
+    )
+
+    np.testing.assert_allclose(
+        profile.best_fit.datasets["toy"].contact_probability,
+        np.array([1.0, 0.0], dtype=np.float32),
+    )
+
+
 def test_profile_contact_threshold_accepts_sampling_times_without_time_grid():
     dataset = MS2Dataset(
         name="toy",

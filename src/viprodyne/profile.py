@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 import warnings
 
@@ -16,6 +16,8 @@ from viprodyne.model import (
     ModelInferenceResult,
     ViprodyneModel,
     _assign_dataset_names,
+    _interval_contact_probability,
+    _validate_time_grid,
 )
 
 FLOAT_DTYPE = np.float32
@@ -48,7 +50,7 @@ class ContactThresholdProfileResult:
 def profile_contact_threshold(
     datasets: tuple[MS2Dataset, ...],
     config: ModelConfig,
-    contact_scores: Mapping[str, np.ndarray] | np.ndarray,
+    contact_scores: Mapping[str, np.ndarray | Callable] | np.ndarray | Callable,
     candidate_values: np.ndarray,
     *,
     fit_config: CAVIConfig | None = None,
@@ -60,6 +62,9 @@ def profile_contact_threshold(
 
     This supports workflows where an external score `z(t)` is converted into a
     contact probability by thresholding, for example `p_contact(t) = z(t) < rc`.
+    `contact_scores` may also be a function `fn(rc)` or `fn(time_grid, rc)`
+    returning contact probabilities directly; mappings can provide arrays or
+    functions per dataset.
     Each candidate produces a fresh `ViprodyneModel` with a model-level fixed
     `ContactDrive`; the input datasets are not modified.
     """
@@ -86,9 +91,11 @@ def profile_contact_threshold(
             )
         contact_drive = {
             dataset.name: ContactDrive.fixed(
-                _threshold_contact_score(
-                    _contact_score_for_dataset(contact_scores, dataset.name),
-                    candidate,
+                _profile_contact_probability(
+                    contact_scores,
+                    dataset=dataset,
+                    config=config,
+                    candidate=candidate,
                     less_than=less_than,
                 )
             )
@@ -122,18 +129,55 @@ def profile_contact_threshold(
     )
 
 
-def _contact_score_for_dataset(
-    contact_scores: Mapping[str, np.ndarray] | np.ndarray,
-    dataset_name: str,
+def _profile_contact_probability(
+    contact_scores: Mapping[str, np.ndarray | Callable] | np.ndarray | Callable,
+    *,
+    dataset: MS2Dataset,
+    config: ModelConfig,
+    candidate: np.ndarray,
+    less_than: bool,
 ) -> np.ndarray:
+    source = _contact_source_for_dataset(contact_scores, dataset.name)
+    if callable(source):
+        time_grid = _profile_time_grid(dataset, config)
+        try:
+            values = source(time_grid, candidate)
+        except TypeError as first_error:
+            try:
+                values = source(candidate)
+            except TypeError:
+                raise first_error
+        return _interval_contact_probability(
+            np.asarray(values, dtype=FLOAT_DTYPE),
+            n_intervals=time_grid.size - 1,
+        )
+    return _threshold_contact_score(
+        np.asarray(source, dtype=FLOAT_DTYPE),
+        candidate,
+        less_than=less_than,
+    )
+
+
+def _contact_source_for_dataset(
+    contact_scores: Mapping[str, np.ndarray | Callable] | np.ndarray | Callable,
+    dataset_name: str,
+) -> np.ndarray | Callable:
     if isinstance(contact_scores, Mapping):
         try:
-            return np.asarray(contact_scores[dataset_name], dtype=FLOAT_DTYPE)
+            return contact_scores[dataset_name]
         except KeyError as exc:
             raise KeyError(
                 f"missing contact score for dataset {dataset_name!r}."
             ) from exc
-    return np.asarray(contact_scores, dtype=FLOAT_DTYPE)
+    return contact_scores
+
+
+def _profile_time_grid(dataset: MS2Dataset, config: ModelConfig) -> np.ndarray:
+    if dataset.time_grid is not None:
+        return _validate_time_grid(dataset.time_grid, f"{dataset.name}.time_grid")
+    if config.time_grid is not None:
+        return _validate_time_grid(config.time_grid, "time_grid")
+    raise ValueError("each dataset needs time_grid, or ModelConfig.time_grid must be set.")
 
 
 def _threshold_contact_score(

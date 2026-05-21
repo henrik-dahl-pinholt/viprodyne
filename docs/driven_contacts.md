@@ -74,4 +74,15 @@ If `rc_candidate_values` is omitted, the model derives a threshold grid from
 the finite score values inside `rc_bounds`.
 
 For a full outer profile, use `profile_contact_threshold`. It fits one model
-per candidate threshold and returns the ELBO profile.
+per candidate threshold and returns the ELBO profile. The same helper also
+accepts `contact_scores` as a function `fn(rc)` or `fn(time_grid, rc)` when the
+candidate value should produce contact probabilities directly:
+
+```python
+profile = profile_contact_threshold(
+    datasets=(dataset,),
+    config=config,
+    contact_scores=p_contact_from_rc,
+    candidate_values=np.array([0.25, 0.5, 0.75], dtype=np.float32),
+)
+```
