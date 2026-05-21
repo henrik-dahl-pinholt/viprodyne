@@ -8,7 +8,12 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 from viprodyne.fit import CAVIConfig
-from viprodyne.model import MS2Dataset, ModelConfig, ModelInferenceResult, ViprodyneModel
+from viprodyne.model import (
+    MS2Dataset,
+    ModelConfig,
+    ModelInferenceResult,
+    ViprodyneModel,
+)
 
 FLOAT_DTYPE = np.float32
 
@@ -45,6 +50,8 @@ def profile_contact_threshold(
     *,
     fit_config: CAVIConfig | None = None,
     less_than: bool = True,
+    verbose: bool = False,
+    **kwargs,
 ) -> ContactThresholdProfileResult:
     """Fit one model per contact-threshold candidate.
 
@@ -57,14 +64,22 @@ def profile_contact_threshold(
     if candidate_values.ndim != 1 or candidate_values.size == 0:
         raise ValueError("candidate_values must be a non-empty one-dimensional array.")
     if not config.driven_transition_indices:
-        raise ValueError("config.driven_transition_indices must be set for contact profiling.")
-    fit_config = CAVIConfig(compute_elbo=True) if fit_config is None else fit_config
+        raise ValueError(
+            "config.driven_transition_indices must be set for contact profiling."
+        )
+    fit_config = (
+        CAVIConfig(compute_elbo=True, **kwargs) if fit_config is None else fit_config
+    )
     if not fit_config.compute_elbo:
         fit_config = replace(fit_config, compute_elbo=True)
 
     fits: list[ModelInferenceResult] = []
     elbos: list[np.float32] = []
     for candidate in candidate_values:
+        if verbose:
+            print(
+                f"Profiling contact threshold candidate {candidate}...({fits.__len__() + 1}/{candidate_values.size})"
+            )
         profiled_datasets = tuple(
             replace(
                 dataset,
@@ -99,7 +114,9 @@ def _contact_score_for_dataset(
         try:
             return np.asarray(contact_scores[dataset_name], dtype=FLOAT_DTYPE)
         except KeyError as exc:
-            raise KeyError(f"missing contact score for dataset {dataset_name!r}.") from exc
+            raise KeyError(
+                f"missing contact score for dataset {dataset_name!r}."
+            ) from exc
     return np.asarray(contact_scores, dtype=FLOAT_DTYPE)
 
 

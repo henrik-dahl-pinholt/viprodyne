@@ -79,7 +79,9 @@ class CAVIResult:
 def run_cavi(model: CAVIModel, config: CAVIConfig | None = None) -> CAVIResult:
     """Run CAVI and compute ELBO only after the final sweep."""
     config = CAVIConfig() if config is None else config
-    schedule = tuple(config.schedule) if config.schedule is not None else model.cavi_schedule()
+    schedule = (
+        tuple(config.schedule) if config.schedule is not None else model.cavi_schedule()
+    )
     parameter_nodes = (
         tuple(config.parameter_nodes)
         if config.parameter_nodes is not None
@@ -97,6 +99,7 @@ def run_cavi(model: CAVIModel, config: CAVIConfig | None = None) -> CAVIResult:
             current,
             absolute_tolerance=config.absolute_tolerance,
         )
+        print(max_change)
         converged = bool(
             iteration >= config.min_iterations
             and float(max_change) <= float(config.tolerance)
@@ -123,7 +126,9 @@ def run_cavi(model: CAVIModel, config: CAVIConfig | None = None) -> CAVIResult:
     )
 
 
-def _parameter_snapshot(graph, parameter_nodes: tuple[str, ...]) -> dict[str, np.ndarray]:
+def _parameter_snapshot(
+    graph, parameter_nodes: tuple[str, ...]
+) -> dict[str, np.ndarray]:
     snapshot: dict[str, np.ndarray] = {}
     for node_name in parameter_nodes:
         node = graph.nodes[node_name]
@@ -138,7 +143,9 @@ def _parameter_snapshot(graph, parameter_nodes: tuple[str, ...]) -> dict[str, np
             if "mean" in moments:
                 parts.append(np.ravel(np.asarray(moments["mean"], dtype=FLOAT_DTYPE)))
         snapshot[node_name] = (
-            np.concatenate(parts).astype(FLOAT_DTYPE) if parts else np.empty(0, dtype=FLOAT_DTYPE)
+            np.concatenate(parts).astype(FLOAT_DTYPE)
+            if parts
+            else np.empty(0, dtype=FLOAT_DTYPE)
         )
     return snapshot
 

@@ -35,7 +35,9 @@ class ThermodynamicIntegrationResult:
 
 
 @jax.jit
-def setup_sampler(time_grid: jax.Array, rate_values: jax.Array) -> tuple[jax.Array, jax.Array]:
+def setup_sampler(
+    time_grid: jax.Array, rate_values: jax.Array
+) -> tuple[jax.Array, jax.Array]:
     """Precompute inverse-CDF tables and integrated loading rates."""
     time_grid = jnp.asarray(time_grid, dtype=FLOAT_DTYPE)
     rates = jnp.clip(jnp.asarray(rate_values, dtype=FLOAT_DTYPE), 0.0, None)
@@ -88,7 +90,9 @@ def support_indices(
 
 
 @jax.jit
-def ms2_kernel(age: jax.Array, rise_time: jax.Array, support_time: jax.Array) -> jax.Array:
+def ms2_kernel(
+    age: jax.Array, rise_time: jax.Array, support_time: jax.Array
+) -> jax.Array:
     """Piecewise-linear MS2 kernel: linear rise followed by a plateau."""
     age = jnp.asarray(age, dtype=FLOAT_DTYPE)
     rise_time = jnp.asarray(rise_time, dtype=FLOAT_DTYPE)
@@ -184,7 +188,9 @@ def papangelou(
 def _sample_death_indices(key: jax.Array, count_grid: jax.Array) -> jax.Array:
     count_sums = jnp.sum(count_grid, axis=1)
     uniform = jnp.full_like(count_grid, 1.0 / count_grid.shape[1])
-    probabilities = jnp.where(count_sums[:, None] > 0.0, count_grid / count_sums[:, None], uniform)
+    probabilities = jnp.where(
+        count_sums[:, None] > 0.0, count_grid / count_sums[:, None], uniform
+    )
     keys = jax.random.split(key, probabilities.shape[0])
     return _choice_per_track(keys, probabilities.shape[1], probabilities)
 
@@ -224,10 +230,16 @@ def _birth_move(
         offsets,
     )
     n_particles = jnp.sum(count_grid, axis=1)
-    proposal_density = rates / jnp.maximum(integrated_rates, jnp.finfo(FLOAT_DTYPE).tiny)
-    alphas = jnp.minimum(1.0, papangelou_values / (n_particles + 1.0) / proposal_density)
+    proposal_density = rates / jnp.maximum(
+        integrated_rates, jnp.finfo(FLOAT_DTYPE).tiny
+    )
+    alphas = jnp.minimum(
+        1.0, papangelou_values / (n_particles + 1.0) / proposal_density
+    )
     accept_key = jax.random.split(key, 2)[1]
-    accepted = jax.random.uniform(accept_key, shape=alphas.shape, dtype=FLOAT_DTYPE) < alphas
+    accepted = (
+        jax.random.uniform(accept_key, shape=alphas.shape, dtype=FLOAT_DTYPE) < alphas
+    )
     return _add_point_update(
         event_times,
         grid_indices,
@@ -296,7 +308,9 @@ def _death_move(
         beta,
         offsets,
     )
-    proposal_density = rates / jnp.maximum(integrated_rates, jnp.finfo(FLOAT_DTYPE).tiny)
+    proposal_density = rates / jnp.maximum(
+        integrated_rates, jnp.finfo(FLOAT_DTYPE).tiny
+    )
     alphas = jnp.minimum(
         1.0,
         proposal_density * n_particles / jnp.maximum(papangelou_values, 1e-9),
@@ -360,11 +374,15 @@ def _move(
         fine_grid,
         beta,
     )
-    return jax.lax.cond(do_birth, lambda x: _birth_move(*x), lambda x: _death_move(*x), args)
+    return jax.lax.cond(
+        do_birth, lambda x: _birth_move(*x), lambda x: _death_move(*x), args
+    )
 
 
 @jax.jit
-def _online_mean(mean: jax.Array, value: jax.Array, count: jax.Array, start_iter: jax.Array) -> jax.Array:
+def _online_mean(
+    mean: jax.Array, value: jax.Array, count: jax.Array, start_iter: jax.Array
+) -> jax.Array:
     update = count >= start_iter
     new_mean = mean + (value - mean) / (count - start_iter + 1)
     return jax.lax.cond(update, lambda _: new_mean, lambda _: mean, operand=None)
@@ -378,7 +396,10 @@ def _energy(
     noise: jax.Array,
 ) -> jax.Array:
     norm = jnp.sum(
-        0.5 * jnp.log(2.0 * jnp.pi * noise[:, None] ** 2) * noise[:, None] ** 2 * precision_field,
+        0.5
+        * jnp.log(2.0 * jnp.pi * noise[:, None] ** 2)
+        * noise[:, None] ** 2
+        * precision_field,
         axis=1,
     )
     return (
@@ -403,6 +424,15 @@ def _prepare_repeated_inputs(
     if rates_on_grid.ndim == 1:
         rates_on_grid = rates_on_grid[None, :]
     base_ntraj = observed.shape[0]
+    if rates_on_grid.shape[0] == 1 and base_ntraj > 1:
+        rates_on_grid = jnp.broadcast_to(
+            rates_on_grid,
+            (base_ntraj, rates_on_grid.shape[1]),
+        )
+    elif rates_on_grid.shape[0] != base_ntraj:
+        raise ValueError(
+            "rates_on_grid must have shape (n_traces, n_grid) to match observed."
+        )
     noise = jnp.asarray(noise_std, dtype=FLOAT_DTYPE)
     if noise.ndim == 0:
         noise = jnp.full((base_ntraj,), noise, dtype=FLOAT_DTYPE)
@@ -417,10 +447,15 @@ def _prepare_repeated_inputs(
     )
 
 
-def _support_offsets(sampling_times: jax.Array, rise_time: float, plateau_time: float) -> jax.Array:
+def _support_offsets(
+    sampling_times: jax.Array, rise_time: float, plateau_time: float
+) -> jax.Array:
     times = jnp.asarray(sampling_times, dtype=FLOAT_DTYPE)
     dt = times[1] - times[0]
-    n_support = int(jnp.ceil((jnp.asarray(rise_time + plateau_time, dtype=FLOAT_DTYPE)) / dt)) + 1
+    n_support = (
+        int(jnp.ceil((jnp.asarray(rise_time + plateau_time, dtype=FLOAT_DTYPE)) / dt))
+        + 1
+    )
     return jnp.arange(n_support, dtype=jnp.int32)
 
 
@@ -496,7 +531,9 @@ def sample_loadings(
     ), (particle_trace, energy_trace) = jax.lax.scan(_scan_sampler, carry_init, keys)
     base_ntraj = ntraj // nrepeat
     grid_dt = fine_grid[1] - fine_grid[0]
-    posterior_rate = mean_count_grid.reshape(nrepeat, base_ntraj, -1).mean(axis=0) / grid_dt
+    posterior_rate = (
+        mean_count_grid.reshape(nrepeat, base_ntraj, -1).mean(axis=0) / grid_dt
+    )
     predicted_signal = mean_signal.reshape(nrepeat, base_ntraj, -1).mean(axis=0)
     mean_energy = mean_energy.reshape(nrepeat, base_ntraj).mean(axis=0)
     return Pol2SamplerResult(
@@ -512,7 +549,16 @@ def sample_loadings(
 
 @jax.jit
 def _scan_sampler(carry, key):
-    params, count, mean_grid, mean_signal, count_grid, signal, log_prior_sum, mean_energy = carry
+    (
+        params,
+        count,
+        mean_grid,
+        mean_signal,
+        count_grid,
+        signal,
+        log_prior_sum,
+        mean_energy,
+    ) = carry
     (
         rates_on_grid,
         rate_cdfs,
@@ -648,7 +694,9 @@ def compute_log_z(
     log_z = jnp.trapezoid(energies, beta_grid)
     return ThermodynamicIntegrationResult(
         log_z=log_z.astype(FLOAT_DTYPE),
-        final_energy_plus_log_prior=(energies[-1] + log_prior_sums[-1]).astype(FLOAT_DTYPE),
+        final_energy_plus_log_prior=(energies[-1] + log_prior_sums[-1]).astype(
+            FLOAT_DTYPE
+        ),
         beta_grid=beta_grid.astype(FLOAT_DTYPE),
         energies=energies.astype(FLOAT_DTYPE),
         log_prior_sums=log_prior_sums.astype(FLOAT_DTYPE),

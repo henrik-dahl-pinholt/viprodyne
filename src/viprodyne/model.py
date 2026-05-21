@@ -14,7 +14,10 @@ from viprodyne.core.ms2_kernels import (
     build_ms2_observation_model,
     resolve_ms2_kernel,
 )
-from viprodyne.core.contact_survival import ContactSurvivalStats, contact_survival_log_profile
+from viprodyne.core.contact_survival import (
+    ContactSurvivalStats,
+    contact_survival_log_profile,
+)
 from viprodyne.core.rate_edges import RateEdge, transition_states
 from viprodyne.variational import (
     DrivenRateMap,
@@ -79,13 +82,13 @@ class MS2Dataset:
 
     Parameters
     ----------
-    name:
-        Unique dataset name used in result dictionaries and graph node labels.
     observed:
         Fluorescence observations with shape `(n_traces, n_timepoints)`.
     noise_std:
         Observation noise standard deviation. Scalars and broadcastable arrays
         are accepted.
+    name:
+        Unique dataset name used in result dictionaries and graph node labels.
     rate_group:
         Optional label used when dataset-scoped rate nodes should be shared
         across several datasets.
@@ -103,9 +106,9 @@ class MS2Dataset:
         probabilities.
     """
 
-    name: str
     observed: np.ndarray
     noise_std: np.ndarray | float
+    name: str | None = None
     rate_group: str | None = None
     time_grid: np.ndarray | None = None
     sampling_times: np.ndarray | None = None
@@ -114,8 +117,8 @@ class MS2Dataset:
     contact_score: np.ndarray | None = None
 
     def __post_init__(self) -> None:
-        if not self.name:
-            raise ValueError("dataset name must be non-empty.")
+        if self.name is None:
+            object.__setattr__(self, "name", f"dataset{np.random.randint(1_000_000)}")
         if self.rate_group is not None and not self.rate_group:
             raise ValueError("rate_group must be non-empty when provided.")
         observed = np.asarray(self.observed, dtype=FLOAT_DTYPE)
@@ -131,12 +134,23 @@ class MS2Dataset:
                 raise ValueError("sampling_times must have shape (n_timepoints,).")
             if np.any(np.diff(sampling_times) <= 0):
                 raise ValueError("sampling_times must be strictly increasing.")
+            if self.time_grid is None:
+                dts = np.diff(sampling_times)
+                left_edges = sampling_times[:-1] - 0.5 * dts
+                final_edge = left_edges[-1] + dts[-1]
+                inferred_grid = np.concatenate([left_edges, [final_edge]])
+                object.__setattr__(self, "time_grid", inferred_grid)
+                _validate_time_grid(
+                    self.time_grid, "dataset.time_grid (inferred from sampling_times)"
+                )
         if self.finite_mask is not None:
             mask = np.asarray(self.finite_mask, dtype=bool)
             if mask.shape != observed.shape:
                 raise ValueError("finite_mask must have the same shape as observed.")
         if self.contact_probability is not None and self.contact_score is not None:
-            raise ValueError("pass either contact_probability or contact_score, not both.")
+            raise ValueError(
+                "pass either contact_probability or contact_score, not both."
+            )
 
     @property
     def n_traces(self) -> int:
@@ -275,7 +289,9 @@ class ModelConfig:
         )
         driven_indices = tuple(int(index) for index in self.driven_transition_indices)
         if any(index < 0 or index >= n_edges for index in driven_indices):
-            raise ValueError("driven_transition_indices must be valid transition indices.")
+            raise ValueError(
+                "driven_transition_indices must be valid transition indices."
+            )
         object.__setattr__(self, "driven_transition_indices", driven_indices)
         lo_rate, hi_rate = self.driven_rate_bounds
         if not 0 < lo_rate < hi_rate:
@@ -292,7 +308,9 @@ class ModelConfig:
         if self.rc_candidate_values is not None:
             candidates = np.asarray(self.rc_candidate_values, dtype=FLOAT_DTYPE)
             if candidates.ndim != 1 or candidates.size == 0:
-                raise ValueError("rc_candidate_values must be a non-empty one-dimensional array.")
+                raise ValueError(
+                    "rc_candidate_values must be a non-empty one-dimensional array."
+                )
             if np.any(candidates <= 0.0):
                 raise ValueError("rc_candidate_values must be positive.")
             object.__setattr__(self, "rc_candidate_values", candidates)
@@ -310,10 +328,17 @@ class ViprodyneModel:
     datasets: tuple[MS2Dataset, ...]
     config: ModelConfig
     graph: VariationalGraph = field(default_factory=VariationalGraph, init=False)
-    dataset_nodes: dict[str, dict[str, str | list[str]]] = field(default_factory=dict, init=False)
+    dataset_nodes: dict[str, dict[str, str | list[str]]] = field(
+        default_factory=dict, init=False
+    )
 
     def __post_init__(self) -> None:
-        self.datasets = tuple(self.datasets)
+        try:
+            self.datasets = tuple(self.datasets)
+        except TypeError as exc:
+            raise ValueError(
+                "datasets must be a tuple or list of MS2Dataset objects."
+            ) from exc
         if not self.datasets:
             raise ValueError("at least one dataset is required.")
         if len({dataset.name for dataset in self.datasets}) != len(self.datasets):
@@ -323,7 +348,9 @@ class ViprodyneModel:
             self._time_grid(dataset)
         self._build_graph()
 
-    def run_schedule(self, schedule: list[str] | tuple[str, ...] | None = None, rho: float = 1.0) -> None:
+    def run_schedule(
+        self, schedule: list[str] | tuple[str, ...] | None = None, rho: float = 1.0
+    ) -> None:
         """Run a graph update schedule."""
         self.graph.run_schedule(schedule=schedule, rho=rho)
 
@@ -357,7 +384,10 @@ class ViprodyneModel:
         """Collect current graph moments into structured inference outputs."""
         return ModelInferenceResult(
             cavi=cavi,
-            datasets={dataset.name: self.dataset_result(dataset.name) for dataset in self.datasets},
+            datasets={
+                dataset.name: self.dataset_result(dataset.name)
+                for dataset in self.datasets
+            },
             elbo_terms=self.compute_elbo_terms() if include_elbo_terms else None,
         )
 
@@ -379,7 +409,11 @@ class ViprodyneModel:
             else {}
         )
         contact_name = nodes["contact_drive"]
-        contact = self.graph.moments.get(str(contact_name)) if contact_name is not None else {}
+        contact = (
+            self.graph.moments.get(str(contact_name))
+            if contact_name is not None
+            else {}
+        )
         sampling_times = None
         if polymerase_name is not None:
             sampling_times = np.asarray(
@@ -387,7 +421,9 @@ class ViprodyneModel:
                 dtype=FLOAT_DTYPE,
             ).copy()
         elif dataset.sampling_times is not None:
-            sampling_times = np.asarray(dataset.sampling_times, dtype=FLOAT_DTYPE).copy()
+            sampling_times = np.asarray(
+                dataset.sampling_times, dtype=FLOAT_DTYPE
+            ).copy()
 
         transition_rate_nodes = {
             index: name for index, name in enumerate(list(nodes["transition_rates"]))
@@ -483,7 +519,9 @@ class ViprodyneModel:
     def compute_elbo(self) -> np.float32:
         """Compute the current available model ELBO."""
         terms = self.compute_elbo_terms()
-        return np.asarray(sum(float(value) for value in terms.values()), dtype=FLOAT_DTYPE)
+        return np.asarray(
+            sum(float(value) for value in terms.values()), dtype=FLOAT_DTYPE
+        )
 
     def _cavi_config(self, config, kwargs):
         from viprodyne.fit import CAVIConfig
@@ -661,14 +699,18 @@ class ViprodyneModel:
             return "global"
         if index in self.config.shared_transition_rate_indices:
             return "global"
-        return self.config.transition_rate_scopes.get(index, self.config.transition_rate_scope)
+        return self.config.transition_rate_scopes.get(
+            index, self.config.transition_rate_scope
+        )
 
     def _loading_rate_scope(self, state: int) -> RateScope:
         if self.config.shared_loading_rates:
             return "global"
         if state in self.config.shared_loading_rate_states:
             return "global"
-        return self.config.loading_rate_scopes.get(state, self.config.loading_rate_scope)
+        return self.config.loading_rate_scopes.get(
+            state, self.config.loading_rate_scope
+        )
 
     def _rate_prefix(self, dataset_name: str, scope: RateScope) -> str:
         if scope == "global":
@@ -690,12 +732,18 @@ class ViprodyneModel:
         parameter = np.asarray(value, dtype=FLOAT_DTYPE)
         if scope != "track":
             return parameter
-        n_traces = next(dataset.n_traces for dataset in self.datasets if dataset.name == dataset_name)
+        n_traces = next(
+            dataset.n_traces
+            for dataset in self.datasets
+            if dataset.name == dataset_name
+        )
         if parameter.shape == ():
             return np.full((n_traces,), parameter, dtype=FLOAT_DTYPE)
         if parameter.shape == (n_traces,):
             return parameter.astype(FLOAT_DTYPE)
-        raise ValueError(f"{name} must be scalar or have shape (n_traces,) for track scope.")
+        raise ValueError(
+            f"{name} must be scalar or have shape (n_traces,) for track scope."
+        )
 
     def _initial_concentration(self) -> np.ndarray:
         if self.config.initial_concentration is None:
@@ -712,7 +760,9 @@ class ViprodyneModel:
             return "mean_field"
         return self.config.pol2_mode
 
-    def _pol2_observation_model(self, dataset: MS2Dataset) -> MS2ObservationModel | None:
+    def _pol2_observation_model(
+        self, dataset: MS2Dataset
+    ) -> MS2ObservationModel | None:
         mode = self._pol2_mode()
         if mode == "sampler":
             self._validate_sampler_kernel()
@@ -737,7 +787,9 @@ class ViprodyneModel:
         if observation.mode != "sampler":
             return None
         if self.config.sampler_fine_grid is not None:
-            return _validate_time_grid(self.config.sampler_fine_grid, "sampler_fine_grid")
+            return _validate_time_grid(
+                self.config.sampler_fine_grid, "sampler_fine_grid"
+            )
         return np.asarray(observation.loading_times, dtype=FLOAT_DTYPE)
 
     def _proximal_kernel(self) -> ProximalKernel:
@@ -770,7 +822,9 @@ class ViprodyneModel:
         contact_drive_name: str | None,
     ) -> RateEdge:
         to_state, from_state = transition_states(self.config.n_states, transition_index)
-        drive_node = contact_drive_name if self._is_driven_transition(transition_index) else None
+        drive_node = (
+            contact_drive_name if self._is_driven_transition(transition_index) else None
+        )
         return RateEdge(
             n_states=self.config.n_states,
             to_state=to_state,
@@ -780,7 +834,9 @@ class ViprodyneModel:
             transition_index=transition_index,
         )
 
-    def _add_contact_drive(self, dataset: MS2Dataset, transition_names: list[str]) -> str | None:
+    def _add_contact_drive(
+        self, dataset: MS2Dataset, transition_names: list[str]
+    ) -> str | None:
         if not self.config.driven_transition_indices:
             return None
         time_grid = self._time_grid(dataset)
@@ -788,8 +844,13 @@ class ViprodyneModel:
         contact_name = f"{dataset.name}:rc"
         if dataset.contact_probability is not None:
             contact = np.asarray(dataset.contact_probability, dtype=FLOAT_DTYPE)
-            if contact.ndim == 0 or contact.shape[-1] not in (n_intervals, n_intervals + 1):
-                raise ValueError("contact_probability last axis must match intervals or grid points.")
+            if contact.ndim == 0 or contact.shape[-1] not in (
+                n_intervals,
+                n_intervals + 1,
+            ):
+                raise ValueError(
+                    "contact_probability last axis must match intervals or grid points."
+                )
 
             def fixed_contact_probability(times, rc):
                 del times, rc
@@ -816,7 +877,9 @@ class ViprodyneModel:
             n_intervals,
             n_intervals + 1,
         ):
-            raise ValueError("contact_score last axis must match intervals or grid points.")
+            raise ValueError(
+                "contact_score last axis must match intervals or grid points."
+            )
 
         def threshold_contact_probability(times, rc):
             del times
@@ -870,11 +933,16 @@ class ViprodyneModel:
             blanket_moments = context.blanket_moments()
             total = 0.0
             for moments in child_moments.values():
-                if not {"expected_occupancy", "expected_jumps", "interval_durations"} <= moments.keys():
+                if (
+                    not {"expected_occupancy", "expected_jumps", "interval_durations"}
+                    <= moments.keys()
+                ):
                     continue
                 occupancy = np.asarray(moments["expected_occupancy"], dtype=FLOAT_DTYPE)
                 jumps = np.asarray(moments["expected_jumps"], dtype=FLOAT_DTYPE)
-                interval_durations = np.asarray(moments["interval_durations"], dtype=FLOAT_DTYPE)
+                interval_durations = np.asarray(
+                    moments["interval_durations"], dtype=FLOAT_DTYPE
+                )
                 dt = _constant_interval_duration(interval_durations)
                 p_contact = _interval_threshold_contact_score(
                     contact_score,
@@ -891,7 +959,9 @@ class ViprodyneModel:
                     )
                     gamma_from = occupancy[..., from_state] / np.float32(dt)
                     gamma_jump = jumps[..., to_state, from_state] / np.float32(dt)
-                    p_broadcast = np.broadcast_to(p_contact, gamma_from.shape).astype(FLOAT_DTYPE)
+                    p_broadcast = np.broadcast_to(p_contact, gamma_from.shape).astype(
+                        FLOAT_DTYPE
+                    )
                     total += _contact_survival_log_likelihood(
                         log_rate=np.log(np.clip(rate, 1e-20, None)).astype(FLOAT_DTYPE),
                         gamma_jump=gamma_jump,
@@ -908,7 +978,10 @@ class ViprodyneModel:
             return _validate_time_grid(dataset.time_grid, f"{dataset.name}.time_grid")
         if self.config.time_grid is not None:
             return _validate_time_grid(self.config.time_grid, "time_grid")
-        raise ValueError("each dataset needs time_grid, or ModelConfig.time_grid must be set.")
+        raise ValueError(
+            "each dataset needs time_grid, or ModelConfig.time_grid must be set."
+        )
+
 
 def _validate_time_grid(time_grid: np.ndarray, name: str) -> np.ndarray:
     time_grid = np.asarray(time_grid, dtype=FLOAT_DTYPE)
@@ -949,9 +1022,13 @@ def _interval_threshold_contact_score(
 def _constant_interval_duration(interval_durations: np.ndarray) -> float:
     durations = np.asarray(interval_durations, dtype=FLOAT_DTYPE)
     if durations.ndim != 1 or durations.size == 0:
-        raise ValueError("interval_durations must be a non-empty one-dimensional array.")
+        raise ValueError(
+            "interval_durations must be a non-empty one-dimensional array."
+        )
     if not np.allclose(durations, durations[0], rtol=1e-6, atol=1e-7):
-        raise ValueError("RcNode threshold updates currently require a uniform time grid.")
+        raise ValueError(
+            "RcNode threshold updates currently require a uniform time grid."
+        )
     return float(durations[0])
 
 
@@ -963,12 +1040,16 @@ def _default_rc_candidate_values(
     values = np.unique(np.ravel(np.asarray(contact_score, dtype=FLOAT_DTYPE)))
     values = values[np.isfinite(values)]
     values = values[(values > lo) & (values < hi)]
-    breaks = np.unique(np.concatenate([np.asarray([lo, hi], dtype=FLOAT_DTYPE), values]))
+    breaks = np.unique(
+        np.concatenate([np.asarray([lo, hi], dtype=FLOAT_DTYPE), values])
+    )
     if breaks.size == 1:
         return breaks.astype(FLOAT_DTYPE)
     midpoints = (breaks[:-1] + breaks[1:]) / np.float32(2.0)
     candidates = np.unique(
-        np.concatenate([np.asarray([lo, hi], dtype=FLOAT_DTYPE), midpoints.astype(FLOAT_DTYPE)])
+        np.concatenate(
+            [np.asarray([lo, hi], dtype=FLOAT_DTYPE), midpoints.astype(FLOAT_DTYPE)]
+        )
     )
     return candidates[(candidates >= lo) & (candidates <= hi)].astype(FLOAT_DTYPE)
 
@@ -986,7 +1067,9 @@ def _contact_survival_log_likelihood(
     gamma_from = np.asarray(gamma_from, dtype=FLOAT_DTYPE)
     p_contact = np.asarray(p_contact, dtype=FLOAT_DTYPE)
     if gamma_jump.shape != gamma_from.shape or gamma_from.shape != p_contact.shape:
-        raise ValueError("gamma_jump, gamma_from, and p_contact must have matching shapes.")
+        raise ValueError(
+            "gamma_jump, gamma_from, and p_contact must have matching shapes."
+        )
     if log_rate.shape == ():
         stats = ContactSurvivalStats.from_posteriors(
             gamma_jump=gamma_jump,
@@ -999,9 +1082,15 @@ def _contact_survival_log_likelihood(
     batch_shape = np.broadcast_shapes(log_rate.shape, gamma_from.shape[:-1])
     n_intervals = gamma_from.shape[-1]
     log_rate = np.broadcast_to(log_rate, batch_shape).astype(FLOAT_DTYPE)
-    gamma_jump = np.broadcast_to(gamma_jump, batch_shape + (n_intervals,)).astype(FLOAT_DTYPE)
-    gamma_from = np.broadcast_to(gamma_from, batch_shape + (n_intervals,)).astype(FLOAT_DTYPE)
-    p_contact = np.broadcast_to(p_contact, batch_shape + (n_intervals,)).astype(FLOAT_DTYPE)
+    gamma_jump = np.broadcast_to(gamma_jump, batch_shape + (n_intervals,)).astype(
+        FLOAT_DTYPE
+    )
+    gamma_from = np.broadcast_to(gamma_from, batch_shape + (n_intervals,)).astype(
+        FLOAT_DTYPE
+    )
+    p_contact = np.broadcast_to(p_contact, batch_shape + (n_intervals,)).astype(
+        FLOAT_DTYPE
+    )
     total = 0.0
     for index in np.ndindex(batch_shape):
         stats = ContactSurvivalStats.from_posteriors(
@@ -1026,7 +1115,9 @@ def _optional_bool_moment(moments: dict, key: str) -> np.ndarray | None:
     return np.asarray(moments[key], dtype=bool).copy()
 
 
-def _validate_index_tuple(indices: tuple[int, ...], upper_bound: int, name: str) -> tuple[int, ...]:
+def _validate_index_tuple(
+    indices: tuple[int, ...], upper_bound: int, name: str
+) -> tuple[int, ...]:
     values = tuple(int(index) for index in indices)
     if len(set(values)) != len(values):
         raise ValueError(f"{name} must not contain duplicates.")
@@ -1045,7 +1136,9 @@ def _validate_rate_prefix_labels(datasets: tuple[MS2Dataset, ...]) -> None:
         if ":" in label:
             raise ValueError(f"{label_type} {label!r} must not contain ':'.")
         if label == "shared":
-            raise ValueError(f"{label_type} {label!r} is reserved for global rate nodes.")
+            raise ValueError(
+                f"{label_type} {label!r} is reserved for global rate nodes."
+            )
 
 
 def _validate_rate_scope(scope: str, name: str) -> RateScope:
