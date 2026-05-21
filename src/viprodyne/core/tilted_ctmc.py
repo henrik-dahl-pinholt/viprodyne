@@ -20,6 +20,7 @@ class TiltedCTMCSolution:
     potentials: jax.Array
     initial_probabilities: jax.Array
     transition_matrices: jax.Array
+    transition_scales: jax.Array
     alpha: jax.Array
     beta: jax.Array
     log_partition: jax.Array
@@ -27,8 +28,7 @@ class TiltedCTMCSolution:
     @property
     def posterior(self) -> jax.Array:
         """State posterior on grid points, shape ``(batch, n_times, n_states)``."""
-        z = jnp.exp(self.log_partition)[:, None, None]
-        return self.alpha * self.beta / z
+        return self.alpha * self.beta
 
     def marginal_at(self, time: float) -> jax.Array:
         """Interpolate the state posterior at a single time."""
@@ -47,7 +47,8 @@ class TiltedCTMCSolution:
 
         alpha_mid = jax.vmap(propagate_left)(tilted, self.alpha[:, interval])
         beta_mid = jax.vmap(propagate_right)(tilted, self.beta[:, interval + 1])
-        return alpha_mid * beta_mid / jnp.exp(self.log_partition)[:, None]
+        scale = self.transition_scales[:, interval, None]
+        return alpha_mid * beta_mid / scale
 
     def expected_occupancy(self) -> jax.Array:
         """Expected time spent in each state per interval.
@@ -58,9 +59,9 @@ class TiltedCTMCSolution:
         return _expected_occupancy_kernel(
             self.generators,
             self.potentials,
+            self.transition_scales,
             self.alpha,
             self.beta,
-            self.log_partition,
             self.time_grid,
         )
 
@@ -73,9 +74,9 @@ class TiltedCTMCSolution:
         return _expected_jumps_kernel(
             self.generators,
             self.potentials,
+            self.transition_scales,
             self.alpha,
             self.beta,
-            self.log_partition,
             self.time_grid,
         )
 
@@ -91,7 +92,7 @@ class TiltedCTMCSolution:
         state being ``to_state`` given current grid state ``from_state``.
         """
         numerator = self.transition_matrices * self.beta[:, 1:, :, None]
-        denominator = self.beta[:, :-1, None, :]
+        denominator = self.transition_scales[:, :, None, None] * self.beta[:, :-1, None, :]
         transitions = numerator / denominator
         return jnp.nan_to_num(transitions, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -169,7 +170,7 @@ class TiltedCTMC:
 
     def solve(self) -> TiltedCTMCSolution:
         """Run forward-backward recursions."""
-        transition_matrices, alpha, beta, log_partition = _solve_forward_backward(
+        transition_matrices, transition_scales, alpha, beta, log_partition = _solve_forward_backward(
             self.generators,
             self.potentials,
             self.initial_probabilities,
@@ -184,6 +185,7 @@ class TiltedCTMC:
             potentials=self.potentials,
             initial_probabilities=self.initial_probabilities,
             transition_matrices=transition_matrices,
+            transition_scales=transition_scales,
             alpha=alpha,
             beta=beta,
             log_partition=log_partition,
@@ -196,7 +198,7 @@ def _solve_forward_backward(
     potentials: jax.Array,
     initial_probabilities: jax.Array,
     time_grid: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     dt = jnp.diff(time_grid)
 
     def interval_transition(generator, potential, interval_dt):
@@ -210,70 +212,81 @@ def _solve_forward_backward(
 
     def solve_batch(transitions, initial):
         def forward_step(alpha_t, transition):
-            next_alpha = transition @ alpha_t
-            return next_alpha, next_alpha
+            unscaled_next_alpha = transition @ alpha_t
+            scale = jnp.sum(unscaled_next_alpha)
+            safe_scale = jnp.maximum(scale, jnp.finfo(jnp.float32).tiny)
+            next_alpha = unscaled_next_alpha / safe_scale
+            return next_alpha, (next_alpha, safe_scale)
 
-        _, alpha_tail = jax.lax.scan(forward_step, initial, transitions)
+        _, (alpha_tail, transition_scales) = jax.lax.scan(forward_step, initial, transitions)
         alpha = jnp.concatenate([initial[None, :], alpha_tail], axis=0)
 
         terminal_beta = jnp.ones_like(initial)
 
-        def backward_step(beta_t, transition):
-            next_beta = transition.T @ beta_t
+        def backward_step(beta_t, inputs):
+            transition, scale = inputs
+            next_beta = (transition.T @ beta_t) / scale
             return next_beta, next_beta
 
-        _, beta_tail_reversed = jax.lax.scan(backward_step, terminal_beta, transitions[::-1])
+        _, beta_tail_reversed = jax.lax.scan(
+            backward_step,
+            terminal_beta,
+            (transitions[::-1], transition_scales[::-1]),
+        )
         beta = jnp.concatenate([beta_tail_reversed[::-1], terminal_beta[None, :]], axis=0)
-        return alpha, beta
+        log_partition = jnp.sum(jnp.log(transition_scales))
+        return alpha, beta, transition_scales, log_partition
 
-    alpha, beta = jax.vmap(solve_batch)(transition_matrices, initial_probabilities)
-    log_partition = jnp.log(jnp.sum(alpha[:, -1], axis=-1))
-    return transition_matrices, alpha, beta, log_partition
+    alpha, beta, transition_scales, log_partition = jax.vmap(solve_batch)(
+        transition_matrices,
+        initial_probabilities,
+    )
+    return transition_matrices, transition_scales, alpha, beta, log_partition
 
 
 @jax.jit
 def _expected_occupancy_kernel(
     generators: jax.Array,
     potentials: jax.Array,
+    transition_scales: jax.Array,
     alpha: jax.Array,
     beta: jax.Array,
-    log_partition: jax.Array,
     time_grid: jax.Array,
 ) -> jax.Array:
     dt = jnp.diff(time_grid)
     n_states = generators.shape[-1]
     state_basis = jnp.eye(n_states, dtype=jnp.float32)
 
-    def interval_occupancy(generator, potential, alpha_left, beta_right, interval_dt, log_z):
+    def interval_occupancy(generator, potential, transition_scale, alpha_left, beta_right, interval_dt):
         matrix = _tilted_generator(generator, potential) * interval_dt
 
         def one_state(direction_diag):
             direction = jnp.diag(direction_diag) * interval_dt
             frechet = jax.scipy.linalg.expm_frechet(matrix, direction, compute_expm=False)
-            return beta_right @ frechet @ alpha_left * jnp.exp(-log_z)
+            return beta_right @ frechet @ alpha_left / transition_scale
 
         return jax.vmap(one_state)(state_basis)
 
-    def batch_occupancy(batch_generators, batch_potentials, batch_alpha, batch_beta, log_z):
-        return jax.vmap(interval_occupancy, in_axes=(0, 0, 0, 0, 0, None))(
+    def batch_occupancy(batch_generators, batch_potentials, batch_scales, batch_alpha, batch_beta):
+        return jax.vmap(interval_occupancy, in_axes=(0, 0, 0, 0, 0, 0))(
             batch_generators,
             batch_potentials,
+            batch_scales,
             batch_alpha[:-1],
             batch_beta[1:],
             dt,
-            log_z,
         )
 
-    return jax.vmap(batch_occupancy)(generators, potentials, alpha, beta, log_partition)
+    return jax.vmap(batch_occupancy)(generators, potentials, transition_scales, alpha, beta)
 
 
 @jax.jit
 def _expected_jumps_kernel(
     generators: jax.Array,
     potentials: jax.Array,
+    transition_scales: jax.Array,
     alpha: jax.Array,
     beta: jax.Array,
-    log_partition: jax.Array,
     time_grid: jax.Array,
 ) -> jax.Array:
     dt = jnp.diff(time_grid)
@@ -283,27 +296,27 @@ def _expected_jumps_kernel(
     )
     offdiag_mask = (1.0 - jnp.eye(n_states, dtype=jnp.float32)).reshape((n_states * n_states,))
 
-    def interval_jumps(generator, potential, alpha_left, beta_right, interval_dt, log_z):
+    def interval_jumps(generator, potential, transition_scale, alpha_left, beta_right, interval_dt):
         matrix = _tilted_generator(generator, potential) * interval_dt
 
         def one_edge(basis_matrix, is_offdiag):
             direction = basis_matrix * generator * interval_dt
             frechet = jax.scipy.linalg.expm_frechet(matrix, direction, compute_expm=False)
-            return is_offdiag * (beta_right @ frechet @ alpha_left) * jnp.exp(-log_z)
+            return is_offdiag * (beta_right @ frechet @ alpha_left) / transition_scale
 
         return jax.vmap(one_edge)(edge_basis, offdiag_mask).reshape((n_states, n_states))
 
-    def batch_jumps(batch_generators, batch_potentials, batch_alpha, batch_beta, log_z):
-        return jax.vmap(interval_jumps, in_axes=(0, 0, 0, 0, 0, None))(
+    def batch_jumps(batch_generators, batch_potentials, batch_scales, batch_alpha, batch_beta):
+        return jax.vmap(interval_jumps, in_axes=(0, 0, 0, 0, 0, 0))(
             batch_generators,
             batch_potentials,
+            batch_scales,
             batch_alpha[:-1],
             batch_beta[1:],
             dt,
-            log_z,
         )
 
-    return jax.vmap(batch_jumps)(generators, potentials, alpha, beta, log_partition)
+    return jax.vmap(batch_jumps)(generators, potentials, transition_scales, alpha, beta)
 
 
 def _tilted_generators(generators: jax.Array, potentials: jax.Array) -> jax.Array:

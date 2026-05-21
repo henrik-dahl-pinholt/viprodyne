@@ -51,6 +51,35 @@ def test_profile_contact_threshold_runs_candidates_and_returns_best_fit():
     assert "toy" in profile.best_fit.datasets
 
 
+def test_profile_contact_threshold_allows_candidates_with_no_contact():
+    dataset = MS2Dataset(
+        name="toy",
+        observed=np.array([[0.1, 0.4]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+    )
+    config = ModelConfig(
+        n_states=2,
+        pol2_mode="transfer",
+        t_rise=np.float32(0.5),
+        t_plateau=np.float32(0.0),
+        driven_transition_indices=(1,),
+    )
+
+    profile = profile_contact_threshold(
+        datasets=(dataset,),
+        config=config,
+        contact_scores=np.array([0.2, 0.6], dtype=np.float32),
+        candidate_values=np.array([0.1, 0.5], dtype=np.float32),
+        fit_config=CAVIConfig(max_iterations=1, min_iterations=1),
+    )
+
+    assert len(profile.fits) == 2
+    assert np.all(np.isfinite(profile.elbos))
+    assert profile.fits[0].datasets["toy"].contact_probability is not None
+    np.testing.assert_allclose(profile.fits[0].datasets["toy"].contact_probability, [0.0, 0.0])
+
+
 def test_profile_contact_threshold_uses_dataset_score_mapping():
     dataset = MS2Dataset(
         name="toy",

@@ -81,6 +81,29 @@ def test_constant_potential_partition_matches_matrix_exponential():
     )
 
 
+def test_scaled_forward_backward_avoids_float32_underflow():
+    n_intervals = 400
+    time_grid = np.linspace(0.0, 200.0, n_intervals + 1, dtype=np.float32)
+    generator = np.array([[0.0]], dtype=np.float32)
+    potential = np.full((n_intervals, 1), -5.0, dtype=np.float32)
+
+    solution = TiltedCTMC(
+        generator=generator,
+        time_grid=time_grid,
+        initial_probabilities=np.array([1.0], dtype=np.float32),
+        potentials=potential,
+    ).solve()
+
+    assert np.isfinite(np.asarray(solution.log_partition)[0])
+    assert solution.log_partition[0] == pytest.approx(-1000.0, rel=1e-6)
+    np.testing.assert_allclose(solution.posterior[0], np.ones((n_intervals + 1, 1)))
+    np.testing.assert_allclose(
+        solution.expected_occupancy()[0, :, 0],
+        np.diff(time_grid),
+        rtol=2e-5,
+    )
+
+
 def test_piecewise_batch_shapes_and_transition_columns():
     generator = two_state_generator(kon=0.5, koff=0.1)
     time_grid = np.array([0.0, 1.0, 1.5])
