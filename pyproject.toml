@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "viprodyne"
 version = "0.1.0"
-description = "Variational inference tools for MS2 posterior models."
+description = "Variational inference for MS2-like live-imaging transcription data."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -22,6 +22,12 @@ dependencies = [
 dev = [
   "pytest>=8",
   "ruff>=0.8",
+]
+docs = [
+  "sphinx>=7",
+  "myst-parser>=2",
+  "sphinx-autodoc-typehints>=2",
+  "pydata-sphinx-theme>=0.15",
 ]
 
 [tool.pytest.ini_options]

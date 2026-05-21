@@ -37,7 +37,14 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class DatasetInferenceResult:
-    """Structured posterior outputs for one dataset plate."""
+    """Posterior outputs for one fitted dataset.
+
+    The arrays in this object are copied from the variational graph after
+    fitting, so they can be inspected without touching internal node objects.
+    `state_posterior` is indexed by trace, grid point, and promoter state.
+    `loading_posterior` is indexed by trace and loading interval when a Pol2
+    loading node is present.
+    """
 
     name: str
     time_grid: np.ndarray
@@ -59,7 +66,7 @@ class DatasetInferenceResult:
 
 @dataclass(frozen=True)
 class ModelInferenceResult:
-    """Result returned by top-level inference helpers."""
+    """Structured result returned by `ViprodyneModel.run_inference`."""
 
     cavi: CAVIResult | None
     datasets: dict[str, DatasetInferenceResult]
@@ -68,7 +75,33 @@ class ModelInferenceResult:
 
 @dataclass(frozen=True)
 class MS2Dataset:
-    """Input data needed to instantiate one dataset plate."""
+    """Observed traces and timing information for one dataset plate.
+
+    Parameters
+    ----------
+    name:
+        Unique dataset name used in result dictionaries and graph node labels.
+    observed:
+        Fluorescence observations with shape `(n_traces, n_timepoints)`.
+    noise_std:
+        Observation noise standard deviation. Scalars and broadcastable arrays
+        are accepted.
+    rate_group:
+        Optional label used when dataset-scoped rate nodes should be shared
+        across several datasets.
+    time_grid:
+        Pol2 loading interval boundaries. If `sampling_times` is omitted,
+        observations are assumed to occur at `time_grid[1:]`.
+    sampling_times:
+        Optional observation times with shape `(n_timepoints,)`.
+    finite_mask:
+        Optional boolean mask with the same shape as `observed`.
+    contact_probability:
+        Optional known contact probability for driven transitions.
+    contact_score:
+        Optional score that is thresholded by an `RcNode` to create contact
+        probabilities.
+    """
 
     name: str
     observed: np.ndarray
@@ -118,7 +151,13 @@ class MS2Dataset:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """Graph-construction options for :class:`ViprodyneModel`."""
+    """Options controlling model construction and fitting structure.
+
+    This configuration specifies the number of promoter states, the MS2 kernel,
+    Pol2 backend, rate-sharing scopes, priors, and optional driven-transition
+    settings. Most users only need to set `n_states`, kernel parameters, and
+    any rate-sharing or contact-drive options relevant to the experiment.
+    """
 
     n_states: int
     time_grid: np.ndarray | None = None
@@ -261,7 +300,12 @@ class ModelConfig:
 
 @dataclass
 class ViprodyneModel:
-    """High-level interface that owns graph construction and update scheduling."""
+    """Top-level model object.
+
+    Construct this class from one or more `MS2Dataset` objects and a
+    `ModelConfig`, then call `run_inference` or `fit` to run coordinate-ascent
+    variational inference.
+    """
 
     datasets: tuple[MS2Dataset, ...]
     config: ModelConfig
@@ -712,7 +756,7 @@ class ViprodyneModel:
             raise ValueError("sampler Pol2 mode requires a proximal MS2 kernel.")
         if isinstance(self.config.ms2_kernel, str):
             name = self.config.ms2_kernel.lower()
-            if name in {"proximal", "ms2posterior"}:
+            if name == "proximal":
                 return
         raise ValueError("sampler Pol2 mode currently supports only ProximalKernel.")
 

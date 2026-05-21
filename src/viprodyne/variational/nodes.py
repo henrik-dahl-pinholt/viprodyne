@@ -1,4 +1,4 @@
-"""Domain-specific variational nodes for MS2 posterior models."""
+"""Domain-specific variational nodes for MS2-like imaging models."""
 
 from __future__ import annotations
 

@@ -14,7 +14,11 @@ KernelFunction = Callable[[jnp.ndarray], jnp.ndarray]
 
 @dataclass(frozen=True)
 class ProximalKernel:
-    """Ramp-then-plateau MS2 kernel for a proximal MS2 cassette."""
+    """Ramp-then-plateau kernel for a proximal MS2 cassette.
+
+    The kernel rises linearly over `t_rise`, stays at `rna_intensity` for
+    `t_plateau`, and is zero outside that support.
+    """
 
     t_rise: np.ndarray | float = np.float32(1.0)
     t_plateau: np.ndarray | float = np.float32(0.0)
@@ -96,7 +100,7 @@ def resolve_ms2_kernel(
     if callable(kernel):
         return kernel
     name = str(kernel).lower()
-    if name not in {"proximal", "ms2posterior"}:
+    if name != "proximal":
         raise ValueError("unknown MS2 kernel name.")
     return ProximalKernel(
         t_rise=t_rise,

@@ -1,4 +1,4 @@
-"""viprodyne: variational inference tools for MS2 posterior models."""
+"""viprodyne: variational inference for MS2-like live-imaging data."""
 
 from viprodyne.core import ProximalKernel
 from viprodyne.fit import CAVIConfig, CAVIIteration, CAVIResult, run_cavi

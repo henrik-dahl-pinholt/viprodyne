@@ -15,7 +15,7 @@ FLOAT_DTYPE = np.float32
 
 @dataclass(frozen=True)
 class ContactThresholdProfileResult:
-    """Result from profiling a threshold that defines contact probabilities."""
+    """Result from fitting a contact-threshold grid."""
 
     candidate_values: np.ndarray
     elbos: np.ndarray
@@ -46,12 +46,12 @@ def profile_contact_threshold(
     fit_config: CAVIConfig | None = None,
     less_than: bool = True,
 ) -> ContactThresholdProfileResult:
-    """Run CAVI over thresholded contact-drive candidates.
+    """Fit one model per contact-threshold candidate.
 
-    This supports workflows where an external score ``z(t)`` is converted into a
-    contact probability by thresholding, for example ``p_contact(t) = z(t) < rc``.
-    Each candidate produces a fresh :class:`ViprodyneModel` whose datasets receive
-    candidate-specific ``contact_probability`` arrays.
+    This supports workflows where an external score `z(t)` is converted into a
+    contact probability by thresholding, for example `p_contact(t) = z(t) < rc`.
+    Each candidate produces a fresh `ViprodyneModel` whose datasets receive
+    candidate-specific `contact_probability` arrays.
     """
     candidate_values = np.asarray(candidate_values, dtype=FLOAT_DTYPE)
     if candidate_values.ndim != 1 or candidate_values.size == 0:

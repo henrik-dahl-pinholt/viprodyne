@@ -323,8 +323,8 @@ def mean_field_bernoulli_elbo_terms(
 ) -> dict[str, jnp.ndarray]:
     """Independent-Bernoulli Pol2 ELBO terms.
 
-    This follows the legacy MS2Posterior convention:
-    ``data + variance + normalization + prior + entropy``.
+    Terms are returned as ``data + variance + normalization + prior + entropy``
+    so tests and diagnostics can inspect each contribution separately.
     """
     q = jnp.clip(jnp.asarray(load_probabilities, dtype=jnp.float32), 1e-7, 1.0 - 1e-7)
     observed = jnp.asarray(observed, dtype=jnp.float32)

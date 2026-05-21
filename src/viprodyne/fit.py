@@ -24,7 +24,11 @@ class CAVIModel(Protocol):
 
 @dataclass(frozen=True)
 class CAVIConfig:
-    """Configuration for coordinate-ascent variational inference."""
+    """Configuration for coordinate-ascent variational inference.
+
+    `run_cavi` monitors convergence from parameter changes and computes the
+    ELBO only after the final sweep when `compute_elbo=True`.
+    """
 
     max_iterations: int = 100
     min_iterations: int = 2
@@ -61,7 +65,7 @@ class CAVIIteration:
 
 @dataclass(frozen=True)
 class CAVIResult:
-    """Result from a CAVI run."""
+    """Diagnostics from a coordinate-ascent variational inference run."""
 
     converged: bool
     n_iterations: int

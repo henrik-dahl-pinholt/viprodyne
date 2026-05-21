@@ -1,8 +1,10 @@
-# viprodyne Architecture
+# Developer Architecture
 
-`viprodyne` is a fresh implementation of the MS2Posterior variational model.
+This document records implementation conventions for contributors. User-facing
+workflow documentation lives in the top-level guide pages.
+
 The code is split into numerical kernels, variational nodes, and a top-level
-model builder so the graphical structure lives above the node implementations.
+model builder so graph structure lives above the node implementations.
 
 ## Numerical Conventions
 
@@ -41,8 +43,8 @@ diagonal potential carries local Feynman-Kac corrections.
 `viprodyne.core.bernoulli_transfer_pol2` contains the fixed-grid Bernoulli Pol2
 loading kernels:
 
-- `mean_field_bernoulli_elbo_terms` and `mean_field_bernoulli_elbo` implement
-  the legacy MS2Posterior ELBO term convention.
+- `mean_field_bernoulli_elbo_terms` and `mean_field_bernoulli_elbo` expose
+  separate data, variance, normalization, prior, and entropy terms.
 - `exact_bernoulli_posterior` enumerates all binary loading configurations for
   small systems and tests.
 - `bernoulli_transfer_log_likelihood` computes exact loading log evidence with a
@@ -60,8 +62,7 @@ internal conversion from user timing inputs to Pol2 observation representations:
 - `ProximalKernel` is the current built-in parameterized kernel. It uses
   `t_rise`, `t_plateau`, and `rna_intensity`.
 - `ModelConfig.ms2_kernel` can also take `"proximal"` or a custom
-  JAX-compatible kernel function. The legacy string `"ms2posterior"` is accepted
-  as an alias for the proximal kernel.
+  JAX-compatible kernel function.
 - `build_ms2_observation_model` derives the dense, transfer, or sampler
   representation used by `PolymeraseLoadings`. The transfer path extracts
   row-specific windows from the kernel without storing a full dense
@@ -237,7 +238,7 @@ Individual rates can override the default scope with
 `transition_rate_scopes={rate_index: scope}` and
 `loading_rate_scopes={state_index: scope}`. This supports mixed models such as a
 global `k_on`, dataset-level `k_off`, and per-track loading rates in the same
-graph. The legacy `shared_transition_rates`, `shared_loading_rates`,
+graph. The boolean shortcuts `shared_transition_rates`, `shared_loading_rates`,
 `shared_transition_rate_indices`, and `shared_loading_rate_states` options are
 kept as aliases for global sharing.
 

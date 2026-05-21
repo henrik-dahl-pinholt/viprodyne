@@ -208,9 +208,8 @@ def test_missing_observations_do_not_create_nan_values_or_gradients():
     assert jnp.all(jnp.isfinite(transfer_gradient))
 
 
-def test_mean_field_elbo_terms_match_legacy_ms2posterior_fixture():
-    # Generated from /net/levsha/share/hdp/git_reps/MS2Posterior/MF_Pol2_finder.py
-    # using its ELBO term convention with jax_enable_x64=False.
+def test_mean_field_elbo_terms_match_reference_fixture():
+    # Reference values pin the ELBO term ordering with jax_enable_x64=False.
     q = jnp.asarray([0.2, 0.55, 0.7, 0.35, 0.8], dtype=jnp.float32)
     observed = jnp.asarray([0.4, jnp.nan, 1.3], dtype=jnp.float32)
     finite_mask = jnp.asarray([True, False, True])
@@ -256,7 +255,7 @@ def test_mean_field_elbo_terms_match_legacy_ms2posterior_fixture():
     assert float(collapsed) == pytest.approx(expected["total"], rel=2e-6, abs=2e-6)
 
 
-def test_mean_field_prior_mask_matches_legacy_ms2posterior_fixture():
+def test_mean_field_prior_mask_matches_reference_fixture():
     q = jnp.asarray([0.5, 0.6, 0.7], dtype=jnp.float32)
     prior = jnp.asarray([0.2, 0.3, 0.4], dtype=jnp.float32)
     terms = mean_field_bernoulli_elbo_terms(
@@ -268,7 +267,6 @@ def test_mean_field_prior_mask_matches_legacy_ms2posterior_fixture():
         jnp.asarray([False]),
         jnp.asarray([True, False, True]),
     )
-    # Same case as old MS2Posterior test_pol2_prior_mask_excludes_invalid_elbo_terms.
     expected = -0.40693044662475586
 
     assert float(terms["data"]) == 0.0
