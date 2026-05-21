@@ -1214,7 +1214,10 @@ def _state_loading_rate_moments_from_moments(
                     rate,
                 )
             )
-        elif name.rsplit(":", 1)[-1].startswith("r"):
+        else:
+            suffix = name.rsplit(":", 1)[-1]
+            if not (suffix.startswith("r") and suffix[1:].isdigit()):
+                continue
             fallback.append((name, mean, expected_log, shape, rate))
     if rates:
         rates.sort(key=lambda item: item[0])

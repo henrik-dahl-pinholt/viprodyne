@@ -230,6 +230,30 @@ def test_ms2_dataset_requires_trace_time_matrix():
         )
 
 
+def test_ms2_dataset_infers_interval_grid_from_sampling_times():
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.array([[0.1, 0.2, 0.3]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        sampling_times=np.array([0.0, 0.5, 1.5], dtype=np.float32),
+    )
+
+    np.testing.assert_allclose(
+        dataset.time_grid,
+        np.array([-0.25, 0.25, 1.0, 2.0], dtype=np.float32),
+    )
+
+
+def test_ms2_dataset_requires_time_grid_for_single_sampling_time():
+    with pytest.raises(ValueError, match="time_grid is required"):
+        MS2Dataset(
+            name="d0",
+            observed=np.array([[0.1]], dtype=np.float32),
+            noise_std=np.float32(0.5),
+            sampling_times=np.array([0.0], dtype=np.float32),
+        )
+
+
 def test_model_config_string_summarizes_common_fields():
     config = ModelConfig(
         n_states=2,
@@ -586,6 +610,35 @@ def test_model_builds_driven_transition_with_model_level_contact_drive():
         atol=2e-7,
     )
     assert "d0:rc" in model.default_schedule()
+
+
+def test_driven_promoter_without_pol2_child_does_not_treat_rc_as_loading_rate():
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.array([[0.1, 0.9]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+    )
+    model = ViprodyneModel(
+        datasets=(dataset,),
+        config=ModelConfig(
+            n_states=2,
+            ms2_kernel=None,
+            driven_transition_indices=(1,),
+            driven_rate_initial=np.float32(0.8),
+            driven_rate_bounds=(1e-4, 10.0),
+        ),
+        contact_drive=ContactDrive.fixed(np.array([0.25, 0.75], dtype=np.float32)),
+    )
+
+    model.run_schedule(["d0:s"])
+
+    generator = model.graph.nodes["d0:s"].tilted_generator
+    np.testing.assert_allclose(
+        np.sum(generator, axis=-2),
+        np.zeros((2, 2), dtype=np.float32),
+        atol=2e-7,
+    )
 
 
 def test_model_builds_driven_transition_with_threshold_contact_drive():

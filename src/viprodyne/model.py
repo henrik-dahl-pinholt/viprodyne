@@ -228,10 +228,21 @@ class MS2Dataset:
             if np.any(np.diff(sampling_times) <= 0):
                 raise ValueError("sampling_times must be strictly increasing.")
             if self.time_grid is None:
+                if sampling_times.size < 2:
+                    raise ValueError(
+                        "time_grid is required when only one sampling time is provided."
+                    )
                 dts = np.diff(sampling_times)
-                left_edges = sampling_times[:-1] - 0.5 * dts
-                final_edge = left_edges[-1] + dts[-1]
-                inferred_grid = np.concatenate([left_edges, [final_edge]])
+                first_edge = sampling_times[0] - 0.5 * dts[0]
+                interior_edges = 0.5 * (sampling_times[:-1] + sampling_times[1:])
+                final_edge = sampling_times[-1] + 0.5 * dts[-1]
+                inferred_grid = np.concatenate(
+                    [
+                        np.asarray([first_edge], dtype=FLOAT_DTYPE),
+                        interior_edges,
+                        np.asarray([final_edge], dtype=FLOAT_DTYPE),
+                    ]
+                )
                 object.__setattr__(self, "time_grid", inferred_grid)
                 _validate_time_grid(
                     self.time_grid, "dataset.time_grid (inferred from sampling_times)"

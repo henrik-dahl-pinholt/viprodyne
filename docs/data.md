@@ -18,7 +18,8 @@ passed as `(1, n_timepoints)`.
 `time_grid` defines Pol2 loading intervals and has length `n_timepoints + 1`
 for the common case where observations are made at the right edge of each
 interval. Use `sampling_times` when image acquisition times differ from
-`time_grid[1:]`.
+`time_grid[1:]`. If `sampling_times` is provided without `time_grid`, viprodyne
+infers interval boundaries from adjacent frame midpoints.
 
 Missing observations can be encoded as `NaN` or with `finite_mask`. Missing
 values are excluded from the imaging likelihood and from downstream loading-rate

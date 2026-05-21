@@ -218,11 +218,10 @@ a `ModelConfig`.
 
 `MS2Dataset` contains observed intensities with shape
 `(n_traces, n_timepoints)`, noise, optional per-dataset `time_grid`, optional
-`sampling_times`, optional missing-data mask, and optional contact probabilities
-for driven transitions. Single-trace datasets are passed as
-`(1, n_timepoints)`. It does not require users to pass dense design matrices or
-transfer windows. Those are derived internally from the MS2 kernel in
-`ModelConfig`.
+`sampling_times`, and optional missing-data mask. Contact drives are model
+inputs, not data fields. Single-trace datasets are passed as `(1, n_timepoints)`.
+It does not require users to pass dense design matrices or transfer windows.
+Those are derived internally from the MS2 kernel in `ModelConfig`.
 
 For fitting many traces, put all same-grid traces for an experimental dataset
 or condition into one `MS2Dataset`. Rate scopes are controlled by
@@ -324,7 +323,8 @@ conditions have different frame timing or different trace lengths.
 
 By default, observations are assumed to occur at interval ends,
 `time_grid[1:n_timepoints + 1]`. Use `MS2Dataset.sampling_times` when frame
-times are not the interval ends.
+times are not the interval ends. If `sampling_times` is supplied without a
+`time_grid`, the dataset infers interval boundaries from frame midpoints.
 
 `ModelConfig.ms2_kernel` can be a named kernel string, a `ProximalKernel`
 instance, or a custom JAX-compatible callable. The current built-in

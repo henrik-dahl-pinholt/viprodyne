@@ -79,6 +79,38 @@ def test_profile_contact_threshold_uses_dataset_score_mapping():
     assert profile.best_fit.datasets["toy"].state_posterior.shape == (1, 3, 2)
 
 
+def test_profile_contact_threshold_accepts_sampling_times_without_time_grid():
+    dataset = MS2Dataset(
+        name="toy",
+        observed=np.array([[0.1, 0.4, 0.8]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        sampling_times=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+    )
+    config = ModelConfig(
+        n_states=2,
+        pol2_mode="transfer",
+        t_rise=np.float32(0.5),
+        t_plateau=np.float32(0.0),
+        driven_transition_indices=(1,),
+    )
+
+    profile = profile_contact_threshold(
+        datasets=(dataset,),
+        config=config,
+        contact_scores=np.array([0.2, 0.6, 0.9], dtype=np.float32),
+        candidate_values=np.array([0.5], dtype=np.float32),
+        fit_config=CAVIConfig(max_iterations=1, min_iterations=1, compute_elbo=False),
+    )
+
+    fit = profile.best_fit.datasets["toy"]
+    np.testing.assert_allclose(
+        fit.time_grid,
+        np.array([-0.25, 0.25, 0.75, 1.25], dtype=np.float32),
+    )
+    assert fit.state_posterior.shape == (1, 4, 2)
+    assert fit.loading_posterior.shape == (1, 3)
+
+
 def test_profile_contact_threshold_recovers_latent_statistics_from_synthetic_data():
     rng = np.random.default_rng(1)
     n_observations = 24
