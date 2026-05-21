@@ -14,6 +14,7 @@ from viprodyne.model import (
     ModelConfig,
     ModelInferenceResult,
     ViprodyneModel,
+    _assign_dataset_names,
 )
 
 FLOAT_DTYPE = np.float32
@@ -68,6 +69,7 @@ def profile_contact_threshold(
         raise ValueError(
             "config.driven_transition_indices must be set for contact profiling."
         )
+    datasets = _assign_dataset_names(tuple(datasets))
     fit_config = (
         CAVIConfig(compute_elbo=True, **kwargs) if fit_config is None else fit_config
     )

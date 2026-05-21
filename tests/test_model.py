@@ -230,6 +230,59 @@ def test_ms2_dataset_requires_trace_time_matrix():
         )
 
 
+def test_ms2_dataset_can_remain_unnamed_until_model_construction():
+    dataset = MS2Dataset(
+        observed=np.array([[0.1, 0.8]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+    )
+
+    model = ViprodyneModel(
+        datasets=(dataset,),
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+        ),
+    )
+
+    assert dataset.name is None
+    assert model.datasets[0].name == "dataset_0"
+    assert "dataset_0" in model.dataset_nodes
+
+
+def test_model_auto_dataset_names_skip_explicit_collisions():
+    unnamed = MS2Dataset(
+        observed=np.array([[0.1, 0.8]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+    )
+    explicit = MS2Dataset(
+        name="dataset_0",
+        observed=np.array([[0.2, 0.5]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+    )
+
+    model = ViprodyneModel(
+        datasets=(unnamed, explicit),
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+        ),
+    )
+
+    assert [dataset.name for dataset in model.datasets] == ["dataset_1", "dataset_0"]
+    assert set(model.dataset_nodes) == {"dataset_0", "dataset_1"}
+
+
+def test_model_rejects_duplicate_explicit_dataset_names():
+    with pytest.raises(ValueError, match="explicit dataset names"):
+        ViprodyneModel(
+            datasets=(make_dataset("d0"), make_dataset("d0")),
+            config=ModelConfig(
+                n_states=2,
+                time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+            ),
+        )
+
+
 def test_ms2_dataset_infers_interval_grid_from_sampling_times():
     dataset = MS2Dataset(
         name="d0",

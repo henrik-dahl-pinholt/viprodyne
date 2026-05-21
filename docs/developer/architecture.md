@@ -220,6 +220,9 @@ a `ModelConfig`.
 `(n_traces, n_timepoints)`, noise, optional per-dataset `time_grid`, optional
 `sampling_times`, and optional missing-data mask. Contact drives are model
 inputs, not data fields. Single-trace datasets are passed as `(1, n_timepoints)`.
+Dataset names are optional on the data object; `ViprodyneModel` assigns stable
+names such as `dataset_0` to unnamed datasets and rejects duplicate explicit
+names.
 It does not require users to pass dense design matrices or transfer windows.
 Those are derived internally from the MS2 kernel in `ModelConfig`.
 

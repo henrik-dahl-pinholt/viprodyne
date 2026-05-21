@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -188,7 +188,9 @@ class MS2Dataset:
         Observation noise standard deviation. Scalars and broadcastable arrays
         are accepted.
     name:
-        Unique dataset name used in result dictionaries and graph node labels.
+        Optional dataset name used in result dictionaries and graph node labels.
+        If omitted, `ViprodyneModel` assigns deterministic names like
+        `dataset_0`.
     rate_group:
         Optional label used when dataset-scoped rate nodes should be shared
         across several datasets.
@@ -210,8 +212,8 @@ class MS2Dataset:
     finite_mask: np.ndarray | None = None
 
     def __post_init__(self) -> None:
-        if self.name is None:
-            object.__setattr__(self, "name", f"dataset{np.random.randint(1_000_000)}")
+        if self.name is not None and not self.name:
+            raise ValueError("dataset name must be non-empty when provided.")
         if self.rate_group is not None and not self.rate_group:
             raise ValueError("rate_group must be non-empty when provided.")
         observed = np.asarray(self.observed, dtype=FLOAT_DTYPE)
@@ -483,8 +485,7 @@ class ViprodyneModel:
             ) from exc
         if not self.datasets:
             raise ValueError("at least one dataset is required.")
-        if len({dataset.name for dataset in self.datasets}) != len(self.datasets):
-            raise ValueError("dataset names must be unique.")
+        self.datasets = _assign_dataset_names(self.datasets)
         _validate_rate_prefix_labels(self.datasets)
         for dataset in self.datasets:
             self._time_grid(dataset)
@@ -1361,6 +1362,29 @@ def _validate_rate_prefix_labels(datasets: tuple[MS2Dataset, ...]) -> None:
             raise ValueError(
                 f"{label_type} {label!r} is reserved for global rate nodes."
             )
+
+
+def _assign_dataset_names(datasets: tuple[MS2Dataset, ...]) -> tuple[MS2Dataset, ...]:
+    if any(not isinstance(dataset, MS2Dataset) for dataset in datasets):
+        raise ValueError("datasets must contain only MS2Dataset objects.")
+    explicit_names = [dataset.name for dataset in datasets if dataset.name is not None]
+    if len(set(explicit_names)) != len(explicit_names):
+        raise ValueError("explicit dataset names must be unique.")
+    used_names = set(explicit_names)
+    named: list[MS2Dataset] = []
+    auto_index = 0
+    for dataset in datasets:
+        if dataset.name is not None:
+            named.append(dataset)
+            continue
+        while True:
+            candidate = f"dataset_{auto_index}"
+            auto_index += 1
+            if candidate not in used_names:
+                break
+        used_names.add(candidate)
+        named.append(replace(dataset, name=candidate))
+    return tuple(named)
 
 
 def _validate_rate_scope(scope: str, name: str) -> RateScope:

@@ -15,6 +15,9 @@ dataset = MS2Dataset(
 `observed` must have shape `(n_traces, n_timepoints)`. A single trace should be
 passed as `(1, n_timepoints)`.
 
+`name` is optional. If omitted, `ViprodyneModel` assigns deterministic names
+such as `dataset_0`, skipping any explicit names already in use.
+
 `time_grid` defines Pol2 loading intervals and has length `n_timepoints + 1`
 for the common case where observations are made at the right edge of each
 interval. Use `sampling_times` when image acquisition times differ from
