@@ -64,6 +64,7 @@ def profile_contact_threshold(
     candidate_values = np.asarray(candidate_values, dtype=FLOAT_DTYPE)
     if candidate_values.ndim != 1 or candidate_values.size == 0:
         raise ValueError("candidate_values must be a non-empty one-dimensional array.")
+    profile_bounds = _candidate_profile_bounds(config.rc_bounds, candidate_values)
     if not config.driven_transition_indices:
         raise ValueError(
             "config.driven_transition_indices must be set for contact profiling."
@@ -84,6 +85,7 @@ def profile_contact_threshold(
         candidate_config = replace(
             config,
             rc_initial=np.asarray(candidate, dtype=FLOAT_DTYPE),
+            rc_bounds=profile_bounds,
             rc_candidate_values=np.asarray([candidate], dtype=FLOAT_DTYPE),
         )
         model = ViprodyneModel(datasets, candidate_config)
@@ -120,3 +122,18 @@ def _model_contact_mass(model: ViprodyneModel) -> float:
         if "p_contact" in moments:
             total += float(np.sum(np.asarray(moments["p_contact"], dtype=FLOAT_DTYPE)))
     return total
+
+
+def _candidate_profile_bounds(
+    bounds: tuple[float, float],
+    candidate_values: np.ndarray,
+) -> tuple[float, float]:
+    candidates = np.asarray(candidate_values, dtype=FLOAT_DTYPE)
+    finite_candidates = candidates[np.isfinite(candidates)]
+    if finite_candidates.size != candidates.size or np.any(finite_candidates <= 0.0):
+        raise ValueError("candidate_values must be positive and finite.")
+    lo, hi = bounds
+    return (
+        float(min(np.float32(lo), np.min(finite_candidates))),
+        float(max(np.float32(hi), np.max(finite_candidates))),
+    )

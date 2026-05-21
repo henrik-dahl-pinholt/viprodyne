@@ -96,6 +96,8 @@ model = ViprodyneModel(datasets=(dataset,), config=config)
 Use {func}`viprodyne.profile_contact_threshold` for an outer ELBO profile. It
 fits one model per threshold candidate using the same config-level contact-drive
 pathway as MAP `rc` fitting.
+Explicit profile candidates define the thresholds to evaluate, even when they
+extend beyond `rc_bounds`; `rc_bounds` still controls in-graph MAP updates.
 
 ```python
 from viprodyne import CAVIConfig, profile_contact_threshold

@@ -149,6 +149,38 @@ def test_profile_contact_threshold_accepts_probability_function():
     )
 
 
+def test_profile_contact_threshold_candidates_override_default_rc_bounds():
+    dataset = MS2Dataset(
+        name="toy",
+        observed=np.array([[0.1, 0.4]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+    )
+
+    def contact_from_rc(rc):
+        del rc
+        return np.array([0.25, 0.75], dtype=np.float32)
+
+    config = ModelConfig(
+        n_states=2,
+        pol2_mode="transfer",
+        t_rise=np.float32(0.5),
+        t_plateau=np.float32(0.0),
+        driven_transition_indices=(1,),
+        contact_drives=(contact_from_rc,),
+    )
+
+    profile = profile_contact_threshold(
+        datasets=(dataset,),
+        config=config,
+        candidate_values=np.array([1.5], dtype=np.float32),
+        fit_config=CAVIConfig(max_iterations=1, min_iterations=1),
+    )
+
+    assert profile.best_value == pytest.approx(np.float32(1.5))
+    assert profile.best_fit.datasets["toy"].contact_rc == pytest.approx(np.float32(1.5))
+
+
 def test_profile_contact_threshold_accepts_time_grid_probability_function():
     dataset = MS2Dataset(
         name="toy",
