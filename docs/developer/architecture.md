@@ -375,12 +375,13 @@ Driven transitions are selected by transition index. For a two-state model,
 index `1` is `0 -> 1`.
 
 ```python
+from viprodyne import ContactDrive
+
 dataset = MS2Dataset(
     name="condition_0",
     observed=np.array([[0.1, 0.8]], dtype=np.float32),
     noise_std=np.float32(0.5),
     time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
-    contact_probability=np.array([0.25, 0.75], dtype=np.float32),
 )
 
 model = ViprodyneModel(
@@ -391,6 +392,7 @@ model = ViprodyneModel(
         driven_rate_initial=np.float32(0.8),
         driven_rate_bounds=(1e-4, 10.0),
     ),
+    contact_drive=ContactDrive.fixed(np.array([0.25, 0.75], dtype=np.float32)),
 )
 ```
 
@@ -398,9 +400,9 @@ Driven transition rates can be scoped as track, dataset, or global rates. The
 contact-drive node remains per track/dataset plate, so a shared driven-rate node
 can still receive different contact probabilities from different traces.
 
-If the contact drive is not pre-thresholded, pass `MS2Dataset.contact_score`
-instead of `contact_probability`. The model then builds an unpinned `RcNode`
-which emits `p_contact(t)` from the current threshold and updates `rc` from the
+If the contact drive is not pre-thresholded, pass a model-level
+`ContactDrive.threshold(...)`. The model then builds an unpinned `RcNode` which
+emits `p_contact(t)` from the current threshold and updates `rc` from the
 promoter-state Markov blanket:
 
 ```python
@@ -409,7 +411,6 @@ dataset = MS2Dataset(
     observed=observed,
     noise_std=np.float32(0.5),
     time_grid=time_grid,
-    contact_score=contact_score,
 )
 
 model = ViprodyneModel(
@@ -421,6 +422,7 @@ model = ViprodyneModel(
         rc_bounds=(0.1, 1.0),
         rc_candidate_values=np.linspace(0.1, 1.0, 10, dtype=np.float32),
     ),
+    contact_drive=ContactDrive.threshold(contact_score),
 )
 ```
 
@@ -452,8 +454,8 @@ best_fit = profile.best_fit
 best_threshold = profile.best_value
 ```
 
-This helper creates a fresh `ViprodyneModel` for each candidate, injects the
-candidate-specific `MS2Dataset.contact_probability`, runs
+This helper creates a fresh `ViprodyneModel` for each candidate with a
+candidate-specific model-level `ContactDrive.fixed(...)`, runs
 `model.run_inference(...)`, and returns the ELBO profile. It is intended as the
 package-native version of the ad hoc profile loop used in the
 `1_kon_rc_toy_identify.ipynb` notebook. A rendered package example lives at

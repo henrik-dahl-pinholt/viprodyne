@@ -57,6 +57,7 @@ def test_cavi_runs_schedule_and_computes_elbo_once():
     assert result.max_parameter_change.dtype == np.float32
     assert "track_0:s" in result.schedule
     assert "track_0:r0" in result.parameter_nodes
+    assert "CAVIResult(" in str(result)
 
 
 def test_model_fit_cavi_updates_loading_rates_from_pol2_blanket_stats():
@@ -96,6 +97,24 @@ def test_model_run_inference_returns_structured_outputs():
     assert set(dataset.loading_rates) == {0, 1}
     assert dataset.transition_rate_nodes[0] == "track_0:R0"
     assert dataset.loading_rate_nodes[1] == "track_0:r1"
+    assert "ModelInferenceResult" in str(result)
+    assert "DatasetInferenceResult" in str(dataset)
+
+
+def test_cavi_progress_reports_pending_nodes(capsys):
+    model = make_model()
+
+    _ = model.fit_cavi(
+        max_iterations=2,
+        min_iterations=2,
+        tolerance=0.0,
+        compute_elbo=False,
+        progress=True,
+    )
+
+    captured = capsys.readouterr()
+    assert "CAVI [" in captured.out
+    assert "pending" in captured.out or "all parameter nodes converged" in captured.out
 
 
 def test_model_fit_alias_runs_inference():

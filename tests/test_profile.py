@@ -3,6 +3,7 @@ import pytest
 
 from viprodyne import (
     CAVIConfig,
+    ContactDrive,
     ContactThresholdProfileResult,
     MS2Dataset,
     ModelConfig,
@@ -142,7 +143,6 @@ def test_profile_contact_threshold_recovers_latent_statistics_from_synthetic_dat
         observed=observed,
         noise_std=np.float32(0.08),
         time_grid=time_grid,
-        contact_score=contact_score,
     )
     direct_model = ViprodyneModel(
         datasets=(direct_dataset,),
@@ -160,6 +160,7 @@ def test_profile_contact_threshold_recovers_latent_statistics_from_synthetic_dat
             rc_bounds=(0.2, 0.6),
             rc_candidate_values=np.array([0.2, 0.3, 0.4, 0.5, 0.6], dtype=np.float32),
         ),
+        contact_drive=ContactDrive.threshold(contact_score),
     )
     direct_fit = direct_model.run_inference(
         CAVIConfig(max_iterations=20, min_iterations=20, tolerance=0.0),

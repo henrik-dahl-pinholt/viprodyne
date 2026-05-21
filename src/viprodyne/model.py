@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -66,6 +66,21 @@ class DatasetInferenceResult:
     contact_rc: np.ndarray | None = None
     contact_probability: np.ndarray | None = None
 
+    def __str__(self) -> str:
+        parts = [
+            f"DatasetInferenceResult(name={self.name!r})",
+            f"  traces={self.observed.shape[0]}, timepoints={self.observed.shape[1]}",
+            f"  states={self.state_posterior.shape[-1]}",
+            f"  transition_rates={len(self.transition_rates)}, loading_rates={len(self.loading_rates)}",
+        ]
+        if self.contact_rc is not None:
+            parts.append(f"  contact_rc={np.asarray(self.contact_rc).item():.6g}")
+        if self.loading_posterior is not None:
+            finite_loads = np.asarray(self.loading_posterior)[np.isfinite(self.loading_posterior)]
+            if finite_loads.size:
+                parts.append(f"  mean_loading_posterior={float(np.mean(finite_loads)):.6g}")
+        return "\n".join(parts)
+
 
 @dataclass(frozen=True)
 class ModelInferenceResult:
@@ -74,6 +89,91 @@ class ModelInferenceResult:
     cavi: CAVIResult | None
     datasets: dict[str, DatasetInferenceResult]
     elbo_terms: dict[str, np.float32] | None = None
+
+    def __str__(self) -> str:
+        cavi = "no CAVI diagnostics" if self.cavi is None else str(self.cavi)
+        dataset_names = ", ".join(sorted(self.datasets))
+        return f"ModelInferenceResult(datasets=[{dataset_names}])\n{cavi}"
+
+
+@dataclass(frozen=True)
+class ContactDrive:
+    """Model-level contact drive for driven promoter transitions.
+
+    Exactly one of `probability`, `score`, or `probability_fn` should be set.
+
+    `probability` is a fixed contact probability array and creates a pinned
+    `RcNode`. `score` creates the threshold model
+    `p_contact(t; rc) = score(t) < rc` by default. `probability_fn` supports
+    general contact models and may be either `fn(rc)` or `fn(time_grid, rc)`;
+    it should return contact probabilities on grid points or intervals.
+    """
+
+    probability: np.ndarray | None = None
+    score: np.ndarray | None = None
+    probability_fn: Callable | None = None
+    less_than: bool | None = None
+    candidate_values: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        configured = sum(
+            item is not None
+            for item in (self.probability, self.score, self.probability_fn)
+        )
+        if configured != 1:
+            raise ValueError("set exactly one of probability, score, or probability_fn.")
+        if self.candidate_values is not None:
+            candidates = np.asarray(self.candidate_values, dtype=FLOAT_DTYPE)
+            if candidates.ndim != 1 or candidates.size == 0:
+                raise ValueError("candidate_values must be a non-empty one-dimensional array.")
+            if np.any(candidates <= 0.0):
+                raise ValueError("candidate_values must be positive.")
+            object.__setattr__(self, "candidate_values", candidates)
+
+    @classmethod
+    def fixed(cls, probability: np.ndarray) -> "ContactDrive":
+        """Create a pinned contact drive from known probabilities."""
+        return cls(probability=np.asarray(probability, dtype=FLOAT_DTYPE))
+
+    @classmethod
+    def threshold(
+        cls,
+        score: np.ndarray,
+        *,
+        less_than: bool = True,
+        candidate_values: np.ndarray | None = None,
+    ) -> "ContactDrive":
+        """Create a thresholded score drive, `p_contact(t; rc) = score(t) < rc`."""
+        return cls(
+            score=np.asarray(score, dtype=FLOAT_DTYPE),
+            less_than=bool(less_than),
+            candidate_values=candidate_values,
+        )
+
+    @classmethod
+    def function(
+        cls,
+        probability_fn: Callable,
+        *,
+        candidate_values: np.ndarray | None = None,
+    ) -> "ContactDrive":
+        """Create a general rc-dependent drive from `fn(rc)` or `fn(time_grid, rc)`."""
+        return cls(probability_fn=probability_fn, candidate_values=candidate_values)
+
+    @property
+    def kind(self) -> str:
+        if self.probability is not None:
+            return "fixed"
+        if self.score is not None:
+            return "threshold"
+        return "function"
+
+    def __str__(self) -> str:
+        return f"ContactDrive(kind={self.kind})"
+
+
+ContactDriveLike = ContactDrive | np.ndarray | Callable
+ContactDriveSpec = ContactDriveLike | Mapping[str, ContactDriveLike] | None
 
 
 @dataclass(frozen=True)
@@ -99,11 +199,6 @@ class MS2Dataset:
         Optional observation times with shape `(n_timepoints,)`.
     finite_mask:
         Optional boolean mask with the same shape as `observed`.
-    contact_probability:
-        Optional known contact probability for driven transitions.
-    contact_score:
-        Optional score that is thresholded by an `RcNode` to create contact
-        probabilities.
     """
 
     observed: np.ndarray
@@ -113,8 +208,6 @@ class MS2Dataset:
     time_grid: np.ndarray | None = None
     sampling_times: np.ndarray | None = None
     finite_mask: np.ndarray | None = None
-    contact_probability: np.ndarray | None = None
-    contact_score: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if self.name is None:
@@ -147,11 +240,6 @@ class MS2Dataset:
             mask = np.asarray(self.finite_mask, dtype=bool)
             if mask.shape != observed.shape:
                 raise ValueError("finite_mask must have the same shape as observed.")
-        if self.contact_probability is not None and self.contact_score is not None:
-            raise ValueError(
-                "pass either contact_probability or contact_score, not both."
-            )
-
     @property
     def n_traces(self) -> int:
         """Number of traces in this dataset plate."""
@@ -165,12 +253,24 @@ class MS2Dataset:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """Options controlling model construction and fitting structure.
+    """Options controlling model structure and numerical fitting choices.
 
-    This configuration specifies the number of promoter states, the MS2 kernel,
-    Pol2 backend, rate-sharing scopes, priors, and optional driven-transition
-    settings. Most users only need to set `n_states`, kernel parameters, and
-    any rate-sharing or contact-drive options relevant to the experiment.
+    The most common fields are:
+
+    - `n_states`: number of promoter states.
+    - `time_grid`: shared loading/promoter grid when datasets do not provide one.
+    - `ms2_kernel`, `t_rise`, `t_plateau`, `rna_intensity`: MS2 observation model.
+    - `pol2_mode`: Pol2 posterior backend, usually `"auto"` or `"transfer"`.
+    - `transition_rate_scope` and `loading_rate_scope`: `"dataset"`, `"track"`,
+      or `"global"` sharing.
+    - `driven_transition_indices`: transition indices driven by contact. For
+      column-sum-zero generators, use `ordered_transition_index(n_states,
+      to_state, from_state)` to avoid orientation mistakes.
+    - `rc_initial`, `rc_bounds`, `rc_candidate_values`: MAP settings for an
+      rc-dependent `ContactDrive`.
+
+    Priors use shape/rate Gamma parameters for rates. Pinned parameters are set
+    on the corresponding node after model construction.
     """
 
     n_states: int
@@ -210,7 +310,6 @@ class ModelConfig:
     rc_initial: np.ndarray | float = np.float32(0.5)
     rc_bounds: tuple[float, float] = (1e-6, 1.0)
     rc_candidate_values: np.ndarray | None = None
-    contact_score_less_than: bool = True
 
     def __post_init__(self) -> None:
         if self.n_states < 2:
@@ -315,18 +414,50 @@ class ModelConfig:
                 raise ValueError("rc_candidate_values must be positive.")
             object.__setattr__(self, "rc_candidate_values", candidates)
 
+    def __str__(self) -> str:
+        driven = (
+            "none"
+            if not self.driven_transition_indices
+            else ", ".join(str(index) for index in self.driven_transition_indices)
+        )
+        return "\n".join(
+            [
+                "ModelConfig(",
+                f"  n_states={self.n_states}, pol2_mode={self.pol2_mode!r},",
+                f"  ms2_kernel={_kernel_summary(self.ms2_kernel)},",
+                f"  transition_rate_scope={self.transition_rate_scope!r}, "
+                f"loading_rate_scope={self.loading_rate_scope!r},",
+                f"  driven_transition_indices={driven},",
+                f"  rc_initial={np.asarray(self.rc_initial).item():.6g}, "
+                f"rc_bounds={self.rc_bounds},",
+                ")",
+            ]
+        )
+
 
 @dataclass
 class ViprodyneModel:
-    """Top-level model object.
+    """Top-level variational model.
 
-    Construct this class from one or more `MS2Dataset` objects and a
-    `ModelConfig`, then call `run_inference` or `fit` to run coordinate-ascent
-    variational inference.
+    Parameters
+    ----------
+    datasets:
+        One or more observed dataset plates. These contain observations,
+        timing, and noise only.
+    config:
+        Model structure, priors, fitting backend choices, and rate sharing.
+    contact_drive:
+        Optional model-level contact drive for driven transitions. Pass a
+        `ContactDrive`, a per-dataset mapping, a fixed probability array, or a
+        callable `fn(rc)` / `fn(time_grid, rc)`.
+
+    Call `fit(...)` or `run_inference(...)` with CAVI keyword arguments such as
+    `max_iterations`, `min_iterations`, `tolerance`, `rho`, and `progress`.
     """
 
     datasets: tuple[MS2Dataset, ...]
     config: ModelConfig
+    contact_drive: ContactDriveSpec = None
     graph: VariationalGraph = field(default_factory=VariationalGraph, init=False)
     dataset_nodes: dict[str, dict[str, str | list[str]]] = field(
         default_factory=dict, init=False
@@ -355,14 +486,25 @@ class ViprodyneModel:
         self.graph.run_schedule(schedule=schedule, rho=rho)
 
     def fit_cavi(self, config=None, **kwargs):
-        """Run coordinate-ascent variational inference for this model."""
+        """Run CAVI and return `CAVIResult` diagnostics.
+
+        Pass either a `CAVIConfig` via `config` or CAVI keyword arguments, for
+        example `max_iterations=200`, `tolerance=1e-3`, `rho=0.75`, or
+        `progress=True`.
+        """
         from viprodyne.fit import run_cavi
 
         config = self._cavi_config(config, kwargs)
         return run_cavi(self, config=config)
 
     def run_inference(self, config=None, **kwargs) -> ModelInferenceResult:
-        """Run CAVI and return structured dataset-level posterior outputs."""
+        """Run CAVI and return structured posterior outputs.
+
+        `config` may be a `CAVIConfig`. If omitted, keyword arguments are passed
+        to `CAVIConfig`, so `model.run_inference(tolerance=1e-3,
+        max_iterations=100, progress=True)` is equivalent to constructing the
+        config object explicitly.
+        """
         config = self._cavi_config(config, kwargs)
         from viprodyne.fit import run_cavi
 
@@ -373,7 +515,12 @@ class ViprodyneModel:
         )
 
     def fit(self, config=None, **kwargs) -> ModelInferenceResult:
-        """Alias for :meth:`run_inference` for the standard public workflow."""
+        """Alias for `run_inference`.
+
+        This is the shortest public fitting entry point. Use CAVI keyword
+        arguments here directly, for example `model.fit(tolerance=1e-3,
+        max_iterations=200, progress=True)`.
+        """
         return self.run_inference(config=config, **kwargs)
 
     def inference_result(
@@ -842,15 +989,18 @@ class ViprodyneModel:
         time_grid = self._time_grid(dataset)
         n_intervals = time_grid.size - 1
         contact_name = f"{dataset.name}:rc"
-        if dataset.contact_probability is not None:
-            contact = np.asarray(dataset.contact_probability, dtype=FLOAT_DTYPE)
-            if contact.ndim == 0 or contact.shape[-1] not in (
-                n_intervals,
-                n_intervals + 1,
-            ):
-                raise ValueError(
-                    "contact_probability last axis must match intervals or grid points."
-                )
+        contact_drive = self._contact_drive_for_dataset(dataset)
+        if contact_drive is None:
+            raise ValueError(
+                "driven transition models require ViprodyneModel(contact_drive=...)."
+            )
+
+        if contact_drive.probability is not None:
+            contact = _validate_contact_array(
+                contact_drive.probability,
+                n_intervals=n_intervals,
+                name="contact probability",
+            )
 
             def fixed_contact_probability(times, rc):
                 del times, rc
@@ -867,44 +1017,52 @@ class ViprodyneModel:
             )
             return contact_name
 
-        if dataset.contact_score is None:
-            raise ValueError(
-                "driven transition models require dataset.contact_probability or "
-                "dataset.contact_score."
+        if contact_drive.score is not None:
+            contact_score = _validate_contact_array(
+                contact_drive.score,
+                n_intervals=n_intervals,
+                name="contact score",
+                clip=False,
             )
-        contact_score = np.asarray(dataset.contact_score, dtype=FLOAT_DTYPE)
-        if contact_score.ndim == 0 or contact_score.shape[-1] not in (
-            n_intervals,
-            n_intervals + 1,
-        ):
-            raise ValueError(
-                "contact_score last axis must match intervals or grid points."
+            less_than = (
+                True if contact_drive.less_than is None else bool(contact_drive.less_than)
             )
 
-        def threshold_contact_probability(times, rc):
-            del times
-            return _threshold_contact_score(
-                contact_score,
-                rc,
-                less_than=self.config.contact_score_less_than,
+            def threshold_contact_probability(times, rc):
+                del times
+                return _threshold_contact_score(
+                    contact_score,
+                    rc,
+                    less_than=less_than,
+                )
+
+            probability_fn = threshold_contact_probability
+            candidate_values = (
+                contact_drive.candidate_values
+                if contact_drive.candidate_values is not None
+                else self.config.rc_candidate_values
+            )
+            if candidate_values is None:
+                candidate_values = _default_rc_candidate_values(contact_score, self.config.rc_bounds)
+        else:
+            probability_fn = _wrap_contact_probability_fn(contact_drive.probability_fn)
+            candidate_values = (
+                contact_drive.candidate_values
+                if contact_drive.candidate_values is not None
+                else self.config.rc_candidate_values
             )
 
-        objective = self._contact_threshold_objective(
-            contact_score=contact_score,
+        objective = self._contact_drive_objective(
+            probability_fn=probability_fn,
             transition_names=transition_names,
-            less_than=self.config.contact_score_less_than,
-        )
-        candidate_values = (
-            self.config.rc_candidate_values
-            if self.config.rc_candidate_values is not None
-            else _default_rc_candidate_values(contact_score, self.config.rc_bounds)
+            time_grid=time_grid,
         )
         self.graph.add_node(
             RcNode(
                 name=contact_name,
                 value=self.config.rc_initial,
                 time_grid=time_grid,
-                contact_probability_fn=threshold_contact_probability,
+                contact_probability_fn=probability_fn,
                 bounds=self.config.rc_bounds,
                 objective_fn=objective,
                 candidate_values=candidate_values,
@@ -912,12 +1070,25 @@ class ViprodyneModel:
         )
         return contact_name
 
-    def _contact_threshold_objective(
+    def _contact_drive_for_dataset(self, dataset: MS2Dataset) -> ContactDrive | None:
+        if self.contact_drive is not None:
+            if isinstance(self.contact_drive, Mapping):
+                try:
+                    value = self.contact_drive[dataset.name]
+                except KeyError as exc:
+                    raise KeyError(
+                        f"missing contact drive for dataset {dataset.name!r}."
+                    ) from exc
+                return _coerce_contact_drive(value)
+            return _coerce_contact_drive(self.contact_drive)
+        return None
+
+    def _contact_drive_objective(
         self,
         *,
-        contact_score: np.ndarray,
+        probability_fn: Callable[[np.ndarray, np.ndarray], np.ndarray],
         transition_names: list[str],
-        less_than: bool,
+        time_grid: np.ndarray,
     ):
         driven_edges = tuple(
             (
@@ -943,12 +1114,9 @@ class ViprodyneModel:
                 interval_durations = np.asarray(
                     moments["interval_durations"], dtype=FLOAT_DTYPE
                 )
-                dt = _constant_interval_duration(interval_durations)
-                p_contact = _interval_threshold_contact_score(
-                    contact_score,
-                    rc_value,
+                p_contact = _interval_contact_probability(
+                    probability_fn(time_grid, rc_value),
                     n_intervals=interval_durations.size,
-                    less_than=less_than,
                 )
                 for _, (to_state, from_state), rate_name in driven_edges:
                     if rate_name not in blanket_moments:
@@ -957,8 +1125,12 @@ class ViprodyneModel:
                         blanket_moments[rate_name]["mean"],
                         dtype=FLOAT_DTYPE,
                     )
-                    gamma_from = occupancy[..., from_state] / np.float32(dt)
-                    gamma_jump = jumps[..., to_state, from_state] / np.float32(dt)
+                    dt_broadcast = np.broadcast_to(
+                        interval_durations,
+                        occupancy[..., from_state].shape,
+                    ).astype(FLOAT_DTYPE)
+                    gamma_from = occupancy[..., from_state] / dt_broadcast
+                    gamma_jump = jumps[..., to_state, from_state] / dt_broadcast
                     p_broadcast = np.broadcast_to(p_contact, gamma_from.shape).astype(
                         FLOAT_DTYPE
                     )
@@ -967,7 +1139,7 @@ class ViprodyneModel:
                         gamma_jump=gamma_jump,
                         gamma_from=gamma_from,
                         p_contact=p_broadcast,
-                        dt=dt,
+                        dt=dt_broadcast,
                     )
             return float(total)
 
@@ -1004,32 +1176,69 @@ def _threshold_contact_score(
     return np.asarray(contact, dtype=FLOAT_DTYPE)
 
 
-def _interval_threshold_contact_score(
-    score: np.ndarray,
-    threshold: np.ndarray,
+def _interval_contact_probability(contact: np.ndarray, *, n_intervals: int) -> np.ndarray:
+    return _validate_contact_array(
+        contact,
+        n_intervals=n_intervals,
+        name="contact probability",
+    )
+
+
+def _validate_contact_array(
+    values: np.ndarray,
     *,
     n_intervals: int,
-    less_than: bool,
+    name: str,
+    clip: bool = True,
 ) -> np.ndarray:
-    contact = _threshold_contact_score(score, threshold, less_than=less_than)
-    if contact.shape[-1] == n_intervals + 1:
-        contact = contact[..., 1:]
-    elif contact.shape[-1] != n_intervals:
-        raise ValueError("contact_score last axis must match intervals or grid points.")
-    return np.clip(contact, 0.0, 1.0).astype(FLOAT_DTYPE)
+    values = np.asarray(values, dtype=FLOAT_DTYPE)
+    if values.ndim == 0:
+        out = np.full((n_intervals,), values, dtype=FLOAT_DTYPE)
+    elif values.shape[-1] == n_intervals + 1:
+        out = values[..., 1:]
+    elif values.shape[-1] == n_intervals:
+        out = values
+    else:
+        raise ValueError(f"{name} last axis must match intervals or grid points.")
+    if clip:
+        out = np.clip(out, 0.0, 1.0)
+    return np.asarray(out, dtype=FLOAT_DTYPE)
 
 
-def _constant_interval_duration(interval_durations: np.ndarray) -> float:
-    durations = np.asarray(interval_durations, dtype=FLOAT_DTYPE)
-    if durations.ndim != 1 or durations.size == 0:
-        raise ValueError(
-            "interval_durations must be a non-empty one-dimensional array."
-        )
-    if not np.allclose(durations, durations[0], rtol=1e-6, atol=1e-7):
-        raise ValueError(
-            "RcNode threshold updates currently require a uniform time grid."
-        )
-    return float(durations[0])
+def _coerce_contact_drive(value) -> ContactDrive:
+    if isinstance(value, ContactDrive):
+        return value
+    if callable(value):
+        return ContactDrive.function(value)
+    return ContactDrive.fixed(np.asarray(value, dtype=FLOAT_DTYPE))
+
+
+def _wrap_contact_probability_fn(
+    probability_fn: Callable | None,
+) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
+    if probability_fn is None:
+        raise ValueError("ContactDrive.probability_fn must be callable.")
+
+    def wrapped(time_grid: np.ndarray, rc_value: np.ndarray) -> np.ndarray:
+        try:
+            return np.asarray(probability_fn(time_grid, rc_value), dtype=FLOAT_DTYPE)
+        except TypeError as first_error:
+            try:
+                return np.asarray(probability_fn(rc_value), dtype=FLOAT_DTYPE)
+            except TypeError:
+                raise first_error
+
+    return wrapped
+
+
+def _kernel_summary(kernel) -> str:
+    if isinstance(kernel, str):
+        return repr(kernel)
+    if isinstance(kernel, ProximalKernel):
+        return "ProximalKernel(...)"
+    if kernel is None:
+        return "None"
+    return getattr(kernel, "__name__", kernel.__class__.__name__)
 
 
 def _default_rc_candidate_values(
@@ -1060,12 +1269,13 @@ def _contact_survival_log_likelihood(
     gamma_jump: np.ndarray,
     gamma_from: np.ndarray,
     p_contact: np.ndarray,
-    dt: float,
+    dt: float | np.ndarray,
 ) -> float:
     log_rate = np.asarray(log_rate, dtype=FLOAT_DTYPE)
     gamma_jump = np.asarray(gamma_jump, dtype=FLOAT_DTYPE)
     gamma_from = np.asarray(gamma_from, dtype=FLOAT_DTYPE)
     p_contact = np.asarray(p_contact, dtype=FLOAT_DTYPE)
+    dt = np.broadcast_to(np.asarray(dt, dtype=FLOAT_DTYPE), gamma_from.shape)
     if gamma_jump.shape != gamma_from.shape or gamma_from.shape != p_contact.shape:
         raise ValueError(
             "gamma_jump, gamma_from, and p_contact must have matching shapes."
@@ -1091,13 +1301,14 @@ def _contact_survival_log_likelihood(
     p_contact = np.broadcast_to(p_contact, batch_shape + (n_intervals,)).astype(
         FLOAT_DTYPE
     )
+    dt = np.broadcast_to(dt, batch_shape + (n_intervals,)).astype(FLOAT_DTYPE)
     total = 0.0
     for index in np.ndindex(batch_shape):
         stats = ContactSurvivalStats.from_posteriors(
             gamma_jump=gamma_jump[index],
             gamma_from=gamma_from[index],
             p_contact=p_contact[index],
-            dt=dt,
+            dt=dt[index],
         )
         total += contact_survival_log_profile(float(log_rate[index]), stats)
     return float(total)

@@ -82,12 +82,13 @@ config = ModelConfig(
 Fit a contact-threshold drive inside one model:
 
 ```python
+from viprodyne import ContactDrive
+
 dataset = MS2Dataset(
     name="condition_0",
     observed=observed,
     noise_std=np.float32(0.5),
     time_grid=time_grid,
-    contact_score=contact_score,
 )
 
 model = ViprodyneModel(
@@ -98,6 +99,7 @@ model = ViprodyneModel(
         rc_initial=np.float32(0.3),
         rc_bounds=(0.1, 1.0),
     ),
+    contact_drive=ContactDrive.threshold(contact_score),
 )
 
 fit = model.run_inference(max_iterations=100)

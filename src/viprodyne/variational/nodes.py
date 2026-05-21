@@ -480,18 +480,19 @@ class PromoterState(VariationalNode):
     ) -> dict[str, ContactSurvivalStats]:
         if not self.drive_probabilities:
             return {}
-        dt = _constant_interval_duration(self.time_grid)
+        dt = np.diff(np.asarray(self.time_grid, dtype=FLOAT_DTYPE))
         stats: dict[str, ContactSurvivalStats] = {}
         for edge in self.rate_edges:
             if edge.rate_node not in self.drive_probabilities:
                 continue
             p_contact = self.drive_probabilities[edge.rate_node]
             p_contact = np.broadcast_to(p_contact, occupancy.shape[:2]).astype(FLOAT_DTYPE)
+            dt_broadcast = np.broadcast_to(dt, occupancy.shape[:2]).astype(FLOAT_DTYPE)
             stats[edge.rate_node] = ContactSurvivalStats.from_posteriors(
-                gamma_jump=jumps[..., edge.to_state, edge.from_state] / dt,
-                gamma_from=occupancy[..., edge.from_state] / dt,
+                gamma_jump=jumps[..., edge.to_state, edge.from_state] / dt_broadcast,
+                gamma_from=occupancy[..., edge.from_state] / dt_broadcast,
                 p_contact=p_contact,
-                dt=dt,
+                dt=dt_broadcast,
             )
         return stats
 
@@ -1516,13 +1517,6 @@ def _add_user_potentials(base: np.ndarray, user_potentials: np.ndarray) -> np.nd
     if base_was_unbatched and user_was_unbatched:
         return result[0].astype(FLOAT_DTYPE)
     return result.astype(FLOAT_DTYPE)
-
-
-def _constant_interval_duration(time_grid: np.ndarray) -> float:
-    dt = np.diff(np.asarray(time_grid, dtype=FLOAT_DTYPE))
-    if not np.allclose(dt, dt[0], rtol=1e-6, atol=1e-7):
-        raise ValueError("contact-survival rate updates currently require a uniform time grid.")
-    return float(dt[0])
 
 
 def _sum_child_stat(context: UpdateContext, key: str) -> np.ndarray | None:

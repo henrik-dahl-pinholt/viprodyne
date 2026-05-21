@@ -3,6 +3,7 @@
 from viprodyne.core import ProximalKernel, ordered_transition_index, transition_states
 from viprodyne.fit import CAVIConfig, CAVIIteration, CAVIResult, run_cavi
 from viprodyne.model import (
+    ContactDrive,
     DatasetInferenceResult,
     MS2Dataset,
     ModelConfig,
@@ -28,6 +29,7 @@ __all__ = [
     "CAVIIteration",
     "CAVIResult",
     "ContactThresholdProfileResult",
+    "ContactDrive",
     "DirichletNode",
     "DrivenRateMap",
     "DatasetInferenceResult",

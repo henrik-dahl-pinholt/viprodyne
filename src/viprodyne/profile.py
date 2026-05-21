@@ -9,6 +9,7 @@ import numpy as np
 
 from viprodyne.fit import CAVIConfig
 from viprodyne.model import (
+    ContactDrive,
     MS2Dataset,
     ModelConfig,
     ModelInferenceResult,
@@ -57,8 +58,8 @@ def profile_contact_threshold(
 
     This supports workflows where an external score `z(t)` is converted into a
     contact probability by thresholding, for example `p_contact(t) = z(t) < rc`.
-    Each candidate produces a fresh `ViprodyneModel` whose datasets receive
-    candidate-specific `contact_probability` arrays.
+    Each candidate produces a fresh `ViprodyneModel` with a model-level fixed
+    `ContactDrive`; the input datasets are not modified.
     """
     candidate_values = np.asarray(candidate_values, dtype=FLOAT_DTYPE)
     if candidate_values.ndim != 1 or candidate_values.size == 0:
@@ -80,19 +81,17 @@ def profile_contact_threshold(
             print(
                 f"Profiling contact threshold candidate {candidate}...({fits.__len__() + 1}/{candidate_values.size})"
             )
-        profiled_datasets = tuple(
-            replace(
-                dataset,
-                contact_probability=_threshold_contact_score(
+        contact_drive = {
+            dataset.name: ContactDrive.fixed(
+                _threshold_contact_score(
                     _contact_score_for_dataset(contact_scores, dataset.name),
                     candidate,
                     less_than=less_than,
-                ),
-                contact_score=None,
+                )
             )
             for dataset in datasets
-        )
-        model = ViprodyneModel(profiled_datasets, config)
+        }
+        model = ViprodyneModel(datasets, config, contact_drive=contact_drive)
         fit = model.run_inference(config=fit_config)
         if fit.cavi is None or fit.cavi.elbo is None:
             raise RuntimeError("contact-threshold profiling requires ELBO computation.")

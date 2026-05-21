@@ -2,7 +2,15 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from viprodyne import DrivenRateMap, MS2Dataset, ModelConfig, ProximalKernel, RcNode, ViprodyneModel
+from viprodyne import (
+    ContactDrive,
+    DrivenRateMap,
+    MS2Dataset,
+    ModelConfig,
+    ProximalKernel,
+    RcNode,
+    ViprodyneModel,
+)
 
 
 def make_dataset(name, offset=0.0):
@@ -220,6 +228,21 @@ def test_ms2_dataset_requires_trace_time_matrix():
             observed=np.array([0.1, 0.8], dtype=np.float32),
             noise_std=np.float32(0.5),
         )
+
+
+def test_model_config_string_summarizes_common_fields():
+    config = ModelConfig(
+        n_states=2,
+        pol2_mode="transfer",
+        driven_transition_indices=(1,),
+        rc_initial=np.float32(0.25),
+    )
+
+    text = str(config)
+
+    assert "n_states=2" in text
+    assert "pol2_mode='transfer'" in text
+    assert "driven_transition_indices=1" in text
 
 
 def test_model_schedule_runs_promoter_and_pol2_nodes():
@@ -523,12 +546,11 @@ def test_model_accepts_dataset_specific_time_grids():
     assert model.graph.moments.get("d1:s")["posterior"].shape == (1, 4, 2)
 
 
-def test_model_builds_driven_transition_with_dataset_contact_drive():
+def test_model_builds_driven_transition_with_model_level_contact_drive():
     dataset = MS2Dataset(
         name="d0",
         observed=np.array([[0.1, 0.9]], dtype=np.float32),
         noise_std=np.float32(0.5),
-        contact_probability=np.array([0.25, 0.75], dtype=np.float32),
     )
     model = ViprodyneModel(
         datasets=(dataset,),
@@ -539,6 +561,7 @@ def test_model_builds_driven_transition_with_dataset_contact_drive():
             driven_rate_initial=np.float32(0.8),
             driven_rate_bounds=(1e-4, 10.0),
         ),
+        contact_drive=ContactDrive.fixed(np.array([0.25, 0.75], dtype=np.float32)),
     )
 
     assert isinstance(model.graph.nodes["d0:R1"], DrivenRateMap)
@@ -565,12 +588,11 @@ def test_model_builds_driven_transition_with_dataset_contact_drive():
     assert "d0:rc" in model.default_schedule()
 
 
-def test_model_builds_driven_transition_with_dataset_contact_score():
+def test_model_builds_driven_transition_with_threshold_contact_drive():
     dataset = MS2Dataset(
         name="d0",
         observed=np.array([[0.1, 0.9]], dtype=np.float32),
         noise_std=np.float32(0.5),
-        contact_score=np.array([0.25, 0.75], dtype=np.float32),
     )
     model = ViprodyneModel(
         datasets=(dataset,),
@@ -584,6 +606,7 @@ def test_model_builds_driven_transition_with_dataset_contact_score():
             rc_bounds=(0.1, 1.0),
             rc_candidate_values=np.array([0.3, 0.8], dtype=np.float32),
         ),
+        contact_drive=ContactDrive.threshold(np.array([0.25, 0.75], dtype=np.float32)),
     )
 
     assert isinstance(model.graph.nodes["d0:R1"], DrivenRateMap)
@@ -597,12 +620,66 @@ def test_model_builds_driven_transition_with_dataset_contact_score():
     assert moments["p_contact"].shape == (2,)
 
 
+def test_model_supports_function_contact_drive_of_rc():
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.array([[0.1, 0.9]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+    )
+
+    def contact_from_rc(rc):
+        return np.array([rc, np.float32(1.0) - rc], dtype=np.float32)
+
+    model = ViprodyneModel(
+        datasets=(dataset,),
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+            driven_transition_indices=(1,),
+            driven_rate_initial=np.float32(0.8),
+            driven_rate_bounds=(1e-4, 10.0),
+            rc_initial=np.float32(0.25),
+            rc_bounds=(0.1, 0.9),
+            rc_candidate_values=np.array([0.25, 0.75], dtype=np.float32),
+        ),
+        contact_drive=ContactDrive.function(contact_from_rc),
+    )
+
+    moments = model.graph.moments.get("d0:rc")
+
+    np.testing.assert_allclose(moments["p_contact"], np.array([0.25, 0.75], dtype=np.float32))
+    assert moments["candidate_values"].shape == (2,)
+
+
+def test_contact_survival_stats_support_nonuniform_time_grid():
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.array([[0.1, 0.9]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+    )
+    model = ViprodyneModel(
+        datasets=(dataset,),
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.3, 1.0], dtype=np.float32),
+            driven_transition_indices=(1,),
+            driven_rate_initial=np.float32(0.8),
+            driven_rate_bounds=(1e-4, 10.0),
+        ),
+        contact_drive=ContactDrive.fixed(np.array([0.25, 0.75], dtype=np.float32)),
+    )
+
+    model.run_schedule(["d0:s"])
+    stats = model.graph.moments.get("d0:s")["contact_survival_stats_by_rate"]["d0:R1"]
+
+    np.testing.assert_allclose(stats.dt, np.array([[0.3, 0.7]], dtype=np.float32))
+
+
 def test_model_derives_rc_candidates_from_contact_score_when_grid_is_omitted():
     dataset = MS2Dataset(
         name="d0",
         observed=np.array([[0.1, 0.9, 0.2]], dtype=np.float32),
         noise_std=np.float32(0.5),
-        contact_score=np.array([0.2, 0.5, 0.8], dtype=np.float32),
     )
     model = ViprodyneModel(
         datasets=(dataset,),
@@ -613,6 +690,7 @@ def test_model_derives_rc_candidates_from_contact_score_when_grid_is_omitted():
             rc_initial=np.float32(0.5),
             rc_bounds=(0.1, 1.0),
         ),
+        contact_drive=ContactDrive.threshold(np.array([0.2, 0.5, 0.8], dtype=np.float32)),
     )
 
     candidates = model.graph.moments.get("d0:rc")["candidate_values"]
@@ -624,8 +702,8 @@ def test_model_derives_rc_candidates_from_contact_score_when_grid_is_omitted():
     assert np.any(np.isclose(candidates, np.float32(0.65)))
 
 
-def test_model_requires_contact_probability_for_driven_transitions():
-    with pytest.raises(ValueError, match="contact_probability"):
+def test_model_requires_contact_drive_for_driven_transitions():
+    with pytest.raises(ValueError, match="contact_drive"):
         ViprodyneModel(
             datasets=(make_dataset("d0"),),
             config=ModelConfig(

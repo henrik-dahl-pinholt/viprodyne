@@ -26,20 +26,26 @@ class ContactSurvivalStats:
     expected_jumps: float
     gamma_from: np.ndarray
     p_contact: np.ndarray
-    dt: float
+    dt: float | np.ndarray
     log_contact_jump: float = 0.0
 
     def __post_init__(self) -> None:
         gamma_from = np.asarray(self.gamma_from, dtype=FLOAT_DTYPE)
         p_contact = np.asarray(self.p_contact, dtype=FLOAT_DTYPE)
+        dt = np.asarray(self.dt, dtype=FLOAT_DTYPE)
         if gamma_from.shape != p_contact.shape:
             raise ValueError("gamma_from and p_contact must have the same shape.")
-        if self.dt <= 0:
+        if dt.ndim == 0:
+            dt = np.full(gamma_from.shape, dt, dtype=FLOAT_DTYPE)
+        elif dt.shape != gamma_from.shape:
+            raise ValueError("dt must be scalar or have the same shape as gamma_from.")
+        if np.any(dt <= 0):
             raise ValueError("dt must be positive.")
         if self.expected_jumps < 0:
             raise ValueError("expected_jumps must be non-negative.")
         object.__setattr__(self, "gamma_from", gamma_from)
         object.__setattr__(self, "p_contact", np.clip(p_contact, 0.0, 1.0).astype(FLOAT_DTYPE))
+        object.__setattr__(self, "dt", dt.astype(FLOAT_DTYPE))
 
     @classmethod
     def from_posteriors(
@@ -47,30 +53,36 @@ class ContactSurvivalStats:
         gamma_jump: np.ndarray,
         gamma_from: np.ndarray,
         p_contact: np.ndarray,
-        dt: float,
+        dt: float | np.ndarray,
         contact_prob_floor: float = CONTACT_PROB_FLOOR,
     ) -> "ContactSurvivalStats":
         """Build stats from posterior jump density and source-state occupancy arrays."""
         gamma_jump = np.nan_to_num(np.asarray(gamma_jump, dtype=FLOAT_DTYPE), nan=0.0)
+        gamma_from = np.nan_to_num(np.asarray(gamma_from, dtype=FLOAT_DTYPE), nan=0.0)
         p_contact = np.asarray(p_contact, dtype=FLOAT_DTYPE)
         if gamma_jump.shape != p_contact.shape:
             raise ValueError("gamma_jump and p_contact must have the same shape.")
-        expected_jumps = float(np.sum(gamma_jump) * dt)
+        dt_arr = np.asarray(dt, dtype=FLOAT_DTYPE)
+        if dt_arr.ndim == 0:
+            dt_arr = np.full(gamma_jump.shape, dt_arr, dtype=FLOAT_DTYPE)
+        elif dt_arr.shape != gamma_jump.shape:
+            raise ValueError("dt must be scalar or have the same shape as gamma_jump.")
+        expected_jumps = float(np.sum(gamma_jump * dt_arr))
         log_contact_jump = float(
-            np.sum(gamma_jump * np.log(np.clip(p_contact, contact_prob_floor, None))) * dt
+            np.sum(gamma_jump * np.log(np.clip(p_contact, contact_prob_floor, None)) * dt_arr)
         )
         return cls(
             expected_jumps=expected_jumps,
-            gamma_from=np.nan_to_num(gamma_from, nan=0.0).astype(FLOAT_DTYPE),
+            gamma_from=gamma_from.astype(FLOAT_DTYPE),
             p_contact=p_contact,
-            dt=dt,
+            dt=dt_arr,
             log_contact_jump=log_contact_jump,
         )
 
     @property
     def exposure_if_always_contact(self) -> float:
         """Return sum_t gamma_from(t) * dt, used by analytic p_contact=1 checks."""
-        return float(np.sum(self.gamma_from) * self.dt)
+        return float(np.sum(self.gamma_from * self.dt))
 
 
 def contact_survival_log_profile(
@@ -99,16 +111,22 @@ def contact_survival_log_profile(
     return float(value)
 
 
-def _log_contact_survival(rate: float, dt: float, p_contact: np.ndarray) -> np.ndarray:
+def _log_contact_survival(
+    rate: float,
+    dt: float | np.ndarray,
+    p_contact: np.ndarray,
+) -> np.ndarray:
     """Compute log(1 - p * (1 - exp(-rate * dt))) without p=1 cancellation."""
     p_contact = np.asarray(p_contact, dtype=FLOAT_DTYPE)
+    dt = np.broadcast_to(np.asarray(dt, dtype=FLOAT_DTYPE), p_contact.shape)
     survival = np.empty_like(p_contact, dtype=FLOAT_DTYPE)
     always_contact = p_contact >= 1.0
-    survival[always_contact] = -float(rate) * float(dt)
+    survival[always_contact] = -float(rate) * dt[always_contact]
     if np.any(~always_contact):
         p = p_contact[~always_contact]
+        local_dt = dt[~always_contact]
         survival[~always_contact] = np.log1p(
-            -p * (-np.expm1(-float(rate) * float(dt)))
+            -p * (-np.expm1(-float(rate) * local_dt))
         ).astype(FLOAT_DTYPE)
     return survival
 
