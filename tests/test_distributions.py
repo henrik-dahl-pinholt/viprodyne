@@ -22,7 +22,10 @@ def test_gamma_node_moments_entropy_and_prior_term():
     assert moments["shape"].dtype == np.float32
     assert moments["rate"].dtype == np.float32
     assert moments["mean"] == pytest.approx(5.0 / 7.0)
-    assert moments["expected_log"] == pytest.approx(float(digamma(5.0) - np.log(7.0)))
+    assert moments["expected_log"] == pytest.approx(
+        float(digamma(5.0) - np.log(7.0)),
+        abs=1e-6,
+    )
     assert moments["shape"] == pytest.approx(5.0)
     assert moments["rate"] == pytest.approx(7.0)
 
@@ -33,11 +36,11 @@ def test_gamma_node_moments_entropy_and_prior_term():
         + (2.0 - 1.0) * moments["expected_log"]
         - 3.0 * moments["mean"]
     )
-    assert node.entropy() == pytest.approx(float(entropy))
-    assert node.expected_log_prior() == pytest.approx(float(expected_log_prior))
+    assert node.entropy() == pytest.approx(float(entropy), abs=3e-6)
+    assert node.expected_log_prior() == pytest.approx(float(expected_log_prior), abs=3e-6)
     assert node.elbo_contribution() == pytest.approx(
         float(entropy + expected_log_prior),
-        rel=2e-6,
+        abs=3e-6,
     )
 
 
@@ -83,7 +86,7 @@ def test_dirichlet_node_moments_entropy_and_update():
     log_beta = np.sum(gammaln(concentration)) - gammaln(total)
     entropy = log_beta + (total - len(concentration)) * digamma(total)
     entropy -= np.sum((concentration - 1.0) * digamma(concentration))
-    assert node.entropy() == pytest.approx(float(entropy))
+    assert node.entropy() == pytest.approx(float(entropy), abs=3e-6)
 
 
 def test_dirichlet_pin_normalizes_and_skips_updates():

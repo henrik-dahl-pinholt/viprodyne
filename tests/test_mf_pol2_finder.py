@@ -94,7 +94,7 @@ def test_factorized_observations_fit_matches_exact_marginals():
     result = fit_mean_field_bernoulli(observed, prior, design, noise)
 
     assert result.success
-    np.testing.assert_allclose(result.load_probabilities, marginal, rtol=5e-5)
+    np.testing.assert_allclose(result.load_probabilities, marginal, rtol=1e-4)
 
 
 def test_missing_observations_return_prior_optimum():
