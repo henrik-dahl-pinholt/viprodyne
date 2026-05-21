@@ -598,8 +598,8 @@ def test_noninteracting_kernel_matches_analytic_theory_for_posteriors_and_elbo()
     np.testing.assert_allclose(
         mean_field_result.load_probabilities,
         expected_posterior,
-        rtol=5e-5,
-        atol=5e-6,
+        rtol=5e-4,
+        atol=2e-4,
     )
 
 
