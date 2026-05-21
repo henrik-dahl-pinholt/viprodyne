@@ -200,8 +200,25 @@ class DrivenRateMap(VariationalNode):
     def entropy(self) -> float:
         return 0.0
 
+    def prior_log_density(self) -> float:
+        """Return the MAP rate prior term without path-likelihood statistics."""
+        if self.is_pinned:
+            return 0.0
+        rate = jnp.asarray(self.rate, dtype=jnp.float32)
+        prior_shape = jnp.asarray(self.prior_shape, dtype=jnp.float32)
+        prior_rate = jnp.asarray(self.prior_rate, dtype=jnp.float32)
+        value = (
+            (prior_shape - 1.0) * jnp.log(jnp.clip(rate, 1e-20, None))
+            - prior_rate * rate
+        )
+        if float(self.prior_rate) > 0.0:
+            value = value + prior_shape * jnp.log(prior_rate) - jax.scipy.special.gammaln(
+                prior_shape
+            )
+        return float(jnp.sum(value))
+
     def elbo_contribution(self) -> float:
-        return 0.0 if self.is_pinned else float(self.log_profile_value)
+        return self.prior_log_density()
 
     def sample(self, rng: np.random.Generator | None = None, size=None):
         return _deterministic_sample(np.asarray(self.rate, dtype=FLOAT_DTYPE), size)

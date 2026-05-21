@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from scipy.special import gammaln
 
 from viprodyne.core.contact_survival import ContactSurvivalStats
 from viprodyne.core.rate_edges import RateEdge
@@ -142,6 +143,39 @@ def test_driven_rate_map_updates_from_contact_survival_stats():
     assert moments["is_driven"] is True
     assert driven.sample().dtype == np.float32
     assert moments["mean"] == pytest.approx(expected_map, rel=5e-4)
+    map_rate = float(moments["mean"])
+    expected_prior = (
+        2.0 * np.log(1.5)
+        - gammaln(2.0)
+        + (2.0 - 1.0) * np.log(map_rate)
+        - 1.5 * map_rate
+    )
+    assert driven.elbo_contribution() == pytest.approx(expected_prior, rel=1e-6)
+    assert driven.elbo_contribution() != pytest.approx(float(driven.log_profile_value))
+
+
+def test_driven_rate_map_flat_prior_has_zero_elbo_contribution():
+    stats = ContactSurvivalStats(
+        expected_jumps=2.0,
+        gamma_from=np.array([1.0, 1.0], dtype=np.float32),
+        p_contact=np.ones(2, dtype=np.float32),
+        dt=0.5,
+    )
+    driven = DrivenRateMap(
+        name="R_contact",
+        initial_rate=np.float32(1.0),
+        rate_bounds=(1e-4, 100.0),
+    )
+    child = StatsNode("contact_stats", {"contact_survival_stats": stats})
+    graph = VariationalGraph()
+    graph.add_node(driven)
+    graph.add_node(child)
+    graph.add_edge("R_contact", "contact_stats")
+
+    graph.run_schedule(["R_contact"])
+
+    assert driven.log_profile_value != pytest.approx(0.0)
+    assert driven.elbo_contribution() == pytest.approx(0.0)
 
 
 def test_driven_rate_map_reads_contact_survival_stats_keyed_by_rate_name():

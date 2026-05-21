@@ -99,7 +99,6 @@ def run_cavi(model: CAVIModel, config: CAVIConfig | None = None) -> CAVIResult:
             current,
             absolute_tolerance=config.absolute_tolerance,
         )
-        print(max_change)
         converged = bool(
             iteration >= config.min_iterations
             and float(max_change) <= float(config.tolerance)
