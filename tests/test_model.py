@@ -3,7 +3,6 @@ import numpy as np
 import pytest
 
 from viprodyne import (
-    ContactDrive,
     DrivenRateMap,
     MS2Dataset,
     ModelConfig,
@@ -297,8 +296,26 @@ def test_ms2_dataset_infers_interval_grid_from_sampling_times():
     )
 
 
-def test_ms2_dataset_requires_time_grid_for_single_sampling_time():
-    with pytest.raises(ValueError, match="time_grid is required"):
+def test_ms2_dataset_builds_centered_sampling_times_from_dt():
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.array([[0.1, 0.2, 0.3]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        dt=np.float32(0.5),
+    )
+
+    np.testing.assert_allclose(
+        dataset.sampling_times,
+        np.array([0.25, 0.75, 1.25], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        dataset.time_grid,
+        np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
+    )
+
+
+def test_ms2_dataset_requires_dt_for_single_sampling_time():
+    with pytest.raises(ValueError, match="dt is required"):
         MS2Dataset(
             name="d0",
             observed=np.array([[0.1]], dtype=np.float32),
@@ -308,10 +325,15 @@ def test_ms2_dataset_requires_time_grid_for_single_sampling_time():
 
 
 def test_model_config_string_summarizes_common_fields():
+    def fixed_contact(rc):
+        del rc
+        return np.ones(1, dtype=np.float32)
+
     config = ModelConfig(
         n_states=2,
         pol2_mode="transfer",
         driven_transition_indices=(1,),
+        contact_drives=(fixed_contact,),
         rc_initial=np.float32(0.25),
     )
 
@@ -623,22 +645,27 @@ def test_model_accepts_dataset_specific_time_grids():
     assert model.graph.moments.get("d1:s")["posterior"].shape == (1, 4, 2)
 
 
-def test_model_builds_driven_transition_with_model_level_contact_drive():
+def test_model_builds_driven_transition_with_config_contact_drive():
     dataset = MS2Dataset(
         name="d0",
         observed=np.array([[0.1, 0.9]], dtype=np.float32),
         noise_std=np.float32(0.5),
     )
+
+    def fixed_contact(rc):
+        del rc
+        return np.array([0.25, 0.75], dtype=np.float32)
+
     model = ViprodyneModel(
         datasets=(dataset,),
         config=ModelConfig(
             n_states=2,
             time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
             driven_transition_indices=(1,),
+            contact_drives=(fixed_contact,),
             driven_rate_initial=np.float32(0.8),
             driven_rate_bounds=(1e-4, 10.0),
         ),
-        contact_drive=ContactDrive.fixed(np.array([0.25, 0.75], dtype=np.float32)),
     )
 
     assert isinstance(model.graph.nodes["d0:R1"], DrivenRateMap)
@@ -672,16 +699,21 @@ def test_driven_promoter_without_pol2_child_does_not_treat_rc_as_loading_rate():
         noise_std=np.float32(0.5),
         time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
     )
+
+    def fixed_contact(rc):
+        del rc
+        return np.array([0.25, 0.75], dtype=np.float32)
+
     model = ViprodyneModel(
         datasets=(dataset,),
         config=ModelConfig(
             n_states=2,
             ms2_kernel=None,
             driven_transition_indices=(1,),
+            contact_drives=(fixed_contact,),
             driven_rate_initial=np.float32(0.8),
             driven_rate_bounds=(1e-4, 10.0),
         ),
-        contact_drive=ContactDrive.fixed(np.array([0.25, 0.75], dtype=np.float32)),
     )
 
     model.run_schedule(["d0:s"])
@@ -706,13 +738,13 @@ def test_model_builds_driven_transition_with_threshold_contact_drive():
             n_states=2,
             time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
             driven_transition_indices=(1,),
+            contact_drives=(np.array([0.25, 0.75], dtype=np.float32),),
             driven_rate_initial=np.float32(0.8),
             driven_rate_bounds=(1e-4, 10.0),
             rc_initial=np.float32(0.5),
             rc_bounds=(0.1, 1.0),
             rc_candidate_values=np.array([0.3, 0.8], dtype=np.float32),
         ),
-        contact_drive=ContactDrive.threshold(np.array([0.25, 0.75], dtype=np.float32)),
     )
 
     assert isinstance(model.graph.nodes["d0:R1"], DrivenRateMap)
@@ -742,13 +774,13 @@ def test_model_supports_function_contact_drive_of_rc():
             n_states=2,
             time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
             driven_transition_indices=(1,),
+            contact_drives=(contact_from_rc,),
             driven_rate_initial=np.float32(0.8),
             driven_rate_bounds=(1e-4, 10.0),
             rc_initial=np.float32(0.25),
             rc_bounds=(0.1, 0.9),
             rc_candidate_values=np.array([0.25, 0.75], dtype=np.float32),
         ),
-        contact_drive=ContactDrive.function(contact_from_rc),
     )
 
     moments = model.graph.moments.get("d0:rc")
@@ -763,16 +795,21 @@ def test_contact_survival_stats_support_nonuniform_time_grid():
         observed=np.array([[0.1, 0.9]], dtype=np.float32),
         noise_std=np.float32(0.5),
     )
+
+    def fixed_contact(rc):
+        del rc
+        return np.array([0.25, 0.75], dtype=np.float32)
+
     model = ViprodyneModel(
         datasets=(dataset,),
         config=ModelConfig(
             n_states=2,
             time_grid=np.array([0.0, 0.3, 1.0], dtype=np.float32),
             driven_transition_indices=(1,),
+            contact_drives=(fixed_contact,),
             driven_rate_initial=np.float32(0.8),
             driven_rate_bounds=(1e-4, 10.0),
         ),
-        contact_drive=ContactDrive.fixed(np.array([0.25, 0.75], dtype=np.float32)),
     )
 
     model.run_schedule(["d0:s"])
@@ -793,10 +830,10 @@ def test_model_derives_rc_candidates_from_contact_score_when_grid_is_omitted():
             n_states=2,
             time_grid=np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
             driven_transition_indices=(1,),
+            contact_drives=(np.array([0.2, 0.5, 0.8], dtype=np.float32),),
             rc_initial=np.float32(0.5),
             rc_bounds=(0.1, 1.0),
         ),
-        contact_drive=ContactDrive.threshold(np.array([0.2, 0.5, 0.8], dtype=np.float32)),
     )
 
     candidates = model.graph.moments.get("d0:rc")["candidate_values"]
@@ -809,12 +846,22 @@ def test_model_derives_rc_candidates_from_contact_score_when_grid_is_omitted():
 
 
 def test_model_requires_contact_drive_for_driven_transitions():
-    with pytest.raises(ValueError, match="contact_drive"):
+    with pytest.raises(ValueError, match="contact_drives"):
+        ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+            driven_transition_indices=(1,),
+        )
+
+
+def test_model_requires_one_contact_drive_per_dataset():
+    with pytest.raises(ValueError, match="one entry per dataset"):
         ViprodyneModel(
-            datasets=(make_dataset("d0"),),
+            datasets=(make_dataset("d0"), make_dataset("d1")),
             config=ModelConfig(
                 n_states=2,
                 time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
                 driven_transition_indices=(1,),
+                contact_drives=(np.array([0.2, 0.6], dtype=np.float32),),
             ),
         )

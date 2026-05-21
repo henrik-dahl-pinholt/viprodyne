@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal
 
@@ -96,84 +96,7 @@ class ModelInferenceResult:
         return f"ModelInferenceResult(datasets=[{dataset_names}])\n{cavi}"
 
 
-@dataclass(frozen=True)
-class ContactDrive:
-    """Model-level contact drive for driven promoter transitions.
-
-    Exactly one of `probability`, `score`, or `probability_fn` should be set.
-
-    `probability` is a fixed contact probability array and creates a pinned
-    `RcNode`. `score` creates the threshold model
-    `p_contact(t; rc) = score(t) < rc` by default. `probability_fn` supports
-    general contact models and may be either `fn(rc)` or `fn(time_grid, rc)`;
-    it should return contact probabilities on grid points or intervals.
-    """
-
-    probability: np.ndarray | None = None
-    score: np.ndarray | None = None
-    probability_fn: Callable | None = None
-    less_than: bool | None = None
-    candidate_values: np.ndarray | None = None
-
-    def __post_init__(self) -> None:
-        configured = sum(
-            item is not None
-            for item in (self.probability, self.score, self.probability_fn)
-        )
-        if configured != 1:
-            raise ValueError("set exactly one of probability, score, or probability_fn.")
-        if self.candidate_values is not None:
-            candidates = np.asarray(self.candidate_values, dtype=FLOAT_DTYPE)
-            if candidates.ndim != 1 or candidates.size == 0:
-                raise ValueError("candidate_values must be a non-empty one-dimensional array.")
-            if np.any(candidates <= 0.0):
-                raise ValueError("candidate_values must be positive.")
-            object.__setattr__(self, "candidate_values", candidates)
-
-    @classmethod
-    def fixed(cls, probability: np.ndarray) -> "ContactDrive":
-        """Create a pinned contact drive from known probabilities."""
-        return cls(probability=np.asarray(probability, dtype=FLOAT_DTYPE))
-
-    @classmethod
-    def threshold(
-        cls,
-        score: np.ndarray,
-        *,
-        less_than: bool = True,
-        candidate_values: np.ndarray | None = None,
-    ) -> "ContactDrive":
-        """Create a thresholded score drive, `p_contact(t; rc) = score(t) < rc`."""
-        return cls(
-            score=np.asarray(score, dtype=FLOAT_DTYPE),
-            less_than=bool(less_than),
-            candidate_values=candidate_values,
-        )
-
-    @classmethod
-    def function(
-        cls,
-        probability_fn: Callable,
-        *,
-        candidate_values: np.ndarray | None = None,
-    ) -> "ContactDrive":
-        """Create a general rc-dependent drive from `fn(rc)` or `fn(time_grid, rc)`."""
-        return cls(probability_fn=probability_fn, candidate_values=candidate_values)
-
-    @property
-    def kind(self) -> str:
-        if self.probability is not None:
-            return "fixed"
-        if self.score is not None:
-            return "threshold"
-        return "function"
-
-    def __str__(self) -> str:
-        return f"ContactDrive(kind={self.kind})"
-
-
-ContactDriveLike = ContactDrive | np.ndarray | Callable
-ContactDriveSpec = ContactDriveLike | Mapping[str, ContactDriveLike] | None
+ContactInputSpec = np.ndarray | Callable
 
 
 @dataclass(frozen=True)
@@ -187,6 +110,9 @@ class MS2Dataset:
     noise_std:
         Observation noise standard deviation. Scalars and broadcastable arrays
         are accepted.
+    dt:
+        Optional frame spacing for regularly sampled traces. If provided,
+        observations are treated as centered in each frame.
     name:
         Optional dataset name used in result dictionaries and graph node labels.
         If omitted, `ViprodyneModel` assigns deterministic names like
@@ -194,17 +120,18 @@ class MS2Dataset:
     rate_group:
         Optional label used when dataset-scoped rate nodes should be shared
         across several datasets.
-    time_grid:
-        Pol2 loading interval boundaries. If `sampling_times` is omitted,
-        observations are assumed to occur at `time_grid[1:]`.
     sampling_times:
         Optional observation times with shape `(n_timepoints,)`.
+    time_grid:
+        Advanced internal loading interval boundaries. Prefer `dt` or
+        `sampling_times` for public workflows.
     finite_mask:
         Optional boolean mask with the same shape as `observed`.
     """
 
     observed: np.ndarray
     noise_std: np.ndarray | float
+    dt: np.ndarray | float | None = None
     name: str | None = None
     rate_group: str | None = None
     time_grid: np.ndarray | None = None
@@ -221,6 +148,29 @@ class MS2Dataset:
             raise ValueError("observed must have shape (n_traces, n_timepoints).")
         if observed.shape[0] < 1 or observed.shape[1] < 1:
             raise ValueError("observed must have at least one trace and one timepoint.")
+        if self.dt is not None:
+            dt = _validate_positive_scalar(self.dt, "dt")
+            sampling_times = (
+                np.arange(observed.shape[1], dtype=FLOAT_DTYPE) + np.float32(0.5)
+            ) * dt
+            time_grid = np.arange(observed.shape[1] + 1, dtype=FLOAT_DTYPE) * dt
+            if self.sampling_times is not None:
+                existing_sampling_times = np.asarray(self.sampling_times, dtype=FLOAT_DTYPE)
+                if existing_sampling_times.shape != sampling_times.shape or not np.allclose(
+                    existing_sampling_times,
+                    sampling_times,
+                ):
+                    raise ValueError("dt cannot be combined with different sampling_times.")
+            if self.time_grid is not None:
+                existing_time_grid = np.asarray(self.time_grid, dtype=FLOAT_DTYPE)
+                if existing_time_grid.shape != time_grid.shape or not np.allclose(
+                    existing_time_grid,
+                    time_grid,
+                ):
+                    raise ValueError("dt cannot be combined with a different time_grid.")
+            object.__setattr__(self, "dt", dt)
+            object.__setattr__(self, "sampling_times", sampling_times.astype(FLOAT_DTYPE))
+            object.__setattr__(self, "time_grid", time_grid.astype(FLOAT_DTYPE))
         if self.time_grid is not None:
             _validate_time_grid(self.time_grid, "dataset.time_grid")
         if self.sampling_times is not None:
@@ -232,7 +182,7 @@ class MS2Dataset:
             if self.time_grid is None:
                 if sampling_times.size < 2:
                     raise ValueError(
-                        "time_grid is required when only one sampling time is provided."
+                        "dt is required when only one sampling time is provided."
                     )
                 dts = np.diff(sampling_times)
                 first_edge = sampling_times[0] - 0.5 * dts[0]
@@ -271,7 +221,8 @@ class ModelConfig:
     The most common fields are:
 
     - `n_states`: number of promoter states.
-    - `time_grid`: shared loading/promoter grid when datasets do not provide one.
+    - `dt`: optional shared frame spacing for regularly sampled datasets that
+      do not provide dataset-specific timing.
     - `ms2_kernel`, `t_rise`, `t_plateau`, `rna_intensity`: MS2 observation model.
     - `pol2_mode`: Pol2 posterior backend, usually `"auto"` or `"transfer"`.
     - `transition_rate_scope` and `loading_rate_scope`: `"dataset"`, `"track"`,
@@ -279,14 +230,18 @@ class ModelConfig:
     - `driven_transition_indices`: transition indices driven by contact. For
       column-sum-zero generators, use `ordered_transition_index(n_states,
       to_state, from_state)` to avoid orientation mistakes.
+    - `contact_drives`: dataset-ordered score arrays or callables for driven
+      contact. Array entries are thresholded as `score < rc`; callables may be
+      `fn(rc)` or `fn(times, rc)` and should return contact probabilities.
     - `rc_initial`, `rc_bounds`, `rc_candidate_values`: MAP settings for an
-      rc-dependent `ContactDrive`.
+      rc-dependent contact drive.
 
     Priors use shape/rate Gamma parameters for rates. Pinned parameters are set
     on the corresponding node after model construction.
     """
 
     n_states: int
+    dt: np.ndarray | float | None = None
     time_grid: np.ndarray | None = None
     initial_concentration: np.ndarray | None = None
     transition_prior_shape: np.ndarray | float = np.float32(1.0)
@@ -316,6 +271,7 @@ class ModelConfig:
     sampler_elbo_steps: int = 10
     sampler_elbo_repeats: int = 20
     driven_transition_indices: tuple[int, ...] = ()
+    contact_drives: tuple[ContactInputSpec, ...] = ()
     driven_rate_initial: np.ndarray | float = np.float32(1.0)
     driven_rate_bounds: tuple[float, float] = (1e-6, 1.0)
     driven_prior_shape: float = 1.0
@@ -327,6 +283,10 @@ class ModelConfig:
     def __post_init__(self) -> None:
         if self.n_states < 2:
             raise ValueError("n_states must be at least 2.")
+        if self.dt is not None:
+            if self.time_grid is not None:
+                raise ValueError("dt cannot be combined with time_grid.")
+            object.__setattr__(self, "dt", _validate_positive_scalar(self.dt, "dt"))
         if self.time_grid is not None:
             _validate_time_grid(self.time_grid, "time_grid")
         if self.pol2_mode not in {"auto", "transfer", "mean_field", "exact", "sampler"}:
@@ -405,6 +365,15 @@ class ModelConfig:
                 "driven_transition_indices must be valid transition indices."
             )
         object.__setattr__(self, "driven_transition_indices", driven_indices)
+        try:
+            contact_drives = tuple(self.contact_drives)
+        except TypeError as exc:
+            raise ValueError("contact_drives must be a tuple of arrays or callables.") from exc
+        if self.driven_transition_indices and not contact_drives:
+            raise ValueError("contact_drives must be set when driven_transition_indices is nonempty.")
+        if not self.driven_transition_indices and contact_drives:
+            raise ValueError("contact_drives requires driven_transition_indices.")
+        object.__setattr__(self, "contact_drives", contact_drives)
         lo_rate, hi_rate = self.driven_rate_bounds
         if not 0 < lo_rate < hi_rate:
             raise ValueError("driven_rate_bounds must satisfy 0 < lower < upper.")
@@ -459,10 +428,6 @@ class ViprodyneModel:
         timing, and noise only.
     config:
         Model structure, priors, fitting backend choices, and rate sharing.
-    contact_drive:
-        Optional model-level contact drive for driven transitions. Pass a
-        `ContactDrive`, a per-dataset mapping, a fixed probability array, or a
-        callable `fn(rc)` / `fn(time_grid, rc)`.
 
     Call `fit(...)` or `run_inference(...)` with CAVI keyword arguments such as
     `max_iterations`, `min_iterations`, `tolerance`, `rho`, and `progress`.
@@ -470,7 +435,6 @@ class ViprodyneModel:
 
     datasets: tuple[MS2Dataset, ...]
     config: ModelConfig
-    contact_drive: ContactDriveSpec = None
     graph: VariationalGraph = field(default_factory=VariationalGraph, init=False)
     dataset_nodes: dict[str, dict[str, str | list[str]]] = field(
         default_factory=dict, init=False
@@ -486,7 +450,14 @@ class ViprodyneModel:
         if not self.datasets:
             raise ValueError("at least one dataset is required.")
         self.datasets = _assign_dataset_names(self.datasets)
+        self.datasets = _assign_dataset_timing(self.datasets, self.config)
         _validate_rate_prefix_labels(self.datasets)
+        if self.config.driven_transition_indices and len(self.config.contact_drives) != len(
+            self.datasets
+        ):
+            raise ValueError(
+                "contact_drives must have one entry per dataset, in dataset input order."
+            )
         for dataset in self.datasets:
             self._time_grid(dataset)
         self._build_graph()
@@ -692,14 +663,16 @@ class ViprodyneModel:
         return config
 
     def _build_graph(self) -> None:
-        for dataset in self.datasets:
+        for dataset_index, dataset in enumerate(self.datasets):
             self.dataset_nodes[dataset.name] = self._add_dataset_plate(
                 dataset,
+                dataset_index,
             )
 
     def _add_dataset_plate(
         self,
         dataset: MS2Dataset,
+        dataset_index: int,
     ) -> dict[str, str | list[str]]:
         time_grid = self._time_grid(dataset)
         initial_name = f"{dataset.name}:pi"
@@ -710,7 +683,7 @@ class ViprodyneModel:
         self.graph.add_node(initial)
 
         transition_names = self._add_transition_rates(dataset.name)
-        contact_drive_name = self._add_contact_drive(dataset, transition_names)
+        contact_drive_name = self._add_contact_drive(dataset, transition_names, dataset_index)
         rate_edges = tuple(
             self._rate_edge(index, transition_name, contact_drive_name)
             for index, transition_name in enumerate(transition_names)
@@ -994,50 +967,32 @@ class ViprodyneModel:
         )
 
     def _add_contact_drive(
-        self, dataset: MS2Dataset, transition_names: list[str]
+        self,
+        dataset: MS2Dataset,
+        transition_names: list[str],
+        dataset_index: int,
     ) -> str | None:
         if not self.config.driven_transition_indices:
             return None
         time_grid = self._time_grid(dataset)
         n_intervals = time_grid.size - 1
         contact_name = f"{dataset.name}:rc"
-        contact_drive = self._contact_drive_for_dataset(dataset)
-        if contact_drive is None:
+        try:
+            contact_drive = self.config.contact_drives[dataset_index]
+        except IndexError as exc:
             raise ValueError(
-                "driven transition models require ViprodyneModel(contact_drive=...)."
-            )
+                "contact_drives must have one entry per dataset, in dataset input order."
+            ) from exc
 
-        if contact_drive.probability is not None:
-            contact = _validate_contact_array(
-                contact_drive.probability,
-                n_intervals=n_intervals,
-                name="contact probability",
-            )
-
-            def fixed_contact_probability(times, rc):
-                del times, rc
-                return contact
-
-            self.graph.add_node(
-                RcNode(
-                    name=contact_name,
-                    value=np.float32(1.0),
-                    time_grid=time_grid,
-                    contact_probability_fn=fixed_contact_probability,
-                    pinned=True,
-                )
-            )
-            return contact_name
-
-        if contact_drive.score is not None:
+        if callable(contact_drive):
+            probability_fn = _wrap_contact_probability_fn(contact_drive)
+            candidate_values = self.config.rc_candidate_values
+        else:
             contact_score = _validate_contact_array(
-                contact_drive.score,
+                contact_drive,
                 n_intervals=n_intervals,
                 name="contact score",
                 clip=False,
-            )
-            less_than = (
-                True if contact_drive.less_than is None else bool(contact_drive.less_than)
             )
 
             def threshold_contact_probability(times, rc):
@@ -1045,24 +1000,13 @@ class ViprodyneModel:
                 return _threshold_contact_score(
                     contact_score,
                     rc,
-                    less_than=less_than,
+                    less_than=True,
                 )
 
             probability_fn = threshold_contact_probability
-            candidate_values = (
-                contact_drive.candidate_values
-                if contact_drive.candidate_values is not None
-                else self.config.rc_candidate_values
-            )
+            candidate_values = self.config.rc_candidate_values
             if candidate_values is None:
                 candidate_values = _default_rc_candidate_values(contact_score, self.config.rc_bounds)
-        else:
-            probability_fn = _wrap_contact_probability_fn(contact_drive.probability_fn)
-            candidate_values = (
-                contact_drive.candidate_values
-                if contact_drive.candidate_values is not None
-                else self.config.rc_candidate_values
-            )
 
         objective = self._contact_drive_objective(
             probability_fn=probability_fn,
@@ -1081,19 +1025,6 @@ class ViprodyneModel:
             )
         )
         return contact_name
-
-    def _contact_drive_for_dataset(self, dataset: MS2Dataset) -> ContactDrive | None:
-        if self.contact_drive is not None:
-            if isinstance(self.contact_drive, Mapping):
-                try:
-                    value = self.contact_drive[dataset.name]
-                except KeyError as exc:
-                    raise KeyError(
-                        f"missing contact drive for dataset {dataset.name!r}."
-                    ) from exc
-                return _coerce_contact_drive(value)
-            return _coerce_contact_drive(self.contact_drive)
-        return None
 
     def _contact_drive_objective(
         self,
@@ -1160,10 +1091,13 @@ class ViprodyneModel:
     def _time_grid(self, dataset: MS2Dataset) -> np.ndarray:
         if dataset.time_grid is not None:
             return _validate_time_grid(dataset.time_grid, f"{dataset.name}.time_grid")
+        if self.config.dt is not None:
+            dt = _validate_positive_scalar(self.config.dt, "dt")
+            return np.arange(dataset.n_timepoints + 1, dtype=FLOAT_DTYPE) * dt
         if self.config.time_grid is not None:
             return _validate_time_grid(self.config.time_grid, "time_grid")
         raise ValueError(
-            "each dataset needs time_grid, or ModelConfig.time_grid must be set."
+            "each dataset needs dt or sampling_times, or ModelConfig.dt must be set."
         )
 
 
@@ -1174,6 +1108,13 @@ def _validate_time_grid(time_grid: np.ndarray, name: str) -> np.ndarray:
     if np.any(np.diff(time_grid) <= 0):
         raise ValueError(f"{name} must be strictly increasing.")
     return time_grid
+
+
+def _validate_positive_scalar(value: np.ndarray | float, name: str) -> np.float32:
+    scalar = np.asarray(value, dtype=FLOAT_DTYPE)
+    if scalar.shape != () or np.any(scalar <= 0.0):
+        raise ValueError(f"{name} must be a positive scalar.")
+    return np.float32(scalar)
 
 
 def _threshold_contact_score(
@@ -1216,20 +1157,11 @@ def _validate_contact_array(
         out = np.clip(out, 0.0, 1.0)
     return np.asarray(out, dtype=FLOAT_DTYPE)
 
-
-def _coerce_contact_drive(value) -> ContactDrive:
-    if isinstance(value, ContactDrive):
-        return value
-    if callable(value):
-        return ContactDrive.function(value)
-    return ContactDrive.fixed(np.asarray(value, dtype=FLOAT_DTYPE))
-
-
 def _wrap_contact_probability_fn(
     probability_fn: Callable | None,
 ) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
     if probability_fn is None:
-        raise ValueError("ContactDrive.probability_fn must be callable.")
+        raise ValueError("contact drive function must be callable.")
 
     def wrapped(time_grid: np.ndarray, rc_value: np.ndarray) -> np.ndarray:
         try:
@@ -1385,6 +1317,25 @@ def _assign_dataset_names(datasets: tuple[MS2Dataset, ...]) -> tuple[MS2Dataset,
         used_names.add(candidate)
         named.append(replace(dataset, name=candidate))
     return tuple(named)
+
+
+def _assign_dataset_timing(
+    datasets: tuple[MS2Dataset, ...],
+    config: ModelConfig,
+) -> tuple[MS2Dataset, ...]:
+    if config.dt is None:
+        return datasets
+    timed: list[MS2Dataset] = []
+    for dataset in datasets:
+        if (
+            dataset.dt is None
+            and dataset.sampling_times is None
+            and dataset.time_grid is None
+        ):
+            timed.append(replace(dataset, dt=config.dt))
+        else:
+            timed.append(dataset)
+    return tuple(timed)
 
 
 def _validate_rate_scope(scope: str, name: str) -> RateScope:

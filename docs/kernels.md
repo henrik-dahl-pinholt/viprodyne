@@ -1,7 +1,7 @@
 # MS2 Kernels
 
-The built-in kernel is `ProximalKernel`, a ramp-then-plateau response specified
-by `t_rise`, `t_plateau`, and `rna_intensity`.
+The built-in kernel is {class}`viprodyne.ProximalKernel`, a ramp-then-plateau
+response specified by `t_rise`, `t_plateau`, and `rna_intensity`.
 
 ```python
 config = ModelConfig(
@@ -23,7 +23,10 @@ def rectangular_kernel(time_offsets):
     return jnp.where((time_offsets >= 0.0) & (time_offsets < 0.75), 1.0, 0.0)
 
 
-config = ModelConfig(n_states=2, ms2_kernel=rectangular_kernel)
+config = ModelConfig(
+    n_states=2,
+    ms2_kernel=rectangular_kernel,
+)
 ```
 
 For regular MS2 traces, `pol2_mode="auto"` uses the transfer backend. This

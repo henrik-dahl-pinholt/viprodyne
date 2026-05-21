@@ -213,16 +213,15 @@ transition.
 
 ## Top-Level Model Builder
 
-Create one `MS2Dataset` per dataset plate and pass them to `ViprodyneModel` with
-a `ModelConfig`.
+Create one {class}`viprodyne.MS2Dataset` per dataset plate and pass them to
+{class}`viprodyne.ViprodyneModel` with a {class}`viprodyne.ModelConfig`.
 
 `MS2Dataset` contains observed intensities with shape
-`(n_traces, n_timepoints)`, noise, optional per-dataset `time_grid`, optional
-`sampling_times`, and optional missing-data mask. Contact drives are model
-inputs, not data fields. Single-trace datasets are passed as `(1, n_timepoints)`.
-Dataset names are optional on the data object; `ViprodyneModel` assigns stable
-names such as `dataset_0` to unnamed datasets and rejects duplicate explicit
-names.
+`(n_traces, n_timepoints)`, noise, optional `dt` or `sampling_times`, and an
+optional missing-data mask. Contact drives are model inputs, not data fields.
+Single-trace datasets are passed as `(1, n_timepoints)`. Dataset names are
+optional on the data object; `ViprodyneModel` assigns stable names such as
+`dataset_0` to unnamed datasets and rejects duplicate explicit names.
 It does not require users to pass dense design matrices or transfer windows.
 Those are derived internally from the MS2 kernel in `ModelConfig`.
 
@@ -253,28 +252,25 @@ import numpy as np
 from viprodyne import MS2Dataset, ModelConfig, ViprodyneModel
 
 dataset = MS2Dataset(
-    name="condition_0",
     observed=np.array([[0.1, np.nan, 0.8]], dtype=np.float32),
     noise_std=np.float32(0.5),
-    time_grid=np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
+    dt=np.float32(0.5),
 )
 
-model = ViprodyneModel(
-    datasets=(dataset,),
-    config=ModelConfig(
-        n_states=2,
-        shared_transition_rates=False,
-        shared_loading_rates=False,
-        pol2_mode="auto",
-        ms2_kernel="proximal",
-        t_rise=np.float32(0.25),
-        t_plateau=np.float32(0.75),
-        rna_intensity=np.float32(1.0),
-    ),
+config = ModelConfig(
+    n_states=2,
+    shared_transition_rates=False,
+    shared_loading_rates=False,
+    pol2_mode="auto",
+    ms2_kernel="proximal",
+    t_rise=np.float32(0.25),
+    t_plateau=np.float32(0.75),
+    rna_intensity=np.float32(1.0),
 )
 
+model = ViprodyneModel(datasets=(dataset,), config=config)
 fit = model.run_inference(max_iterations=100, tolerance=1e-4)
-condition = fit.datasets["condition_0"]
+condition = fit.datasets["dataset_0"]
 
 state_posterior = condition.state_posterior
 loading_posterior = condition.loading_posterior
@@ -283,9 +279,11 @@ transition_rates = condition.transition_rates
 loading_rates = condition.loading_rates
 ```
 
-The standard inference entry point is `model.run_inference(...)` or the alias
-`model.fit(...)`. It returns `ModelInferenceResult`, which contains the CAVI
-diagnostics and one `DatasetInferenceResult` per dataset plate. The result
+The standard inference entry point is
+{meth}`viprodyne.ViprodyneModel.run_inference` or the alias
+{meth}`viprodyne.ViprodyneModel.fit`. It returns
+{class}`viprodyne.ModelInferenceResult`, which contains the CAVI diagnostics
+and one {class}`viprodyne.DatasetInferenceResult` per dataset plate. The result
 fields expose posterior arrays and fitted rates without requiring users to look
 up graph node names.
 
@@ -320,14 +318,9 @@ fit = model.run_inference(max_iterations=100, tolerance=1e-4, compute_elbo=True)
 print(fit.cavi.converged, fit.cavi.max_parameter_change, fit.cavi.elbo)
 ```
 
-Datasets can either inherit `ModelConfig.time_grid` or provide their own
-`MS2Dataset.time_grid`. Per-dataset grids are the right representation when
-conditions have different frame timing or different trace lengths.
-
-By default, observations are assumed to occur at interval ends,
-`time_grid[1:n_timepoints + 1]`. Use `MS2Dataset.sampling_times` when frame
-times are not the interval ends. If `sampling_times` is supplied without a
-`time_grid`, the dataset infers interval boundaries from frame midpoints.
+Regularly sampled datasets should pass `dt`; irregularly sampled datasets
+should pass `MS2Dataset.sampling_times`. The model derives its internal loading
+intervals from those public timing inputs.
 
 `ModelConfig.ms2_kernel` can be a named kernel string, a `ProximalKernel`
 instance, or a custom JAX-compatible callable. The current built-in
@@ -342,22 +335,25 @@ proximal kernels; tune `sampler_iterations`, `sampler_repeats`,
 `sampler_fine_grid`, and the thermodynamic-integration settings when requesting
 sampler ELBOs with `sampler_compute_elbo=True`.
 
-Example with heterogeneous grids:
+Example with heterogeneous sampling times:
 
 ```python
 d0 = MS2Dataset(
     name="d0",
     observed=np.array([[0.1, 0.8]], dtype=np.float32),
     noise_std=np.float32(0.5),
-    time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+    sampling_times=np.array([0.25, 0.75], dtype=np.float32),
 )
 d1 = MS2Dataset(
     name="d1",
     observed=np.array([[0.2, 0.5, 0.9]], dtype=np.float32),
     noise_std=np.float32(0.5),
-    time_grid=np.array([0.0, 0.25, 0.75, 1.5], dtype=np.float32),
+    sampling_times=np.array([0.125, 0.5, 1.125], dtype=np.float32),
 )
-model = ViprodyneModel(datasets=(d0, d1), config=ModelConfig(n_states=2))
+config = ModelConfig(
+    n_states=2,
+)
+model = ViprodyneModel(datasets=(d0, d1), config=config)
 ```
 
 Example with a custom kernel:
@@ -368,65 +364,69 @@ import jax.numpy as jnp
 def rectangular_kernel(time_offsets):
     return jnp.where((time_offsets >= 0.0) & (time_offsets < 0.75), 1.0, 0.0)
 
+
+config = ModelConfig(
+    n_states=2,
+    ms2_kernel=rectangular_kernel,
+)
 model = ViprodyneModel(
     datasets=(dataset,),
-    config=ModelConfig(n_states=2, ms2_kernel=rectangular_kernel),
+    config=config,
 )
 ```
 
 Driven transitions are selected by transition index. For a two-state model,
-index `1` is `0 -> 1`.
+index `1` is `0 -> 1`. Contact-drive inputs are stored in `ModelConfig` as a
+dataset-ordered tuple.
 
 ```python
-from viprodyne import ContactDrive
-
 dataset = MS2Dataset(
-    name="condition_0",
     observed=np.array([[0.1, 0.8]], dtype=np.float32),
     noise_std=np.float32(0.5),
-    time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+    dt=np.float32(0.5),
 )
 
-model = ViprodyneModel(
-    datasets=(dataset,),
-    config=ModelConfig(
-        n_states=2,
-        driven_transition_indices=(1,),
-        driven_rate_initial=np.float32(0.8),
-        driven_rate_bounds=(1e-4, 10.0),
-    ),
-    contact_drive=ContactDrive.fixed(np.array([0.25, 0.75], dtype=np.float32)),
+def fixed_contact(rc):
+    del rc
+    return np.array([0.25, 0.75], dtype=np.float32)
+
+
+config = ModelConfig(
+    n_states=2,
+    driven_transition_indices=(1,),
+    contact_drives=(fixed_contact,),
+    driven_rate_initial=np.float32(0.8),
+    driven_rate_bounds=(1e-4, 10.0),
 )
+
+model = ViprodyneModel(datasets=(dataset,), config=config)
 ```
 
 Driven transition rates can be scoped as track, dataset, or global rates. The
 contact-drive node remains per track/dataset plate, so a shared driven-rate node
 can still receive different contact probabilities from different traces.
 
-If the contact drive is not pre-thresholded, pass a model-level
-`ContactDrive.threshold(...)`. The model then builds an unpinned `RcNode` which
-emits `p_contact(t)` from the current threshold and updates `rc` from the
-promoter-state Markov blanket:
+If contact is defined by thresholding a score, pass the score array directly.
+The model builds an unpinned `RcNode` which emits `p_contact(t)` from the
+current threshold and updates `rc` from the promoter-state Markov blanket:
 
 ```python
 dataset = MS2Dataset(
-    name="condition_0",
     observed=observed,
     noise_std=np.float32(0.5),
-    time_grid=time_grid,
+    dt=np.float32(0.5),
 )
 
-model = ViprodyneModel(
-    datasets=(dataset,),
-    config=ModelConfig(
-        n_states=2,
-        driven_transition_indices=(1,),
-        rc_initial=np.float32(0.3),
-        rc_bounds=(0.1, 1.0),
-        rc_candidate_values=np.linspace(0.1, 1.0, 10, dtype=np.float32),
-    ),
-    contact_drive=ContactDrive.threshold(contact_score),
+config = ModelConfig(
+    n_states=2,
+    driven_transition_indices=(1,),
+    contact_drives=(contact_score.astype(np.float32),),
+    rc_initial=np.float32(0.3),
+    rc_bounds=(0.1, 1.0),
+    rc_candidate_values=np.linspace(0.1, 1.0, 10, dtype=np.float32),
 )
+
+model = ViprodyneModel(datasets=(dataset,), config=config)
 ```
 
 When `rc_candidate_values` is omitted, the model derives a candidate grid from
@@ -441,26 +441,29 @@ contact probability, are supported by `profile_contact_threshold(...)`:
 ```python
 from viprodyne import CAVIConfig, profile_contact_threshold
 
+config = ModelConfig(
+    n_states=2,
+    driven_transition_indices=(1,),
+    contact_drives=(contact_score.astype(np.float32),),
+    ms2_kernel="proximal",
+)
+fit_config = CAVIConfig(max_iterations=100)
+
 profile = profile_contact_threshold(
     datasets=(dataset,),
-    config=ModelConfig(
-        n_states=2,
-        driven_transition_indices=(1,),
-        ms2_kernel="proximal",
-    ),
-    contact_scores=contact_score,
+    config=config,
     candidate_values=np.linspace(0.25, 2.0, 10, dtype=np.float32),
-    fit_config=CAVIConfig(max_iterations=100),
+    fit_config=fit_config,
 )
 
 best_fit = profile.best_fit
 best_threshold = profile.best_value
 ```
 
-This helper creates a fresh `ViprodyneModel` for each candidate with a
-candidate-specific model-level `ContactDrive.fixed(...)`, runs
-`model.run_inference(...)`, and returns the ELBO profile. It is intended as the
-package-native version of the ad hoc profile loop used in the
+This helper creates a fresh `ViprodyneModel` for each candidate using the same
+config-level drive pathway as MAP `rc` fitting, runs `model.run_inference(...)`,
+and returns the ELBO profile. It is intended as the package-native version of
+the ad hoc profile loop used in the
 `1_kon_rc_toy_identify.ipynb` notebook. A rendered package example lives at
 `examples/contact_threshold_profile.ipynb`, with the same workflow mirrored in
 `examples/contact_threshold_profile.py`.

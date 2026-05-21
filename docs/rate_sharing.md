@@ -3,6 +3,8 @@
 Rates can be fitted per track, per dataset group, or globally.
 
 ```python
+from viprodyne import ModelConfig
+
 config = ModelConfig(
     n_states=2,
     transition_rate_scope="global",
@@ -10,16 +12,18 @@ config = ModelConfig(
 )
 ```
 
-Use `MS2Dataset.rate_group` to share dataset-scoped rates across several
-datasets:
+Use {attr}`viprodyne.MS2Dataset.rate_group` to share dataset-scoped rates
+across several datasets:
 
 ```python
+from viprodyne import MS2Dataset
+
 dataset = MS2Dataset(
     name="replicate_0",
     rate_group="condition_a",
     observed=observed,
     noise_std=np.float32(0.5),
-    time_grid=time_grid,
+    dt=np.float32(0.5),
 )
 ```
 

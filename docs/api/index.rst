@@ -6,7 +6,6 @@ API Reference
    :recursive:
 
    viprodyne.MS2Dataset
-   viprodyne.ContactDrive
    viprodyne.ModelConfig
    viprodyne.ViprodyneModel
    viprodyne.DatasetInferenceResult

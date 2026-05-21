@@ -5,24 +5,21 @@ from viprodyne import MS2Dataset, ModelConfig, ViprodyneModel
 
 def test_getting_started_public_workflow_smoke():
     dataset = MS2Dataset(
-        name="condition_0",
         observed=np.array([[0.1, np.nan, 0.8]], dtype=np.float32),
         noise_std=np.float32(0.5),
-        time_grid=np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
+        dt=np.float32(0.5),
     )
-    model = ViprodyneModel(
-        datasets=(dataset,),
-        config=ModelConfig(
-            n_states=2,
-            ms2_kernel="proximal",
-            t_rise=np.float32(0.25),
-            t_plateau=np.float32(0.75),
-            rna_intensity=np.float32(1.0),
-        ),
+    config = ModelConfig(
+        n_states=2,
+        ms2_kernel="proximal",
+        t_rise=np.float32(0.25),
+        t_plateau=np.float32(0.75),
+        rna_intensity=np.float32(1.0),
     )
+    model = ViprodyneModel(datasets=(dataset,), config=config)
 
     fit = model.run_inference(max_iterations=2, min_iterations=2, compute_elbo=True)
-    posterior = fit.datasets["condition_0"]
+    posterior = fit.datasets["dataset_0"]
 
     assert fit.cavi.n_iterations == 2
     assert fit.cavi.elbo.dtype == np.float32

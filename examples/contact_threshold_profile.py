@@ -17,9 +17,8 @@ def main() -> None:
     n_observations = 24
     n_traces = 8
     dt = np.float32(0.5)
-    time_grid = np.arange(n_observations + 1, dtype=np.float32) * dt
-    observation_times = time_grid[1:]
-    loading_times = time_grid[:-1]
+    observation_times = (np.arange(n_observations, dtype=np.float32) + 0.5) * dt
+    loading_times = np.arange(n_observations, dtype=np.float32) * dt
     contact_score = (
         0.5 + 0.5 * np.sin(np.linspace(0.0, 2.0 * np.pi, n_observations, dtype=np.float32))
     ).astype(np.float32)
@@ -48,10 +47,9 @@ def main() -> None:
     ).astype(np.float32)
 
     dataset = MS2Dataset(
-        name="toy",
         observed=observed,
         noise_std=np.float32(0.1),
-        time_grid=time_grid,
+        dt=dt,
     )
     config = ModelConfig(
         n_states=2,
@@ -61,15 +59,16 @@ def main() -> None:
         t_plateau=np.float32(0.5),
         rna_intensity=np.float32(1.0),
         driven_transition_indices=(1,),
+        contact_drives=(contact_score,),
         driven_rate_initial=np.float32(0.8),
         driven_rate_bounds=(1e-3, 5.0),
     )
+    fit_config = CAVIConfig(max_iterations=10, min_iterations=10, tolerance=0.0)
     profile = profile_contact_threshold(
         datasets=(dataset,),
         config=config,
-        contact_scores=contact_score,
         candidate_values=np.linspace(0.2, 0.8, 7, dtype=np.float32),
-        fit_config=CAVIConfig(max_iterations=10, min_iterations=10, tolerance=0.0),
+        fit_config=fit_config,
     )
 
     print("candidate thresholds:", profile.candidate_values)

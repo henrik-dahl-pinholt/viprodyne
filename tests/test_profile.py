@@ -3,7 +3,6 @@ import pytest
 
 from viprodyne import (
     CAVIConfig,
-    ContactDrive,
     ContactThresholdProfileResult,
     MS2Dataset,
     ModelConfig,
@@ -26,6 +25,7 @@ def test_profile_contact_threshold_runs_candidates_and_returns_best_fit():
         t_rise=np.float32(0.5),
         t_plateau=np.float32(0.0),
         driven_transition_indices=(1,),
+        contact_drives=(np.array([0.2, 0.6, 0.9], dtype=np.float32),),
         driven_rate_initial=np.float32(0.5),
         driven_rate_bounds=(1e-3, 5.0),
     )
@@ -33,7 +33,6 @@ def test_profile_contact_threshold_runs_candidates_and_returns_best_fit():
     profile = profile_contact_threshold(
         datasets=(dataset,),
         config=config,
-        contact_scores=np.array([0.2, 0.6, 0.9], dtype=np.float32),
         candidate_values=np.array([0.3, 0.7], dtype=np.float32),
         fit_config=CAVIConfig(max_iterations=2, min_iterations=2, compute_elbo=False),
     )
@@ -64,13 +63,13 @@ def test_profile_contact_threshold_allows_candidates_with_no_contact():
         t_rise=np.float32(0.5),
         t_plateau=np.float32(0.0),
         driven_transition_indices=(1,),
+        contact_drives=(np.array([0.2, 0.6], dtype=np.float32),),
     )
 
     with pytest.warns(UserWarning, match="zero contact probability"):
         profile = profile_contact_threshold(
             datasets=(dataset,),
             config=config,
-            contact_scores=np.array([0.2, 0.6], dtype=np.float32),
             candidate_values=np.array([0.1, 0.5], dtype=np.float32),
             fit_config=CAVIConfig(max_iterations=1, min_iterations=1),
         )
@@ -81,7 +80,7 @@ def test_profile_contact_threshold_allows_candidates_with_no_contact():
     np.testing.assert_allclose(profile.fits[0].datasets["toy"].contact_probability, [0.0, 0.0])
 
 
-def test_profile_contact_threshold_uses_dataset_score_mapping():
+def test_profile_contact_threshold_uses_dataset_ordered_score_inputs():
     dataset = MS2Dataset(
         name="toy",
         observed=np.array([[0.1, 0.4]], dtype=np.float32),
@@ -94,18 +93,21 @@ def test_profile_contact_threshold_uses_dataset_score_mapping():
         t_rise=np.float32(0.5),
         t_plateau=np.float32(0.0),
         driven_transition_indices=(1,),
+        contact_drives=(np.array([0.2, 0.6], dtype=np.float32),),
     )
 
     profile = profile_contact_threshold(
         datasets=(dataset,),
         config=config,
-        contact_scores={"toy": np.array([0.2, 0.6], dtype=np.float32)},
         candidate_values=np.array([0.5], dtype=np.float32),
         fit_config=CAVIConfig(max_iterations=1, min_iterations=1),
-        less_than=False,
     )
 
     assert profile.elbos.shape == (1,)
+    np.testing.assert_allclose(
+        profile.best_fit.datasets["toy"].contact_probability,
+        np.array([1.0, 0.0], dtype=np.float32),
+    )
     assert profile.best_fit.datasets["toy"].state_posterior.shape == (1, 3, 2)
 
 
@@ -116,21 +118,22 @@ def test_profile_contact_threshold_accepts_probability_function():
         noise_std=np.float32(0.5),
         time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
     )
+
+    def contact_from_rc(rc):
+        return np.array([rc, np.float32(1.0) - rc], dtype=np.float32)
+
     config = ModelConfig(
         n_states=2,
         pol2_mode="transfer",
         t_rise=np.float32(0.5),
         t_plateau=np.float32(0.0),
         driven_transition_indices=(1,),
+        contact_drives=(contact_from_rc,),
     )
-
-    def contact_from_rc(rc):
-        return np.array([rc, np.float32(1.0) - rc], dtype=np.float32)
 
     profile = profile_contact_threshold(
         datasets=(dataset,),
         config=config,
-        contact_scores=contact_from_rc,
         candidate_values=np.array([0.25, 0.75], dtype=np.float32),
         fit_config=CAVIConfig(max_iterations=1, min_iterations=1),
     )
@@ -146,28 +149,29 @@ def test_profile_contact_threshold_accepts_probability_function():
     )
 
 
-def test_profile_contact_threshold_accepts_time_grid_probability_function_mapping():
+def test_profile_contact_threshold_accepts_time_grid_probability_function():
     dataset = MS2Dataset(
         name="toy",
         observed=np.array([[0.1, 0.4]], dtype=np.float32),
         noise_std=np.float32(0.5),
         time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
     )
+
+    def contact_from_grid(time_grid, rc):
+        return np.where(time_grid[1:] <= rc, np.float32(1.0), np.float32(0.0))
+
     config = ModelConfig(
         n_states=2,
         pol2_mode="transfer",
         t_rise=np.float32(0.5),
         t_plateau=np.float32(0.0),
         driven_transition_indices=(1,),
+        contact_drives=(contact_from_grid,),
     )
-
-    def contact_from_grid(time_grid, rc):
-        return np.where(time_grid[1:] <= rc, np.float32(1.0), np.float32(0.0))
 
     profile = profile_contact_threshold(
         datasets=(dataset,),
         config=config,
-        contact_scores={"toy": contact_from_grid},
         candidate_values=np.array([0.5], dtype=np.float32),
         fit_config=CAVIConfig(max_iterations=1, min_iterations=1),
     )
@@ -191,12 +195,12 @@ def test_profile_contact_threshold_accepts_sampling_times_without_time_grid():
         t_rise=np.float32(0.5),
         t_plateau=np.float32(0.0),
         driven_transition_indices=(1,),
+        contact_drives=(np.array([0.2, 0.6, 0.9], dtype=np.float32),),
     )
 
     profile = profile_contact_threshold(
         datasets=(dataset,),
         config=config,
-        contact_scores=np.array([0.2, 0.6, 0.9], dtype=np.float32),
         candidate_values=np.array([0.5], dtype=np.float32),
         fit_config=CAVIConfig(max_iterations=1, min_iterations=1, compute_elbo=False),
     )
@@ -222,12 +226,12 @@ def test_profile_contact_threshold_names_unnamed_datasets_deterministically():
         t_rise=np.float32(0.5),
         t_plateau=np.float32(0.0),
         driven_transition_indices=(1,),
+        contact_drives=(np.array([0.2, 0.6], dtype=np.float32),),
     )
 
     profile = profile_contact_threshold(
         datasets=(dataset,),
         config=config,
-        contact_scores=np.array([0.2, 0.6], dtype=np.float32),
         candidate_values=np.array([0.5], dtype=np.float32),
         fit_config=CAVIConfig(max_iterations=1, min_iterations=1, compute_elbo=False),
     )
@@ -284,6 +288,7 @@ def test_profile_contact_threshold_recovers_latent_statistics_from_synthetic_dat
         t_plateau=np.float32(0.5),
         rna_intensity=np.float32(1.0),
         driven_transition_indices=(1,),
+        contact_drives=(contact_score,),
         driven_rate_initial=np.float32(1.0),
         driven_rate_bounds=(1e-3, 5.0),
     )
@@ -291,7 +296,6 @@ def test_profile_contact_threshold_recovers_latent_statistics_from_synthetic_dat
     profile = profile_contact_threshold(
         datasets=(dataset,),
         config=config,
-        contact_scores=contact_score,
         candidate_values=np.array([0.2, 0.3, 0.4, 0.5, 0.6], dtype=np.float32),
         fit_config=CAVIConfig(max_iterations=20, min_iterations=20, tolerance=0.0),
     )
@@ -311,13 +315,13 @@ def test_profile_contact_threshold_recovers_latent_statistics_from_synthetic_dat
             t_plateau=np.float32(0.5),
             rna_intensity=np.float32(1.0),
             driven_transition_indices=(1,),
+            contact_drives=(contact_score,),
             driven_rate_initial=np.float32(1.0),
             driven_rate_bounds=(1e-3, 5.0),
             rc_initial=true_threshold,
             rc_bounds=(0.2, 0.6),
             rc_candidate_values=np.array([0.2, 0.3, 0.4, 0.5, 0.6], dtype=np.float32),
         ),
-        contact_drive=ContactDrive.threshold(contact_score),
     )
     direct_fit = direct_model.run_inference(
         CAVIConfig(max_iterations=20, min_iterations=20, tolerance=0.0),

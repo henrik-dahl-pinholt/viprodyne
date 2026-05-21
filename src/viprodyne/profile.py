@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 import warnings
 
@@ -10,14 +9,10 @@ import numpy as np
 
 from viprodyne.fit import CAVIConfig
 from viprodyne.model import (
-    ContactDrive,
     MS2Dataset,
     ModelConfig,
     ModelInferenceResult,
     ViprodyneModel,
-    _assign_dataset_names,
-    _interval_contact_probability,
-    _validate_time_grid,
 )
 
 FLOAT_DTYPE = np.float32
@@ -50,24 +45,22 @@ class ContactThresholdProfileResult:
 def profile_contact_threshold(
     datasets: tuple[MS2Dataset, ...],
     config: ModelConfig,
-    contact_scores: Mapping[str, np.ndarray | Callable] | np.ndarray | Callable,
-    candidate_values: np.ndarray,
+    candidate_values: np.ndarray | None = None,
     *,
     fit_config: CAVIConfig | None = None,
-    less_than: bool = True,
     verbose: bool = False,
     **kwargs,
 ) -> ContactThresholdProfileResult:
     """Fit one model per contact-threshold candidate.
 
-    This supports workflows where an external score `z(t)` is converted into a
-    contact probability by thresholding, for example `p_contact(t) = z(t) < rc`.
-    `contact_scores` may also be a function `fn(rc)` or `fn(time_grid, rc)`
-    returning contact probabilities directly; mappings can provide arrays or
-    functions per dataset.
-    Each candidate produces a fresh `ViprodyneModel` with a model-level fixed
-    `ContactDrive`; the input datasets are not modified.
+    Contact drives are read from `config.contact_drives`. Each candidate
+    produces a fresh `ViprodyneModel` with `rc` pinned to that candidate through
+    the same model-construction path used by MAP rc fitting.
     """
+    if candidate_values is None:
+        if config.rc_candidate_values is None:
+            raise ValueError("candidate_values or config.rc_candidate_values must be set.")
+        candidate_values = config.rc_candidate_values
     candidate_values = np.asarray(candidate_values, dtype=FLOAT_DTYPE)
     if candidate_values.ndim != 1 or candidate_values.size == 0:
         raise ValueError("candidate_values must be a non-empty one-dimensional array.")
@@ -75,7 +68,6 @@ def profile_contact_threshold(
         raise ValueError(
             "config.driven_transition_indices must be set for contact profiling."
         )
-    datasets = _assign_dataset_names(tuple(datasets))
     fit_config = (
         CAVIConfig(compute_elbo=True, **kwargs) if fit_config is None else fit_config
     )
@@ -89,23 +81,13 @@ def profile_contact_threshold(
             print(
                 f"Profiling contact threshold candidate {candidate}...({fits.__len__() + 1}/{candidate_values.size})"
             )
-        contact_drive = {
-            dataset.name: ContactDrive.fixed(
-                _profile_contact_probability(
-                    contact_scores,
-                    dataset=dataset,
-                    config=config,
-                    candidate=candidate,
-                    less_than=less_than,
-                )
-            )
-            for dataset in datasets
-        }
-        contact_mass = sum(
-            float(np.sum(np.asarray(drive.probability, dtype=FLOAT_DTYPE)))
-            for drive in contact_drive.values()
-            if drive.probability is not None
+        candidate_config = replace(
+            config,
+            rc_initial=np.asarray(candidate, dtype=FLOAT_DTYPE),
+            rc_candidate_values=np.asarray([candidate], dtype=FLOAT_DTYPE),
         )
+        model = ViprodyneModel(datasets, candidate_config)
+        contact_mass = _model_contact_mass(model)
         if contact_mass <= 0.0:
             warnings.warn(
                 "contact threshold candidate "
@@ -115,7 +97,6 @@ def profile_contact_threshold(
                 UserWarning,
                 stacklevel=2,
             )
-        model = ViprodyneModel(datasets, config, contact_drive=contact_drive)
         fit = model.run_inference(config=fit_config)
         if fit.cavi is None or fit.cavi.elbo is None:
             raise RuntimeError("contact-threshold profiling requires ELBO computation.")
@@ -129,64 +110,13 @@ def profile_contact_threshold(
     )
 
 
-def _profile_contact_probability(
-    contact_scores: Mapping[str, np.ndarray | Callable] | np.ndarray | Callable,
-    *,
-    dataset: MS2Dataset,
-    config: ModelConfig,
-    candidate: np.ndarray,
-    less_than: bool,
-) -> np.ndarray:
-    source = _contact_source_for_dataset(contact_scores, dataset.name)
-    if callable(source):
-        time_grid = _profile_time_grid(dataset, config)
-        try:
-            values = source(time_grid, candidate)
-        except TypeError as first_error:
-            try:
-                values = source(candidate)
-            except TypeError:
-                raise first_error
-        return _interval_contact_probability(
-            np.asarray(values, dtype=FLOAT_DTYPE),
-            n_intervals=time_grid.size - 1,
-        )
-    return _threshold_contact_score(
-        np.asarray(source, dtype=FLOAT_DTYPE),
-        candidate,
-        less_than=less_than,
-    )
-
-
-def _contact_source_for_dataset(
-    contact_scores: Mapping[str, np.ndarray | Callable] | np.ndarray | Callable,
-    dataset_name: str,
-) -> np.ndarray | Callable:
-    if isinstance(contact_scores, Mapping):
-        try:
-            return contact_scores[dataset_name]
-        except KeyError as exc:
-            raise KeyError(
-                f"missing contact score for dataset {dataset_name!r}."
-            ) from exc
-    return contact_scores
-
-
-def _profile_time_grid(dataset: MS2Dataset, config: ModelConfig) -> np.ndarray:
-    if dataset.time_grid is not None:
-        return _validate_time_grid(dataset.time_grid, f"{dataset.name}.time_grid")
-    if config.time_grid is not None:
-        return _validate_time_grid(config.time_grid, "time_grid")
-    raise ValueError("each dataset needs time_grid, or ModelConfig.time_grid must be set.")
-
-
-def _threshold_contact_score(
-    score: np.ndarray,
-    candidate: np.ndarray,
-    *,
-    less_than: bool,
-) -> np.ndarray:
-    score = np.asarray(score, dtype=FLOAT_DTYPE)
-    candidate = np.asarray(candidate, dtype=FLOAT_DTYPE)
-    contact = score < candidate if less_than else score > candidate
-    return np.asarray(contact, dtype=FLOAT_DTYPE)
+def _model_contact_mass(model: ViprodyneModel) -> float:
+    total = 0.0
+    for nodes in model.dataset_nodes.values():
+        contact_name = nodes["contact_drive"]
+        if contact_name is None:
+            continue
+        moments = model.graph.moments.get(str(contact_name))
+        if "p_contact" in moments:
+            total += float(np.sum(np.asarray(moments["p_contact"], dtype=FLOAT_DTYPE)))
+    return total

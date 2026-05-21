@@ -27,25 +27,22 @@ import numpy as np
 from viprodyne import MS2Dataset, ModelConfig, ViprodyneModel
 
 dataset = MS2Dataset(
-    name="condition_0",
     observed=np.array([[0.1, np.nan, 0.8]], dtype=np.float32),
     noise_std=np.float32(0.5),
-    time_grid=np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
+    dt=np.float32(0.5),
 )
 
-model = ViprodyneModel(
-    datasets=(dataset,),
-    config=ModelConfig(
-        n_states=2,
-        ms2_kernel="proximal",
-        t_rise=np.float32(0.25),
-        t_plateau=np.float32(0.75),
-        rna_intensity=np.float32(1.0),
-    ),
+config = ModelConfig(
+    n_states=2,
+    ms2_kernel="proximal",
+    t_rise=np.float32(0.25),
+    t_plateau=np.float32(0.75),
+    rna_intensity=np.float32(1.0),
 )
 
+model = ViprodyneModel(datasets=(dataset,), config=config)
 fit = model.run_inference(max_iterations=100, tolerance=1e-4)
-posterior = fit.datasets["condition_0"]
+posterior = fit.datasets["dataset_0"]
 
 print(fit.cavi.converged, fit.cavi.elbo)
 print(posterior.state_posterior.shape)
@@ -82,28 +79,23 @@ config = ModelConfig(
 Fit a contact-threshold drive inside one model:
 
 ```python
-from viprodyne import ContactDrive
-
 dataset = MS2Dataset(
-    name="condition_0",
     observed=observed,
     noise_std=np.float32(0.5),
-    time_grid=time_grid,
+    dt=np.float32(0.5),
 )
 
-model = ViprodyneModel(
-    datasets=(dataset,),
-    config=ModelConfig(
-        n_states=2,
-        driven_transition_indices=(1,),
-        rc_initial=np.float32(0.3),
-        rc_bounds=(0.1, 1.0),
-    ),
-    contact_drive=ContactDrive.threshold(contact_score),
+config = ModelConfig(
+    n_states=2,
+    driven_transition_indices=(1,),
+    contact_drives=(contact_score,),
+    rc_initial=np.float32(0.3),
+    rc_bounds=(0.1, 1.0),
 )
 
+model = ViprodyneModel(datasets=(dataset,), config=config)
 fit = model.run_inference(max_iterations=100)
-print(fit.datasets["condition_0"].contact_rc)
+print(fit.datasets["dataset_0"].contact_rc)
 ```
 
 Run an outer threshold profile:
@@ -111,12 +103,18 @@ Run an outer threshold profile:
 ```python
 from viprodyne import CAVIConfig, profile_contact_threshold
 
+profile_config = ModelConfig(
+    n_states=2,
+    driven_transition_indices=(1,),
+    contact_drives=(contact_score,),
+)
+fit_config = CAVIConfig(max_iterations=100)
+
 profile = profile_contact_threshold(
     datasets=(dataset,),
-    config=ModelConfig(n_states=2, driven_transition_indices=(1,)),
-    contact_scores=contact_score,
+    config=profile_config,
     candidate_values=np.linspace(0.1, 1.0, 10, dtype=np.float32),
-    fit_config=CAVIConfig(max_iterations=100),
+    fit_config=fit_config,
 )
 
 print(profile.best_value, profile.elbos)

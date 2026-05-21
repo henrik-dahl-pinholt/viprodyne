@@ -5,9 +5,10 @@ models to MS2-like live-imaging transcription data.
 
 The package is built around one workflow:
 
-1. Put one experiment or condition into an `MS2Dataset`.
-2. Choose a promoter model, MS2 kernel, and rate-sharing structure with `ModelConfig`.
-3. Run `ViprodyneModel.run_inference`.
+1. Put one experiment or condition into an {class}`viprodyne.MS2Dataset`.
+2. Choose a promoter model, MS2 kernel, and rate-sharing structure with
+   {class}`viprodyne.ModelConfig`.
+3. Run {meth}`viprodyne.ViprodyneModel.run_inference`.
 4. Inspect state posteriors, loading posteriors, fitted rates, and predicted signal.
 
 ```{toctree}
