@@ -24,4 +24,5 @@ missing_data
 examples
 api/index
 developer/architecture
+developer/ms2posterior_parity
 ```
