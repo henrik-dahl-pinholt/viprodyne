@@ -296,10 +296,11 @@ expensive.
 
 Each `DatasetInferenceResult` contains:
 
-- `state_posterior`: promoter state posterior on the CTMC grid, shaped
-  `(n_traces, n_grid_points, n_states)`;
-- `loading_posterior`: Pol2 loading posterior on the loading grid, shaped
-  `(n_traces, n_loadings)`;
+- `state_posterior`: promoter state posterior on `state_posterior_times`,
+  shaped `(n_traces, n_state_times, n_states)`;
+- `loading_posterior`: Pol2 loading posterior on `loading_posterior_times`,
+  shaped `(n_traces, n_loading_times)`;
+- `loading_posterior_rate`: posterior Pol2 loading rate for sampler mode;
 - `predicted_signal`: posterior mean MS2 intensity at observation times;
 - `loading_mask`: loading-grid support mask derived from missing observations;
 - `initial_probabilities`, `transition_rates`, and `loading_rates`: fitted
@@ -331,9 +332,15 @@ parameterized kernel is `"proximal"` and uses `t_rise`, `t_plateau`, and
 configuration. `pol2_mode="mean_field"` or `"exact"` asks the builder to create
 the internal dense representation and should be reserved for small tests and
 diagnostics. `pol2_mode="sampler"` uses the continuous Pol2 sampler for
-proximal kernels; tune `sampler_iterations`, `sampler_repeats`,
-`sampler_fine_grid`, and the thermodynamic-integration settings when requesting
-sampler ELBOs with `sampler_compute_elbo=True`.
+proximal kernels; tune `sampler_iterations`, `sampler_repeats`, and
+`sampler_fine_grid`. Sampler ELBOs can use thermodynamic integration with
+`sampler_compute_elbo=True`, or a final mean-field diagnostic term with
+`pol2_elbo_mode="mean_field"`.
+
+`run_inference`, `fit`, `inference_result`, and `dataset_result` accept
+`posterior_times`, plus separate `state_times` and `loading_times` overrides.
+These affect only returned posterior arrays. MS2 signal predictions remain on
+the observation times.
 
 Example with heterogeneous sampling times:
 

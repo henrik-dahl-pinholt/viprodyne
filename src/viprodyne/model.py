@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal
 
@@ -44,9 +44,9 @@ class DatasetInferenceResult:
 
     The arrays in this object are copied from the variational graph after
     fitting, so they can be inspected without touching internal node objects.
-    `state_posterior` is indexed by trace, grid point, and promoter state.
-    `loading_posterior` is indexed by trace and loading interval when a Pol2
-    loading node is present.
+    `state_posterior` is indexed by trace, requested state-posterior time,
+    and promoter state. `loading_posterior` is indexed by trace and requested
+    loading-posterior time when a Pol2 loading node is present.
     """
 
     name: str
@@ -65,6 +65,9 @@ class DatasetInferenceResult:
     loading_rate_nodes: dict[int, str]
     contact_rc: np.ndarray | None = None
     contact_probability: np.ndarray | None = None
+    state_posterior_times: np.ndarray | None = None
+    loading_posterior_times: np.ndarray | None = None
+    loading_posterior_rate: np.ndarray | None = None
 
     def __str__(self) -> str:
         parts = [
@@ -181,9 +184,7 @@ class MS2Dataset:
                 raise ValueError("sampling_times must be strictly increasing.")
             if self.time_grid is None:
                 if sampling_times.size < 2:
-                    raise ValueError(
-                        "dt is required when only one sampling time is provided."
-                    )
+                    raise ValueError("dt is required when only one sampling time is provided.")
                 dts = np.diff(sampling_times)
                 first_edge = sampling_times[0] - 0.5 * dts[0]
                 interior_edges = 0.5 * (sampling_times[:-1] + sampling_times[1:])
@@ -203,6 +204,7 @@ class MS2Dataset:
             mask = np.asarray(self.finite_mask, dtype=bool)
             if mask.shape != observed.shape:
                 raise ValueError("finite_mask must have the same shape as observed.")
+
     @property
     def n_traces(self) -> int:
         """Number of traces in this dataset plate."""
@@ -225,6 +227,9 @@ class ModelConfig:
       do not provide dataset-specific timing.
     - `ms2_kernel`, `t_rise`, `t_plateau`, `rna_intensity`: MS2 observation model.
     - `pol2_mode`: Pol2 posterior backend, usually `"auto"` or `"transfer"`.
+    - `pol2_elbo_mode`: local Pol2 ELBO backend. `"native"` uses the posterior
+      backend's own contribution; `"mean_field"` keeps the posterior backend but
+      computes a mean-field diagnostic contribution.
     - `transition_rate_scope` and `loading_rate_scope`: `"dataset"`, `"track"`,
       or `"global"` sharing.
     - `driven_transition_indices`: transition indices driven by contact. For
@@ -257,6 +262,7 @@ class ModelConfig:
     transition_rate_scopes: dict[int, RateScope] = field(default_factory=dict)
     loading_rate_scopes: dict[int, RateScope] = field(default_factory=dict)
     pol2_mode: str = "auto"
+    pol2_elbo_mode: Literal["native", "mean_field"] = "native"
     ms2_kernel: ProximalKernel | str | Callable | None = "proximal"
     t_rise: np.ndarray | float = np.float32(1.0)
     t_plateau: np.ndarray | float = np.float32(0.0)
@@ -293,6 +299,8 @@ class ModelConfig:
             raise ValueError(
                 "pol2_mode must be 'auto', 'transfer', 'mean_field', 'exact', or 'sampler'."
             )
+        if self.pol2_elbo_mode not in {"native", "mean_field"}:
+            raise ValueError("pol2_elbo_mode must be 'native' or 'mean_field'.")
         if self.kernel_support_tolerance < 0:
             raise ValueError("kernel_support_tolerance must be non-negative.")
         if self.sampler_fine_grid is not None:
@@ -361,16 +369,16 @@ class ModelConfig:
         )
         driven_indices = tuple(int(index) for index in self.driven_transition_indices)
         if any(index < 0 or index >= n_edges for index in driven_indices):
-            raise ValueError(
-                "driven_transition_indices must be valid transition indices."
-            )
+            raise ValueError("driven_transition_indices must be valid transition indices.")
         object.__setattr__(self, "driven_transition_indices", driven_indices)
         try:
             contact_drives = tuple(self.contact_drives)
         except TypeError as exc:
             raise ValueError("contact_drives must be a tuple of arrays or callables.") from exc
         if self.driven_transition_indices and not contact_drives:
-            raise ValueError("contact_drives must be set when driven_transition_indices is nonempty.")
+            raise ValueError(
+                "contact_drives must be set when driven_transition_indices is nonempty."
+            )
         if not self.driven_transition_indices and contact_drives:
             raise ValueError("contact_drives requires driven_transition_indices.")
         object.__setattr__(self, "contact_drives", contact_drives)
@@ -389,9 +397,7 @@ class ModelConfig:
         if self.rc_candidate_values is not None:
             candidates = np.asarray(self.rc_candidate_values, dtype=FLOAT_DTYPE)
             if candidates.ndim != 1 or candidates.size == 0:
-                raise ValueError(
-                    "rc_candidate_values must be a non-empty one-dimensional array."
-                )
+                raise ValueError("rc_candidate_values must be a non-empty one-dimensional array.")
             if np.any(candidates <= 0.0):
                 raise ValueError("rc_candidate_values must be positive.")
             object.__setattr__(self, "rc_candidate_values", candidates)
@@ -405,7 +411,8 @@ class ModelConfig:
         return "\n".join(
             [
                 "ModelConfig(",
-                f"  n_states={self.n_states}, pol2_mode={self.pol2_mode!r},",
+                f"  n_states={self.n_states}, pol2_mode={self.pol2_mode!r}, "
+                f"pol2_elbo_mode={self.pol2_elbo_mode!r},",
                 f"  ms2_kernel={_kernel_summary(self.ms2_kernel)},",
                 f"  transition_rate_scope={self.transition_rate_scope!r}, "
                 f"loading_rate_scope={self.loading_rate_scope!r},",
@@ -436,17 +443,13 @@ class ViprodyneModel:
     datasets: tuple[MS2Dataset, ...]
     config: ModelConfig
     graph: VariationalGraph = field(default_factory=VariationalGraph, init=False)
-    dataset_nodes: dict[str, dict[str, str | list[str]]] = field(
-        default_factory=dict, init=False
-    )
+    dataset_nodes: dict[str, dict[str, str | list[str]]] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         try:
             self.datasets = tuple(self.datasets)
         except TypeError as exc:
-            raise ValueError(
-                "datasets must be a tuple or list of MS2Dataset objects."
-            ) from exc
+            raise ValueError("datasets must be a tuple or list of MS2Dataset objects.") from exc
         if not self.datasets:
             raise ValueError("at least one dataset is required.")
         self.datasets = _assign_dataset_names(self.datasets)
@@ -480,7 +483,15 @@ class ViprodyneModel:
         config = self._cavi_config(config, kwargs)
         return run_cavi(self, config=config)
 
-    def run_inference(self, config=None, **kwargs) -> ModelInferenceResult:
+    def run_inference(
+        self,
+        config=None,
+        *,
+        posterior_times=None,
+        state_times=None,
+        loading_times=None,
+        **kwargs,
+    ) -> ModelInferenceResult:
         """Run CAVI and return structured posterior outputs.
 
         `config` may be a `CAVIConfig`. If omitted, keyword arguments are passed
@@ -495,33 +506,65 @@ class ViprodyneModel:
         return self.inference_result(
             cavi=cavi_result,
             include_elbo_terms=bool(config.compute_elbo),
+            posterior_times=posterior_times,
+            state_times=state_times,
+            loading_times=loading_times,
         )
 
-    def fit(self, config=None, **kwargs) -> ModelInferenceResult:
+    def fit(
+        self,
+        config=None,
+        *,
+        posterior_times=None,
+        state_times=None,
+        loading_times=None,
+        **kwargs,
+    ) -> ModelInferenceResult:
         """Alias for `run_inference`.
 
         This is the shortest public fitting entry point. Use CAVI keyword
         arguments here directly, for example `model.fit(tolerance=1e-3,
         max_iterations=200, progress=True)`.
         """
-        return self.run_inference(config=config, **kwargs)
+        return self.run_inference(
+            config=config,
+            posterior_times=posterior_times,
+            state_times=state_times,
+            loading_times=loading_times,
+            **kwargs,
+        )
 
     def inference_result(
         self,
         cavi=None,
         include_elbo_terms: bool = True,
+        posterior_times=None,
+        state_times=None,
+        loading_times=None,
     ) -> ModelInferenceResult:
         """Collect current graph moments into structured inference outputs."""
         return ModelInferenceResult(
             cavi=cavi,
             datasets={
-                dataset.name: self.dataset_result(dataset.name)
+                dataset.name: self.dataset_result(
+                    dataset.name,
+                    posterior_times=posterior_times,
+                    state_times=state_times,
+                    loading_times=loading_times,
+                )
                 for dataset in self.datasets
             },
             elbo_terms=self.compute_elbo_terms() if include_elbo_terms else None,
         )
 
-    def dataset_result(self, dataset_name: str) -> DatasetInferenceResult:
+    def dataset_result(
+        self,
+        dataset_name: str,
+        *,
+        posterior_times=None,
+        state_times=None,
+        loading_times=None,
+    ) -> DatasetInferenceResult:
         """Return structured posterior outputs for one dataset plate."""
         try:
             dataset = next(item for item in self.datasets if item.name == dataset_name)
@@ -534,26 +577,49 @@ class ViprodyneModel:
         initial = self.graph.moments.get(str(nodes["initial"]))
         polymerase_name = nodes["polymerase"]
         polymerase = (
-            self.graph.moments.get(str(polymerase_name))
-            if polymerase_name is not None
-            else {}
+            self.graph.moments.get(str(polymerase_name)) if polymerase_name is not None else {}
         )
         contact_name = nodes["contact_drive"]
-        contact = (
-            self.graph.moments.get(str(contact_name))
-            if contact_name is not None
-            else {}
+        contact = self.graph.moments.get(str(contact_name)) if contact_name is not None else {}
+        polymerase_node = (
+            self.graph.nodes[str(polymerase_name)] if polymerase_name is not None else None
         )
         sampling_times = None
-        if polymerase_name is not None:
+        if polymerase_node is not None:
             sampling_times = np.asarray(
-                self.graph.nodes[str(polymerase_name)].sampling_times,
+                polymerase_node.sampling_times,
                 dtype=FLOAT_DTYPE,
             ).copy()
         elif dataset.sampling_times is not None:
-            sampling_times = np.asarray(
-                dataset.sampling_times, dtype=FLOAT_DTYPE
-            ).copy()
+            sampling_times = np.asarray(dataset.sampling_times, dtype=FLOAT_DTYPE).copy()
+        state_times = _resolve_time_spec(
+            state_times if state_times is not None else posterior_times,
+            dataset.name,
+            "state_times",
+        )
+        loading_times = _resolve_time_spec(
+            loading_times if loading_times is not None else posterior_times,
+            dataset.name,
+            "loading_times",
+        )
+        state_posterior, state_posterior_times = _state_posterior_at_times(
+            self.graph.nodes[str(nodes["promoter"])],
+            promoter,
+            state_times,
+        )
+        loading_posterior, loading_posterior_times = _loading_posterior_at_times(
+            polymerase_node,
+            polymerase,
+            "load_probabilities",
+            loading_times,
+        )
+        loading_posterior_rate, _ = _loading_posterior_at_times(
+            polymerase_node,
+            polymerase,
+            "posterior_rate",
+            loading_times,
+        )
+        loading_mask = _loading_mask_at_times(polymerase_node, polymerase, loading_times)
 
         transition_rate_nodes = {
             index: name for index, name in enumerate(list(nodes["transition_rates"]))
@@ -567,10 +633,10 @@ class ViprodyneModel:
             sampling_times=sampling_times,
             observed=np.asarray(observed["observed"], dtype=FLOAT_DTYPE).copy(),
             finite_mask=np.asarray(observed["finite_mask"], dtype=bool).copy(),
-            state_posterior=np.asarray(promoter["posterior"], dtype=FLOAT_DTYPE).copy(),
-            loading_posterior=_optional_float_moment(polymerase, "load_probabilities"),
+            state_posterior=state_posterior,
+            loading_posterior=loading_posterior,
             predicted_signal=_optional_float_moment(polymerase, "predicted_signal"),
-            loading_mask=_optional_bool_moment(polymerase, "loading_mask"),
+            loading_mask=loading_mask,
             initial_probabilities=np.asarray(initial["mean"], dtype=FLOAT_DTYPE).copy(),
             transition_rates={
                 index: np.asarray(
@@ -590,6 +656,9 @@ class ViprodyneModel:
             loading_rate_nodes=loading_rate_nodes,
             contact_rc=_optional_float_moment(contact, "rc"),
             contact_probability=_optional_float_moment(contact, "p_contact"),
+            state_posterior_times=state_posterior_times,
+            loading_posterior_times=loading_posterior_times,
+            loading_posterior_rate=loading_posterior_rate,
         )
 
     def default_schedule(self) -> tuple[str, ...]:
@@ -649,9 +718,7 @@ class ViprodyneModel:
     def compute_elbo(self) -> np.float32:
         """Compute the current available model ELBO."""
         terms = self.compute_elbo_terms()
-        return np.asarray(
-            sum(float(value) for value in terms.values()), dtype=FLOAT_DTYPE
-        )
+        return np.asarray(sum(float(value) for value in terms.values()), dtype=FLOAT_DTYPE)
 
     def _cavi_config(self, config, kwargs):
         from viprodyne.fit import CAVIConfig
@@ -718,6 +785,12 @@ class ViprodyneModel:
         polymerase_name = None
         if pol2_observation is not None:
             polymerase_name = f"{dataset.name}:tau"
+            sampler_fine_grid = self._sampler_fine_grid(pol2_observation)
+            polymerase_loading_times = (
+                sampler_fine_grid
+                if pol2_observation.mode == "sampler"
+                else pol2_observation.loading_times
+            )
             polymerase = PolymeraseLoadings(
                 name=polymerase_name,
                 observed=dataset.observed,
@@ -725,10 +798,17 @@ class ViprodyneModel:
                 noise_std=dataset.noise_std,
                 finite_mask=dataset.finite_mask,
                 mode=pol2_observation.mode,
+                elbo_mode=self.config.pol2_elbo_mode,
                 window_weights=pol2_observation.window_weights,
                 observation_starts=pol2_observation.observation_starts,
+                loading_times=polymerase_loading_times,
                 sampling_times=pol2_observation.sampling_times,
-                fine_grid=self._sampler_fine_grid(pol2_observation),
+                fine_grid=sampler_fine_grid,
+                elbo_design_matrix=self._pol2_elbo_design_matrix(
+                    dataset,
+                    pol2_observation,
+                    polymerase_loading_times,
+                ),
                 rise_time=self._proximal_kernel().t_rise,
                 plateau_time=self._proximal_kernel().t_plateau,
                 rna_intensity=self._proximal_kernel().rna_intensity,
@@ -831,18 +911,14 @@ class ViprodyneModel:
             return "global"
         if index in self.config.shared_transition_rate_indices:
             return "global"
-        return self.config.transition_rate_scopes.get(
-            index, self.config.transition_rate_scope
-        )
+        return self.config.transition_rate_scopes.get(index, self.config.transition_rate_scope)
 
     def _loading_rate_scope(self, state: int) -> RateScope:
         if self.config.shared_loading_rates:
             return "global"
         if state in self.config.shared_loading_rate_states:
             return "global"
-        return self.config.loading_rate_scopes.get(
-            state, self.config.loading_rate_scope
-        )
+        return self.config.loading_rate_scopes.get(state, self.config.loading_rate_scope)
 
     def _rate_prefix(self, dataset_name: str, scope: RateScope) -> str:
         if scope == "global":
@@ -865,17 +941,13 @@ class ViprodyneModel:
         if scope != "track":
             return parameter
         n_traces = next(
-            dataset.n_traces
-            for dataset in self.datasets
-            if dataset.name == dataset_name
+            dataset.n_traces for dataset in self.datasets if dataset.name == dataset_name
         )
         if parameter.shape == ():
             return np.full((n_traces,), parameter, dtype=FLOAT_DTYPE)
         if parameter.shape == (n_traces,):
             return parameter.astype(FLOAT_DTYPE)
-        raise ValueError(
-            f"{name} must be scalar or have shape (n_traces,) for track scope."
-        )
+        raise ValueError(f"{name} must be scalar or have shape (n_traces,) for track scope.")
 
     def _initial_concentration(self) -> np.ndarray:
         if self.config.initial_concentration is None:
@@ -892,9 +964,7 @@ class ViprodyneModel:
             return "mean_field"
         return self.config.pol2_mode
 
-    def _pol2_observation_model(
-        self, dataset: MS2Dataset
-    ) -> MS2ObservationModel | None:
+    def _pol2_observation_model(self, dataset: MS2Dataset) -> MS2ObservationModel | None:
         mode = self._pol2_mode()
         if mode == "sampler":
             self._validate_sampler_kernel()
@@ -919,10 +989,39 @@ class ViprodyneModel:
         if observation.mode != "sampler":
             return None
         if self.config.sampler_fine_grid is not None:
-            return _validate_time_grid(
-                self.config.sampler_fine_grid, "sampler_fine_grid"
-            )
+            return _validate_time_grid(self.config.sampler_fine_grid, "sampler_fine_grid")
         return np.asarray(observation.loading_times, dtype=FLOAT_DTYPE)
+
+    def _pol2_elbo_design_matrix(
+        self,
+        dataset: MS2Dataset,
+        observation: MS2ObservationModel,
+        loading_times: np.ndarray,
+    ) -> np.ndarray | None:
+        if self.config.pol2_elbo_mode != "mean_field":
+            return None
+        if observation.mode == "mean_field" and observation.design_matrix is not None:
+            return np.asarray(observation.design_matrix, dtype=FLOAT_DTYPE)
+        kernel = resolve_ms2_kernel(
+            self.config.ms2_kernel,
+            self.config.t_rise,
+            self.config.t_plateau,
+            self.config.rna_intensity,
+        )
+        if kernel is None:
+            return None
+        if observation.mode == "sampler":
+            time_grid = _loading_times_to_time_grid(loading_times, "sampler_fine_grid")
+        else:
+            time_grid = self._time_grid(dataset)
+        return build_ms2_observation_model(
+            time_grid=time_grid,
+            n_observations=dataset.n_timepoints,
+            kernel=kernel,
+            sampling_times=dataset.sampling_times,
+            mode="mean_field",
+            tolerance=self.config.kernel_support_tolerance,
+        ).design_matrix
 
     def _proximal_kernel(self) -> ProximalKernel:
         if isinstance(self.config.ms2_kernel, ProximalKernel):
@@ -954,9 +1053,7 @@ class ViprodyneModel:
         contact_drive_name: str | None,
     ) -> RateEdge:
         to_state, from_state = transition_states(self.config.n_states, transition_index)
-        drive_node = (
-            contact_drive_name if self._is_driven_transition(transition_index) else None
-        )
+        drive_node = contact_drive_name if self._is_driven_transition(transition_index) else None
         return RateEdge(
             n_states=self.config.n_states,
             to_state=to_state,
@@ -1006,7 +1103,9 @@ class ViprodyneModel:
             probability_fn = threshold_contact_probability
             candidate_values = self.config.rc_candidate_values
             if candidate_values is None:
-                candidate_values = _default_rc_candidate_values(contact_score, self.config.rc_bounds)
+                candidate_values = _default_rc_candidate_values(
+                    contact_score, self.config.rc_bounds
+                )
 
         objective = self._contact_drive_objective(
             probability_fn=probability_fn,
@@ -1054,9 +1153,7 @@ class ViprodyneModel:
                     continue
                 occupancy = np.asarray(moments["expected_occupancy"], dtype=FLOAT_DTYPE)
                 jumps = np.asarray(moments["expected_jumps"], dtype=FLOAT_DTYPE)
-                interval_durations = np.asarray(
-                    moments["interval_durations"], dtype=FLOAT_DTYPE
-                )
+                interval_durations = np.asarray(moments["interval_durations"], dtype=FLOAT_DTYPE)
                 p_contact = _interval_contact_probability(
                     probability_fn(time_grid, rc_value),
                     n_intervals=interval_durations.size,
@@ -1074,9 +1171,7 @@ class ViprodyneModel:
                     ).astype(FLOAT_DTYPE)
                     gamma_from = occupancy[..., from_state] / dt_broadcast
                     gamma_jump = jumps[..., to_state, from_state] / dt_broadcast
-                    p_broadcast = np.broadcast_to(p_contact, gamma_from.shape).astype(
-                        FLOAT_DTYPE
-                    )
+                    p_broadcast = np.broadcast_to(p_contact, gamma_from.shape).astype(FLOAT_DTYPE)
                     total += _contact_survival_log_likelihood(
                         log_rate=np.log(np.clip(rate, 1e-20, None)).astype(FLOAT_DTYPE),
                         gamma_jump=gamma_jump,
@@ -1096,9 +1191,7 @@ class ViprodyneModel:
             return np.arange(dataset.n_timepoints + 1, dtype=FLOAT_DTYPE) * dt
         if self.config.time_grid is not None:
             return _validate_time_grid(self.config.time_grid, "time_grid")
-        raise ValueError(
-            "each dataset needs dt or sampling_times, or ModelConfig.dt must be set."
-        )
+        raise ValueError("each dataset needs dt or sampling_times, or ModelConfig.dt must be set.")
 
 
 def _validate_time_grid(time_grid: np.ndarray, name: str) -> np.ndarray:
@@ -1157,6 +1250,7 @@ def _validate_contact_array(
         out = np.clip(out, 0.0, 1.0)
     return np.asarray(out, dtype=FLOAT_DTYPE)
 
+
 def _wrap_contact_probability_fn(
     probability_fn: Callable | None,
 ) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
@@ -1193,16 +1287,12 @@ def _default_rc_candidate_values(
     values = np.unique(np.ravel(np.asarray(contact_score, dtype=FLOAT_DTYPE)))
     values = values[np.isfinite(values)]
     values = values[(values > lo) & (values < hi)]
-    breaks = np.unique(
-        np.concatenate([np.asarray([lo, hi], dtype=FLOAT_DTYPE), values])
-    )
+    breaks = np.unique(np.concatenate([np.asarray([lo, hi], dtype=FLOAT_DTYPE), values]))
     if breaks.size == 1:
         return breaks.astype(FLOAT_DTYPE)
     midpoints = (breaks[:-1] + breaks[1:]) / np.float32(2.0)
     candidates = np.unique(
-        np.concatenate(
-            [np.asarray([lo, hi], dtype=FLOAT_DTYPE), midpoints.astype(FLOAT_DTYPE)]
-        )
+        np.concatenate([np.asarray([lo, hi], dtype=FLOAT_DTYPE), midpoints.astype(FLOAT_DTYPE)])
     )
     return candidates[(candidates >= lo) & (candidates <= hi)].astype(FLOAT_DTYPE)
 
@@ -1221,9 +1311,7 @@ def _contact_survival_log_likelihood(
     p_contact = np.asarray(p_contact, dtype=FLOAT_DTYPE)
     dt = np.broadcast_to(np.asarray(dt, dtype=FLOAT_DTYPE), gamma_from.shape)
     if gamma_jump.shape != gamma_from.shape or gamma_from.shape != p_contact.shape:
-        raise ValueError(
-            "gamma_jump, gamma_from, and p_contact must have matching shapes."
-        )
+        raise ValueError("gamma_jump, gamma_from, and p_contact must have matching shapes.")
     if log_rate.shape == ():
         stats = ContactSurvivalStats.from_posteriors(
             gamma_jump=gamma_jump,
@@ -1236,15 +1324,9 @@ def _contact_survival_log_likelihood(
     batch_shape = np.broadcast_shapes(log_rate.shape, gamma_from.shape[:-1])
     n_intervals = gamma_from.shape[-1]
     log_rate = np.broadcast_to(log_rate, batch_shape).astype(FLOAT_DTYPE)
-    gamma_jump = np.broadcast_to(gamma_jump, batch_shape + (n_intervals,)).astype(
-        FLOAT_DTYPE
-    )
-    gamma_from = np.broadcast_to(gamma_from, batch_shape + (n_intervals,)).astype(
-        FLOAT_DTYPE
-    )
-    p_contact = np.broadcast_to(p_contact, batch_shape + (n_intervals,)).astype(
-        FLOAT_DTYPE
-    )
+    gamma_jump = np.broadcast_to(gamma_jump, batch_shape + (n_intervals,)).astype(FLOAT_DTYPE)
+    gamma_from = np.broadcast_to(gamma_from, batch_shape + (n_intervals,)).astype(FLOAT_DTYPE)
+    p_contact = np.broadcast_to(p_contact, batch_shape + (n_intervals,)).astype(FLOAT_DTYPE)
     dt = np.broadcast_to(dt, batch_shape + (n_intervals,)).astype(FLOAT_DTYPE)
     total = 0.0
     for index in np.ndindex(batch_shape):
@@ -1256,6 +1338,136 @@ def _contact_survival_log_likelihood(
         )
         total += contact_survival_log_profile(float(log_rate[index]), stats)
     return float(total)
+
+
+def _resolve_time_spec(spec, dataset_name: str, name: str) -> np.ndarray | None:
+    if spec is None:
+        return None
+    if isinstance(spec, Mapping):
+        if dataset_name not in spec:
+            return None
+        spec = spec[dataset_name]
+        if spec is None:
+            return None
+    return _validate_result_times(spec, name)
+
+
+def _validate_result_times(times, name: str) -> np.ndarray:
+    values = np.asarray(times, dtype=FLOAT_DTYPE)
+    if values.ndim == 0:
+        values = values[None]
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError(f"{name} must be a non-empty one-dimensional array.")
+    if np.any(~np.isfinite(values)):
+        raise ValueError(f"{name} must contain only finite values.")
+    if np.any(np.diff(values) <= 0):
+        raise ValueError(f"{name} must be strictly increasing.")
+    return values.astype(FLOAT_DTYPE)
+
+
+def _validate_times_inside(query: np.ndarray, source: np.ndarray, name: str) -> np.ndarray:
+    query = _validate_result_times(query, name)
+    source = np.asarray(source, dtype=FLOAT_DTYPE)
+    if query[0] < source[0] or query[-1] > source[-1]:
+        raise ValueError(f"{name} must lie within the fitted posterior time range.")
+    return query
+
+
+def _state_posterior_at_times(
+    promoter_node,
+    promoter_moments: dict,
+    state_times: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    source_times = np.asarray(promoter_node.time_grid, dtype=FLOAT_DTYPE)
+    if state_times is None:
+        return (
+            np.asarray(promoter_moments["posterior"], dtype=FLOAT_DTYPE).copy(),
+            source_times.copy(),
+        )
+    query = _validate_times_inside(state_times, source_times, "state_times")
+    if getattr(promoter_node, "solution", None) is None:
+        raise ValueError("state posterior interpolation requires an updated PromoterState node.")
+    interpolated = [
+        np.asarray(promoter_node.solution.marginal_at(float(time)), dtype=FLOAT_DTYPE)
+        for time in query
+    ]
+    return np.stack(interpolated, axis=1).astype(FLOAT_DTYPE), query.copy()
+
+
+def _loading_posterior_at_times(
+    polymerase_node,
+    polymerase_moments: dict,
+    key: str,
+    loading_times: np.ndarray | None,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    if polymerase_node is None or key not in polymerase_moments:
+        return None, None
+    values = np.asarray(polymerase_moments[key], dtype=FLOAT_DTYPE)
+    source_times = _loading_times_from_node(polymerase_node, values.shape[-1])
+    if loading_times is None:
+        return values.copy(), source_times.copy()
+    query = _validate_times_inside(loading_times, source_times, "loading_times")
+    return _resample_last_axis(values, source_times, query), query.copy()
+
+
+def _loading_mask_at_times(
+    polymerase_node,
+    polymerase_moments: dict,
+    loading_times: np.ndarray | None,
+) -> np.ndarray | None:
+    if polymerase_node is None or "loading_mask" not in polymerase_moments:
+        return None
+    values = np.asarray(polymerase_moments["loading_mask"], dtype=bool)
+    source_times = _loading_times_from_node(polymerase_node, values.shape[-1])
+    if loading_times is None:
+        return values.copy()
+    query = _validate_times_inside(loading_times, source_times, "loading_times")
+    return _resample_bool_last_axis(values, source_times, query)
+
+
+def _loading_times_from_node(polymerase_node, n_loadings: int) -> np.ndarray:
+    if getattr(polymerase_node, "loading_times", None) is not None:
+        times = np.asarray(polymerase_node.loading_times, dtype=FLOAT_DTYPE)
+    elif getattr(polymerase_node, "fine_grid", None) is not None:
+        times = np.asarray(polymerase_node.fine_grid, dtype=FLOAT_DTYPE)
+    else:
+        times = np.arange(n_loadings, dtype=FLOAT_DTYPE)
+    if times.shape != (n_loadings,):
+        raise ValueError("loading posterior times do not match the posterior length.")
+    return times
+
+
+def _resample_last_axis(values: np.ndarray, source: np.ndarray, query: np.ndarray) -> np.ndarray:
+    flat = values.reshape((-1, values.shape[-1]))
+    out = np.stack(
+        [np.interp(query, source, row).astype(FLOAT_DTYPE) for row in flat],
+        axis=0,
+    )
+    return out.reshape(values.shape[:-1] + (query.size,)).astype(FLOAT_DTYPE)
+
+
+def _resample_bool_last_axis(
+    values: np.ndarray, source: np.ndarray, query: np.ndarray
+) -> np.ndarray:
+    indices = np.searchsorted(source, query, side="left")
+    indices = np.clip(indices, 0, source.size - 1)
+    left = np.clip(indices - 1, 0, source.size - 1)
+    use_left = np.abs(query - source[left]) <= np.abs(query - source[indices])
+    nearest = np.where(use_left, left, indices)
+    return np.take(values, nearest, axis=-1).astype(bool)
+
+
+def _loading_times_to_time_grid(loading_times: np.ndarray, name: str) -> np.ndarray:
+    loading_times = _validate_result_times(loading_times, name)
+    if loading_times.size < 2:
+        raise ValueError(f"{name} must contain at least two points.")
+    spacing = np.diff(loading_times)
+    if np.any(spacing <= 0):
+        raise ValueError(f"{name} must be strictly increasing.")
+    final_edge = loading_times[-1] + spacing[-1]
+    return np.concatenate([loading_times, np.asarray([final_edge], dtype=FLOAT_DTYPE)]).astype(
+        FLOAT_DTYPE
+    )
 
 
 def _optional_float_moment(moments: dict, key: str) -> np.ndarray | None:
@@ -1270,9 +1482,7 @@ def _optional_bool_moment(moments: dict, key: str) -> np.ndarray | None:
     return np.asarray(moments[key], dtype=bool).copy()
 
 
-def _validate_index_tuple(
-    indices: tuple[int, ...], upper_bound: int, name: str
-) -> tuple[int, ...]:
+def _validate_index_tuple(indices: tuple[int, ...], upper_bound: int, name: str) -> tuple[int, ...]:
     values = tuple(int(index) for index in indices)
     if len(set(values)) != len(values):
         raise ValueError(f"{name} must not contain duplicates.")
@@ -1291,9 +1501,7 @@ def _validate_rate_prefix_labels(datasets: tuple[MS2Dataset, ...]) -> None:
         if ":" in label:
             raise ValueError(f"{label_type} {label!r} must not contain ':'.")
         if label == "shared":
-            raise ValueError(
-                f"{label_type} {label!r} is reserved for global rate nodes."
-            )
+            raise ValueError(f"{label_type} {label!r} is reserved for global rate nodes.")
 
 
 def _assign_dataset_names(datasets: tuple[MS2Dataset, ...]) -> tuple[MS2Dataset, ...]:
@@ -1327,11 +1535,7 @@ def _assign_dataset_timing(
         return datasets
     timed: list[MS2Dataset] = []
     for dataset in datasets:
-        if (
-            dataset.dt is None
-            and dataset.sampling_times is None
-            and dataset.time_grid is None
-        ):
+        if dataset.dt is None and dataset.sampling_times is None and dataset.time_grid is None:
             timed.append(replace(dataset, dt=config.dt))
         else:
             timed.append(dataset)

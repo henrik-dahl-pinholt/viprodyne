@@ -489,6 +489,66 @@ def test_model_can_run_sampler_pol2_mode():
     assert "d0:r0" in moments["loading_counts_by_rate"]
 
 
+def test_dataset_result_can_return_requested_posterior_times():
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.array([[0.1, 0.5, 0.9]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+    )
+    model = ViprodyneModel(
+        datasets=(dataset,),
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
+            pol2_mode="transfer",
+            t_rise=np.float32(0.5),
+            t_plateau=np.float32(0.0),
+        ),
+    )
+
+    model.run_schedule(["d0:s", "d0:tau"])
+    posterior_times = np.array([0.25, 0.75, 1.0], dtype=np.float32)
+    result = model.dataset_result("d0", posterior_times=posterior_times)
+
+    assert result.state_posterior.shape == (1, 3, 2)
+    assert result.loading_posterior.shape == (1, 3)
+    assert result.predicted_signal.shape == (1, 3)
+    np.testing.assert_allclose(result.state_posterior_times, posterior_times)
+    np.testing.assert_allclose(result.loading_posterior_times, posterior_times)
+
+
+def test_sampler_pol2_mode_can_use_mean_field_elbo_contribution():
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.array([[0.1, 0.4, 0.9]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+    )
+    model = ViprodyneModel(
+        datasets=(dataset,),
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
+            pol2_mode="sampler",
+            pol2_elbo_mode="mean_field",
+            t_rise=np.float32(0.5),
+            t_plateau=np.float32(0.0),
+            sampler_iterations=12,
+            sampler_repeats=1,
+            sampler_compute_elbo=False,
+        ),
+    )
+
+    model.run_schedule(["d0:s", "d0:tau"])
+    moments = model.graph.moments.get("d0:tau")
+
+    assert model.graph.nodes["d0:tau"].mode == "sampler"
+    assert model.graph.nodes["d0:tau"].elbo_mode == "mean_field"
+    assert moments["posterior_rate"].shape == (1, 3)
+    elbo = model.graph.nodes["d0:tau"].elbo_contribution()
+    assert np.isfinite(np.asarray(elbo))
+    assert abs(float(np.asarray(elbo))) > 0.0
+
+
 def test_model_accepts_explicit_kernel_function():
     def rectangular_kernel(offsets):
         return jnp.where((offsets >= 0.0) & (offsets < 0.75), 2.0, 0.0)
@@ -596,8 +656,7 @@ def test_model_derives_pol2_prior_from_gamma_rate_laplace_moments():
     log_load0 = np.log(-np.expm1(-np.float32(0.5) * dt))
     terms = np.arange(1, 257, dtype=np.float32)
     log_load1 = -np.sum(
-        (np.float32(3.0) / (np.float32(3.0) + terms[:, None] * dt[None, :]))
-        ** np.float32(2.0)
+        (np.float32(3.0) / (np.float32(3.0) + terms[:, None] * dt[None, :])) ** np.float32(2.0)
         / terms[:, None],
         axis=0,
     )

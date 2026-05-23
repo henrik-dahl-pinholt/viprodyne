@@ -30,4 +30,7 @@ config = ModelConfig(
 ```
 
 For regular MS2 traces, `pol2_mode="auto"` uses the transfer backend. This
-avoids constructing a dense observation-by-loading matrix for long traces.
+avoids constructing a dense observation-by-loading matrix for long traces, but
+the transfer state space grows exponentially with the number of loading grid
+points covered by the MS2 kernel. For very fine time resolution, use
+`pol2_mode="sampler"` and choose `sampler_fine_grid` explicitly.
