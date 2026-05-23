@@ -1522,8 +1522,9 @@ def _validate_sampler_fine_grid(fine_grid: np.ndarray) -> np.ndarray:
     dt = np.diff(fine_grid)
     if np.any(dt <= 0):
         raise ValueError("fine_grid must be strictly increasing.")
-    if not np.allclose(dt, dt[0], rtol=1e-6, atol=1e-7):
-        raise ValueError("sampler fine_grid must be uniformly spaced.")
+    reference_dt = np.median(dt).astype(FLOAT_DTYPE)
+    if not np.allclose(dt, reference_dt, rtol=1e-4, atol=1e-6):
+        raise ValueError("latent_grid must be uniformly spaced for sampler Pol2 mode.")
     return fine_grid
 
 

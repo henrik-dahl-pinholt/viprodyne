@@ -556,6 +556,39 @@ def test_sampler_uses_latent_grid_for_state_and_loading_posteriors():
     np.testing.assert_allclose(result.latent_grid, latent_grid)
 
 
+def test_sampler_accepts_float32_measurement_grid_jitter():
+    measurement_interval = np.float32(5.0 / 60.0)
+    sampling_times = np.arange(
+        0.0,
+        50.0 + float(measurement_interval),
+        float(measurement_interval),
+        dtype=np.float32,
+    )
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.zeros((1, sampling_times.size), dtype=np.float32),
+        noise_std=np.float32(1.0),
+        sampling_times=sampling_times,
+    )
+
+    model = ViprodyneModel(
+        datasets=(dataset,),
+        config=ModelConfig(
+            n_states=2,
+            pol2_mode="sampler",
+            t_rise=np.float32(3.0),
+            t_plateau=np.float32(3.0),
+            sampler_iterations=12,
+            sampler_repeats=1,
+            sampler_compute_elbo=False,
+        ),
+    )
+
+    polymerase = model.graph.nodes["d0:tau"]
+    assert polymerase.mode == "sampler"
+    assert polymerase.fine_grid.shape == sampling_times.shape
+
+
 def test_transfer_rejects_explicit_latent_grid():
     dataset = MS2Dataset(
         name="d0",
