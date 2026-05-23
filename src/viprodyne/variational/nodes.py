@@ -846,6 +846,8 @@ class PolymeraseLoadings(VariationalNode):
             self.objective_value = np.asarray(0.0, dtype=FLOAT_DTYPE)
 
     def _infer_n_loadings(self) -> int:
+        if self.loading_times is not None:
+            return int(np.asarray(self.loading_times).size)
         if self.design_matrix is not None:
             return int(self.design_matrix.shape[1])
         if self.window_weights is not None and self.observation_starts is not None:

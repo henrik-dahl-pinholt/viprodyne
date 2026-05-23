@@ -489,32 +489,92 @@ def test_model_can_run_sampler_pol2_mode():
     assert "d0:r0" in moments["loading_counts_by_rate"]
 
 
-def test_dataset_result_can_return_requested_posterior_times():
+def test_mean_field_uses_latent_grid_for_state_and_loading_posteriors():
     dataset = MS2Dataset(
         name="d0",
         observed=np.array([[0.1, 0.5, 0.9]], dtype=np.float32),
         noise_std=np.float32(0.5),
+        sampling_times=np.array([0.0, 1.0, 2.0], dtype=np.float32),
     )
+    latent_grid = np.array([0.0, 0.5, 1.0, 1.5, 2.0], dtype=np.float32)
     model = ViprodyneModel(
         datasets=(dataset,),
         config=ModelConfig(
             n_states=2,
-            time_grid=np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
-            pol2_mode="transfer",
+            latent_grid=latent_grid,
+            pol2_mode="mean_field",
             t_rise=np.float32(0.5),
             t_plateau=np.float32(0.0),
         ),
     )
 
-    model.run_schedule(["d0:s", "d0:tau"])
-    posterior_times = np.array([0.25, 0.75, 1.0], dtype=np.float32)
-    result = model.dataset_result("d0", posterior_times=posterior_times)
+    polymerase = model.graph.nodes["d0:tau"]
+    promoter = model.graph.nodes["d0:s"]
+    np.testing.assert_allclose(promoter.time_grid[:-1], latent_grid)
+    np.testing.assert_allclose(polymerase.loading_times, latent_grid)
+    assert polymerase.design_matrix.shape == (3, 5)
 
-    assert result.state_posterior.shape == (1, 3, 2)
-    assert result.loading_posterior.shape == (1, 3)
+    model.run_schedule(["d0:s", "d0:tau"])
+    result = model.dataset_result("d0")
+
+    assert result.state_posterior.shape == (1, 5, 2)
+    assert result.loading_posterior.shape == (1, 5)
     assert result.predicted_signal.shape == (1, 3)
-    np.testing.assert_allclose(result.state_posterior_times, posterior_times)
-    np.testing.assert_allclose(result.loading_posterior_times, posterior_times)
+    np.testing.assert_allclose(result.latent_grid, latent_grid)
+
+
+def test_sampler_uses_latent_grid_for_state_and_loading_posteriors():
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.array([[0.1, np.nan, 0.9]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        sampling_times=np.array([0.0, 1.0, 2.0], dtype=np.float32),
+    )
+    latent_grid = np.array([0.0, 0.5, 1.0, 1.5, 2.0], dtype=np.float32)
+    model = ViprodyneModel(
+        datasets=(dataset,),
+        config=ModelConfig(
+            n_states=2,
+            latent_grid=latent_grid,
+            pol2_mode="sampler",
+            t_rise=np.float32(0.5),
+            t_plateau=np.float32(0.0),
+            sampler_iterations=12,
+            sampler_repeats=1,
+            sampler_compute_elbo=False,
+        ),
+    )
+
+    model.run_schedule(["d0:s", "d0:tau"])
+    result = model.dataset_result("d0")
+
+    assert model.graph.nodes["d0:tau"].mode == "sampler"
+    assert result.state_posterior.shape == (1, 5, 2)
+    assert result.loading_posterior.shape == (1, 5)
+    assert result.loading_posterior_rate.shape == (1, 5)
+    assert result.predicted_signal.shape == (1, 3)
+    np.testing.assert_allclose(result.latent_grid, latent_grid)
+
+
+def test_transfer_rejects_explicit_latent_grid():
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.array([[0.1, 0.5, 0.9]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        sampling_times=np.array([0.0, 1.0, 2.0], dtype=np.float32),
+    )
+
+    with pytest.raises(ValueError, match="transfer Pol2 mode requires"):
+        ViprodyneModel(
+            datasets=(dataset,),
+            config=ModelConfig(
+                n_states=2,
+                latent_grid=np.array([0.0, 0.5, 1.0, 1.5, 2.0], dtype=np.float32),
+                pol2_mode="transfer",
+                t_rise=np.float32(0.5),
+                t_plateau=np.float32(0.0),
+            ),
+        )
 
 
 def test_sampler_pol2_mode_can_use_mean_field_elbo_contribution():

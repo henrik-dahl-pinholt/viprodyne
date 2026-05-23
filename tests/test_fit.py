@@ -88,7 +88,7 @@ def test_model_run_inference_returns_structured_outputs():
     assert dataset.name == "track_0"
     assert dataset.observed.shape == (1, 2)
     assert dataset.finite_mask.shape == (1, 2)
-    assert dataset.state_posterior.shape == (1, 3, 2)
+    assert dataset.state_posterior.shape == (1, 2, 2)
     assert dataset.loading_posterior.shape == (1, 2)
     assert dataset.predicted_signal.shape == (1, 2)
     assert dataset.loading_mask.shape == (1, 2)

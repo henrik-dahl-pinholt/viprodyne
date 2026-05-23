@@ -43,6 +43,10 @@ print(posterior.state_posterior.shape)
 print(posterior.loading_posterior.shape)
 ```
 
+If you need promoter-state and Pol2-loading posteriors on a finer latent grid,
+set {attr}`viprodyne.ModelConfig.latent_grid` and use `pol2_mode="sampler"`.
+The predicted MS2 signal is still reported at the observation times.
+
 The returned {class}`viprodyne.DatasetInferenceResult` contains posterior state
 probabilities, Pol2 loading probabilities, predicted signal, fitted transition
 rates, fitted loading rates, and contact-drive outputs when present.

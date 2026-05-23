@@ -296,10 +296,12 @@ expensive.
 
 Each `DatasetInferenceResult` contains:
 
-- `state_posterior`: promoter state posterior on `state_posterior_times`,
-  shaped `(n_traces, n_state_times, n_states)`;
-- `loading_posterior`: Pol2 loading posterior on `loading_posterior_times`,
-  shaped `(n_traces, n_loading_times)`;
+- `latent_grid`: latent times shared by promoter-state and Pol2-loading
+  variables;
+- `state_posterior`: promoter state posterior on `latent_grid`, shaped
+  `(n_traces, n_latent_times, n_states)`;
+- `loading_posterior`: Pol2 loading posterior on `latent_grid`, shaped
+  `(n_traces, n_latent_times)`;
 - `loading_posterior_rate`: posterior Pol2 loading rate for sampler mode;
 - `predicted_signal`: posterior mean MS2 intensity at observation times;
 - `loading_mask`: loading-grid support mask derived from missing observations;
@@ -328,19 +330,21 @@ instance, or a custom JAX-compatible callable. The current built-in
 parameterized kernel is `"proximal"` and uses `t_rise`, `t_plateau`, and
 `rna_intensity`.
 
+`ModelConfig.latent_grid` defines the actual latent inference grid. If omitted,
+the model uses each dataset's measurement times. The same latent grid is used
+for the promoter-state path and Pol2 loading variables; MS2 signal predictions
+remain on observation times. For multiple datasets, `latent_grid` may be a
+dataset-ordered tuple or a mapping keyed by dataset name.
+
 `ModelConfig.pol2_mode="auto"` chooses the transfer backend from the kernel
-configuration. `pol2_mode="mean_field"` or `"exact"` asks the builder to create
-the internal dense representation and should be reserved for small tests and
-diagnostics. `pol2_mode="sampler"` uses the continuous Pol2 sampler for
-proximal kernels; tune `sampler_iterations`, `sampler_repeats`, and
-`sampler_fine_grid`. Sampler ELBOs can use thermodynamic integration with
+configuration. Transfer mode is restricted to the observation latent grid and
+raises if `latent_grid` is explicitly set. `pol2_mode="mean_field"` or
+`"exact"` asks the builder to create the internal dense representation and
+should be reserved for small tests and diagnostics. `pol2_mode="sampler"` uses
+the continuous Pol2 sampler for proximal kernels; tune `sampler_iterations` and
+`sampler_repeats`. Sampler ELBOs can use thermodynamic integration with
 `sampler_compute_elbo=True`, or a final mean-field diagnostic term with
 `pol2_elbo_mode="mean_field"`.
-
-`run_inference`, `fit`, `inference_result`, and `dataset_result` accept
-`posterior_times`, plus separate `state_times` and `loading_times` overrides.
-These affect only returned posterior arrays. MS2 signal predictions remain on
-the observation times.
 
 Example with heterogeneous sampling times:
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal
 
@@ -44,13 +44,14 @@ class DatasetInferenceResult:
 
     The arrays in this object are copied from the variational graph after
     fitting, so they can be inspected without touching internal node objects.
-    `state_posterior` is indexed by trace, requested state-posterior time,
-    and promoter state. `loading_posterior` is indexed by trace and requested
-    loading-posterior time when a Pol2 loading node is present.
+    `state_posterior` is indexed by trace, latent-grid time, and promoter
+    state. `loading_posterior` is indexed by trace and latent-grid time when a
+    Pol2 loading node is present.
     """
 
     name: str
     time_grid: np.ndarray
+    latent_grid: np.ndarray
     sampling_times: np.ndarray | None
     observed: np.ndarray
     finite_mask: np.ndarray
@@ -65,8 +66,6 @@ class DatasetInferenceResult:
     loading_rate_nodes: dict[int, str]
     contact_rc: np.ndarray | None = None
     contact_probability: np.ndarray | None = None
-    state_posterior_times: np.ndarray | None = None
-    loading_posterior_times: np.ndarray | None = None
     loading_posterior_rate: np.ndarray | None = None
 
     def __str__(self) -> str:
@@ -100,6 +99,7 @@ class ModelInferenceResult:
 
 
 ContactInputSpec = np.ndarray | Callable
+LatentGridSpec = np.ndarray | Sequence[float] | Sequence[np.ndarray] | Mapping[str, np.ndarray]
 
 
 @dataclass(frozen=True)
@@ -225,6 +225,9 @@ class ModelConfig:
     - `n_states`: number of promoter states.
     - `dt`: optional shared frame spacing for regularly sampled datasets that
       do not provide dataset-specific timing.
+    - `latent_grid`: optional latent time grid shared by promoter-state and
+      Pol2-loading variables. If omitted, each dataset uses its measurement
+      times.
     - `ms2_kernel`, `t_rise`, `t_plateau`, `rna_intensity`: MS2 observation model.
     - `pol2_mode`: Pol2 posterior backend, usually `"auto"` or `"transfer"`.
     - `pol2_elbo_mode`: local Pol2 ELBO backend. `"native"` uses the posterior
@@ -248,6 +251,7 @@ class ModelConfig:
     n_states: int
     dt: np.ndarray | float | None = None
     time_grid: np.ndarray | None = None
+    latent_grid: LatentGridSpec | None = None
     initial_concentration: np.ndarray | None = None
     transition_prior_shape: np.ndarray | float = np.float32(1.0)
     transition_prior_rate: np.ndarray | float = np.float32(1.0)
@@ -268,7 +272,6 @@ class ModelConfig:
     t_plateau: np.ndarray | float = np.float32(0.0)
     rna_intensity: np.ndarray | float = np.float32(1.0)
     kernel_support_tolerance: float = 1e-7
-    sampler_fine_grid: np.ndarray | None = None
     sampler_seed: int = 0
     sampler_iterations: int = 15_000
     sampler_repeats: int = 100
@@ -295,6 +298,8 @@ class ModelConfig:
             object.__setattr__(self, "dt", _validate_positive_scalar(self.dt, "dt"))
         if self.time_grid is not None:
             _validate_time_grid(self.time_grid, "time_grid")
+        if self.latent_grid is not None:
+            _validate_latent_grid_spec(self.latent_grid)
         if self.pol2_mode not in {"auto", "transfer", "mean_field", "exact", "sampler"}:
             raise ValueError(
                 "pol2_mode must be 'auto', 'transfer', 'mean_field', 'exact', or 'sampler'."
@@ -303,8 +308,6 @@ class ModelConfig:
             raise ValueError("pol2_elbo_mode must be 'native' or 'mean_field'.")
         if self.kernel_support_tolerance < 0:
             raise ValueError("kernel_support_tolerance must be non-negative.")
-        if self.sampler_fine_grid is not None:
-            _validate_time_grid(self.sampler_fine_grid, "sampler_fine_grid")
         for name in (
             "sampler_iterations",
             "sampler_repeats",
@@ -413,6 +416,7 @@ class ModelConfig:
                 "ModelConfig(",
                 f"  n_states={self.n_states}, pol2_mode={self.pol2_mode!r}, "
                 f"pol2_elbo_mode={self.pol2_elbo_mode!r},",
+                f"  latent_grid={_grid_summary(self.latent_grid)},",
                 f"  ms2_kernel={_kernel_summary(self.ms2_kernel)},",
                 f"  transition_rate_scope={self.transition_rate_scope!r}, "
                 f"loading_rate_scope={self.loading_rate_scope!r},",
@@ -461,8 +465,8 @@ class ViprodyneModel:
             raise ValueError(
                 "contact_drives must have one entry per dataset, in dataset input order."
             )
-        for dataset in self.datasets:
-            self._time_grid(dataset)
+        for dataset_index, dataset in enumerate(self.datasets):
+            self._time_grid(dataset, dataset_index)
         self._build_graph()
 
     def run_schedule(
@@ -486,10 +490,6 @@ class ViprodyneModel:
     def run_inference(
         self,
         config=None,
-        *,
-        posterior_times=None,
-        state_times=None,
-        loading_times=None,
         **kwargs,
     ) -> ModelInferenceResult:
         """Run CAVI and return structured posterior outputs.
@@ -506,18 +506,11 @@ class ViprodyneModel:
         return self.inference_result(
             cavi=cavi_result,
             include_elbo_terms=bool(config.compute_elbo),
-            posterior_times=posterior_times,
-            state_times=state_times,
-            loading_times=loading_times,
         )
 
     def fit(
         self,
         config=None,
-        *,
-        posterior_times=None,
-        state_times=None,
-        loading_times=None,
         **kwargs,
     ) -> ModelInferenceResult:
         """Alias for `run_inference`.
@@ -528,9 +521,6 @@ class ViprodyneModel:
         """
         return self.run_inference(
             config=config,
-            posterior_times=posterior_times,
-            state_times=state_times,
-            loading_times=loading_times,
             **kwargs,
         )
 
@@ -538,36 +528,23 @@ class ViprodyneModel:
         self,
         cavi=None,
         include_elbo_terms: bool = True,
-        posterior_times=None,
-        state_times=None,
-        loading_times=None,
     ) -> ModelInferenceResult:
         """Collect current graph moments into structured inference outputs."""
         return ModelInferenceResult(
             cavi=cavi,
             datasets={
-                dataset.name: self.dataset_result(
-                    dataset.name,
-                    posterior_times=posterior_times,
-                    state_times=state_times,
-                    loading_times=loading_times,
-                )
+                dataset.name: self.dataset_result(dataset.name)
                 for dataset in self.datasets
             },
             elbo_terms=self.compute_elbo_terms() if include_elbo_terms else None,
         )
 
-    def dataset_result(
-        self,
-        dataset_name: str,
-        *,
-        posterior_times=None,
-        state_times=None,
-        loading_times=None,
-    ) -> DatasetInferenceResult:
+    def dataset_result(self, dataset_name: str) -> DatasetInferenceResult:
         """Return structured posterior outputs for one dataset plate."""
         try:
-            dataset = next(item for item in self.datasets if item.name == dataset_name)
+            dataset_index, dataset = next(
+                (index, item) for index, item in enumerate(self.datasets) if item.name == dataset_name
+            )
             nodes = self.dataset_nodes[dataset_name]
         except (KeyError, StopIteration) as exc:
             raise KeyError(f"unknown dataset {dataset_name!r}.") from exc
@@ -592,34 +569,23 @@ class ViprodyneModel:
             ).copy()
         elif dataset.sampling_times is not None:
             sampling_times = np.asarray(dataset.sampling_times, dtype=FLOAT_DTYPE).copy()
-        state_times = _resolve_time_spec(
-            state_times if state_times is not None else posterior_times,
-            dataset.name,
-            "state_times",
-        )
-        loading_times = _resolve_time_spec(
-            loading_times if loading_times is not None else posterior_times,
-            dataset.name,
-            "loading_times",
-        )
-        state_posterior, state_posterior_times = _state_posterior_at_times(
+        latent_grid = self._latent_grid(dataset, dataset_index)
+        state_posterior = _state_posterior_on_latent_grid(
             self.graph.nodes[str(nodes["promoter"])],
             promoter,
-            state_times,
+            latent_grid,
         )
-        loading_posterior, loading_posterior_times = _loading_posterior_at_times(
+        loading_posterior = _loading_posterior_on_latent_grid(
             polymerase_node,
             polymerase,
             "load_probabilities",
-            loading_times,
         )
-        loading_posterior_rate, _ = _loading_posterior_at_times(
+        loading_posterior_rate = _loading_posterior_on_latent_grid(
             polymerase_node,
             polymerase,
             "posterior_rate",
-            loading_times,
         )
-        loading_mask = _loading_mask_at_times(polymerase_node, polymerase, loading_times)
+        loading_mask = _loading_mask_on_latent_grid(polymerase_node, polymerase)
 
         transition_rate_nodes = {
             index: name for index, name in enumerate(list(nodes["transition_rates"]))
@@ -629,7 +595,8 @@ class ViprodyneModel:
         }
         return DatasetInferenceResult(
             name=dataset.name,
-            time_grid=self._time_grid(dataset).copy(),
+            time_grid=self._time_grid(dataset, dataset_index).copy(),
+            latent_grid=latent_grid.copy(),
             sampling_times=sampling_times,
             observed=np.asarray(observed["observed"], dtype=FLOAT_DTYPE).copy(),
             finite_mask=np.asarray(observed["finite_mask"], dtype=bool).copy(),
@@ -656,8 +623,6 @@ class ViprodyneModel:
             loading_rate_nodes=loading_rate_nodes,
             contact_rc=_optional_float_moment(contact, "rc"),
             contact_probability=_optional_float_moment(contact, "p_contact"),
-            state_posterior_times=state_posterior_times,
-            loading_posterior_times=loading_posterior_times,
             loading_posterior_rate=loading_posterior_rate,
         )
 
@@ -741,7 +706,7 @@ class ViprodyneModel:
         dataset: MS2Dataset,
         dataset_index: int,
     ) -> dict[str, str | list[str]]:
-        time_grid = self._time_grid(dataset)
+        time_grid = self._time_grid(dataset, dataset_index)
         initial_name = f"{dataset.name}:pi"
         initial = InitialStateProb(
             name=initial_name,
@@ -781,16 +746,11 @@ class ViprodyneModel:
 
         loading_names = self._add_loading_rates(dataset.name)
 
-        pol2_observation = self._pol2_observation_model(dataset)
+        pol2_observation = self._pol2_observation_model(dataset, dataset_index)
         polymerase_name = None
         if pol2_observation is not None:
             polymerase_name = f"{dataset.name}:tau"
-            sampler_fine_grid = self._sampler_fine_grid(pol2_observation)
-            polymerase_loading_times = (
-                sampler_fine_grid
-                if pol2_observation.mode == "sampler"
-                else pol2_observation.loading_times
-            )
+            polymerase_loading_times = pol2_observation.loading_times
             polymerase = PolymeraseLoadings(
                 name=polymerase_name,
                 observed=dataset.observed,
@@ -803,11 +763,11 @@ class ViprodyneModel:
                 observation_starts=pol2_observation.observation_starts,
                 loading_times=polymerase_loading_times,
                 sampling_times=pol2_observation.sampling_times,
-                fine_grid=sampler_fine_grid,
+                fine_grid=polymerase_loading_times if pol2_observation.mode == "sampler" else None,
                 elbo_design_matrix=self._pol2_elbo_design_matrix(
                     dataset,
+                    dataset_index,
                     pol2_observation,
-                    polymerase_loading_times,
                 ),
                 rise_time=self._proximal_kernel().t_rise,
                 plateau_time=self._proximal_kernel().t_plateau,
@@ -964,8 +924,17 @@ class ViprodyneModel:
             return "mean_field"
         return self.config.pol2_mode
 
-    def _pol2_observation_model(self, dataset: MS2Dataset) -> MS2ObservationModel | None:
+    def _pol2_observation_model(
+        self,
+        dataset: MS2Dataset,
+        dataset_index: int,
+    ) -> MS2ObservationModel | None:
         mode = self._pol2_mode()
+        if mode == "transfer" and self.config.latent_grid is not None:
+            raise ValueError(
+                "transfer Pol2 mode requires the observation latent grid; "
+                "do not set latent_grid with pol2_mode='transfer'."
+            )
         if mode == "sampler":
             self._validate_sampler_kernel()
         kernel = resolve_ms2_kernel(
@@ -977,26 +946,19 @@ class ViprodyneModel:
         if kernel is None:
             return None
         return build_ms2_observation_model(
-            time_grid=self._time_grid(dataset),
+            time_grid=self._time_grid(dataset, dataset_index),
             n_observations=dataset.n_timepoints,
             kernel=kernel,
-            sampling_times=dataset.sampling_times,
+            sampling_times=self._sampling_times(dataset),
             mode=mode,
             tolerance=self.config.kernel_support_tolerance,
         )
 
-    def _sampler_fine_grid(self, observation: MS2ObservationModel) -> np.ndarray | None:
-        if observation.mode != "sampler":
-            return None
-        if self.config.sampler_fine_grid is not None:
-            return _validate_time_grid(self.config.sampler_fine_grid, "sampler_fine_grid")
-        return np.asarray(observation.loading_times, dtype=FLOAT_DTYPE)
-
     def _pol2_elbo_design_matrix(
         self,
         dataset: MS2Dataset,
+        dataset_index: int,
         observation: MS2ObservationModel,
-        loading_times: np.ndarray,
     ) -> np.ndarray | None:
         if self.config.pol2_elbo_mode != "mean_field":
             return None
@@ -1010,15 +972,12 @@ class ViprodyneModel:
         )
         if kernel is None:
             return None
-        if observation.mode == "sampler":
-            time_grid = _loading_times_to_time_grid(loading_times, "sampler_fine_grid")
-        else:
-            time_grid = self._time_grid(dataset)
+        time_grid = self._time_grid(dataset, dataset_index)
         return build_ms2_observation_model(
             time_grid=time_grid,
             n_observations=dataset.n_timepoints,
             kernel=kernel,
-            sampling_times=dataset.sampling_times,
+            sampling_times=self._sampling_times(dataset),
             mode="mean_field",
             tolerance=self.config.kernel_support_tolerance,
         ).design_matrix
@@ -1071,7 +1030,7 @@ class ViprodyneModel:
     ) -> str | None:
         if not self.config.driven_transition_indices:
             return None
-        time_grid = self._time_grid(dataset)
+        time_grid = self._time_grid(dataset, dataset_index)
         n_intervals = time_grid.size - 1
         contact_name = f"{dataset.name}:rc"
         try:
@@ -1183,15 +1142,57 @@ class ViprodyneModel:
 
         return objective
 
-    def _time_grid(self, dataset: MS2Dataset) -> np.ndarray:
+    def _latent_grid(self, dataset: MS2Dataset, dataset_index: int) -> np.ndarray:
+        if self.config.latent_grid is not None:
+            return _resolve_latent_grid_spec(
+                self.config.latent_grid,
+                dataset.name,
+                dataset_index,
+                "latent_grid",
+            )
+        if dataset.sampling_times is not None:
+            return _validate_latent_grid(dataset.sampling_times, f"{dataset.name}.sampling_times")
         if dataset.time_grid is not None:
-            return _validate_time_grid(dataset.time_grid, f"{dataset.name}.time_grid")
+            time_grid = _validate_time_grid(dataset.time_grid, f"{dataset.name}.time_grid")
+            return time_grid[:-1].astype(FLOAT_DTYPE)
+        if self.config.time_grid is not None:
+            time_grid = _validate_time_grid(self.config.time_grid, "time_grid")
+            return time_grid[:-1].astype(FLOAT_DTYPE)
         if self.config.dt is not None:
             dt = _validate_positive_scalar(self.config.dt, "dt")
-            return np.arange(dataset.n_timepoints + 1, dtype=FLOAT_DTYPE) * dt
+            return ((np.arange(dataset.n_timepoints, dtype=FLOAT_DTYPE) + np.float32(0.5)) * dt)
+        raise ValueError(
+            "each dataset needs dt or sampling_times, or ModelConfig.dt/latent_grid must be set."
+        )
+
+    def _time_grid(self, dataset: MS2Dataset, dataset_index: int) -> np.ndarray:
+        if self.config.latent_grid is None and dataset.sampling_times is None:
+            if dataset.time_grid is not None:
+                return _validate_time_grid(dataset.time_grid, f"{dataset.name}.time_grid")
+            if self.config.time_grid is not None:
+                return _validate_time_grid(self.config.time_grid, "time_grid")
+        latent_grid = self._latent_grid(dataset, dataset_index)
+        dt = dataset.dt if dataset.dt is not None else self.config.dt
+        return _latent_grid_to_time_grid(latent_grid, dt=dt, name=f"{dataset.name}.latent_grid")
+
+    def _sampling_times(self, dataset: MS2Dataset) -> np.ndarray | None:
+        if dataset.sampling_times is not None:
+            return np.asarray(dataset.sampling_times, dtype=FLOAT_DTYPE)
+        if dataset.time_grid is not None:
+            return _sampling_times_from_time_grid(
+                dataset.time_grid,
+                dataset.n_timepoints,
+                f"{dataset.name}.time_grid",
+            )
         if self.config.time_grid is not None:
-            return _validate_time_grid(self.config.time_grid, "time_grid")
-        raise ValueError("each dataset needs dt or sampling_times, or ModelConfig.dt must be set.")
+            return _sampling_times_from_time_grid(
+                self.config.time_grid,
+                dataset.n_timepoints,
+                "time_grid",
+            )
+        if self.config.latent_grid is not None:
+            raise ValueError("latent_grid requires dt or sampling_times to locate observations.")
+        return None
 
 
 def _validate_time_grid(time_grid: np.ndarray, name: str) -> np.ndarray:
@@ -1201,6 +1202,91 @@ def _validate_time_grid(time_grid: np.ndarray, name: str) -> np.ndarray:
     if np.any(np.diff(time_grid) <= 0):
         raise ValueError(f"{name} must be strictly increasing.")
     return time_grid
+
+
+def _validate_latent_grid(latent_grid: np.ndarray, name: str) -> np.ndarray:
+    values = np.asarray(latent_grid, dtype=FLOAT_DTYPE)
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError(f"{name} must be a non-empty one-dimensional array.")
+    if np.any(~np.isfinite(values)):
+        raise ValueError(f"{name} must contain only finite values.")
+    if values.size > 1 and np.any(np.diff(values) <= 0):
+        raise ValueError(f"{name} must be strictly increasing.")
+    return values.astype(FLOAT_DTYPE)
+
+
+def _validate_latent_grid_spec(spec: LatentGridSpec) -> None:
+    if isinstance(spec, Mapping):
+        for name, values in spec.items():
+            _validate_latent_grid(values, f"latent_grid[{name!r}]")
+        return
+    if isinstance(spec, np.ndarray):
+        _validate_latent_grid(spec, "latent_grid")
+        return
+    try:
+        values = tuple(spec)
+    except TypeError as exc:
+        raise ValueError("latent_grid must be an array, tuple/list, or mapping.") from exc
+    if not values:
+        raise ValueError("latent_grid tuple/list must not be empty.")
+    if all(np.asarray(value).ndim == 0 for value in values):
+        _validate_latent_grid(np.asarray(values, dtype=FLOAT_DTYPE), "latent_grid")
+        return
+    for index, value in enumerate(values):
+        _validate_latent_grid(value, f"latent_grid[{index}]")
+
+
+def _resolve_latent_grid_spec(
+    spec: LatentGridSpec,
+    dataset_name: str,
+    dataset_index: int,
+    name: str,
+) -> np.ndarray:
+    if isinstance(spec, Mapping):
+        if dataset_name not in spec:
+            raise ValueError(f"{name} mapping is missing dataset {dataset_name!r}.")
+        return _validate_latent_grid(spec[dataset_name], f"{name}[{dataset_name!r}]")
+    if isinstance(spec, np.ndarray):
+        return _validate_latent_grid(spec, name)
+    values = tuple(spec)
+    if all(np.asarray(value).ndim == 0 for value in values):
+        return _validate_latent_grid(np.asarray(values, dtype=FLOAT_DTYPE), name)
+    try:
+        selected = values[dataset_index]
+    except IndexError as exc:
+        raise ValueError(f"{name} tuple/list must have one grid per dataset.") from exc
+    return _validate_latent_grid(selected, f"{name}[{dataset_index}]")
+
+
+def _latent_grid_to_time_grid(
+    latent_grid: np.ndarray,
+    *,
+    dt: np.ndarray | float | None,
+    name: str,
+) -> np.ndarray:
+    latent = _validate_latent_grid(latent_grid, name)
+    if latent.size > 1:
+        final_dt = latent[-1] - latent[-2]
+    elif dt is not None:
+        final_dt = _validate_positive_scalar(dt, "dt")
+    else:
+        raise ValueError(f"{name} needs at least two entries when dt is not set.")
+    final_edge = latent[-1] + np.asarray(final_dt, dtype=FLOAT_DTYPE)
+    return np.concatenate([latent, np.asarray([final_edge], dtype=FLOAT_DTYPE)]).astype(
+        FLOAT_DTYPE
+    )
+
+
+def _sampling_times_from_time_grid(
+    time_grid: np.ndarray,
+    n_observations: int,
+    name: str,
+) -> np.ndarray:
+    grid = _validate_time_grid(time_grid, name)
+    n_observations = int(n_observations)
+    if n_observations > grid.size - 1:
+        raise ValueError(f"{name} is shorter than the observation series.")
+    return np.asarray(grid[1 : n_observations + 1], dtype=FLOAT_DTYPE)
 
 
 def _validate_positive_scalar(value: np.ndarray | float, name: str) -> np.float32:
@@ -1279,6 +1365,22 @@ def _kernel_summary(kernel) -> str:
     return getattr(kernel, "__name__", kernel.__class__.__name__)
 
 
+def _grid_summary(grid) -> str:
+    if grid is None:
+        return "measurement"
+    if isinstance(grid, Mapping):
+        return f"mapping[{len(grid)}]"
+    if isinstance(grid, np.ndarray):
+        return f"array[{grid.size}]"
+    try:
+        values = tuple(grid)
+    except TypeError:
+        return grid.__class__.__name__
+    if all(np.asarray(value).ndim == 0 for value in values):
+        return f"array[{len(values)}]"
+    return f"tuple[{len(values)}]"
+
+
 def _default_rc_candidate_values(
     contact_score: np.ndarray,
     bounds: tuple[float, float],
@@ -1340,89 +1442,40 @@ def _contact_survival_log_likelihood(
     return float(total)
 
 
-def _resolve_time_spec(spec, dataset_name: str, name: str) -> np.ndarray | None:
-    if spec is None:
-        return None
-    if isinstance(spec, Mapping):
-        if dataset_name not in spec:
-            return None
-        spec = spec[dataset_name]
-        if spec is None:
-            return None
-    return _validate_result_times(spec, name)
-
-
-def _validate_result_times(times, name: str) -> np.ndarray:
-    values = np.asarray(times, dtype=FLOAT_DTYPE)
-    if values.ndim == 0:
-        values = values[None]
-    if values.ndim != 1 or values.size == 0:
-        raise ValueError(f"{name} must be a non-empty one-dimensional array.")
-    if np.any(~np.isfinite(values)):
-        raise ValueError(f"{name} must contain only finite values.")
-    if np.any(np.diff(values) <= 0):
-        raise ValueError(f"{name} must be strictly increasing.")
-    return values.astype(FLOAT_DTYPE)
-
-
-def _validate_times_inside(query: np.ndarray, source: np.ndarray, name: str) -> np.ndarray:
-    query = _validate_result_times(query, name)
-    source = np.asarray(source, dtype=FLOAT_DTYPE)
-    if query[0] < source[0] or query[-1] > source[-1]:
-        raise ValueError(f"{name} must lie within the fitted posterior time range.")
-    return query
-
-
-def _state_posterior_at_times(
+def _state_posterior_on_latent_grid(
     promoter_node,
     promoter_moments: dict,
-    state_times: np.ndarray | None,
-) -> tuple[np.ndarray, np.ndarray]:
-    source_times = np.asarray(promoter_node.time_grid, dtype=FLOAT_DTYPE)
-    if state_times is None:
-        return (
-            np.asarray(promoter_moments["posterior"], dtype=FLOAT_DTYPE).copy(),
-            source_times.copy(),
-        )
-    query = _validate_times_inside(state_times, source_times, "state_times")
-    if getattr(promoter_node, "solution", None) is None:
-        raise ValueError("state posterior interpolation requires an updated PromoterState node.")
-    interpolated = [
-        np.asarray(promoter_node.solution.marginal_at(float(time)), dtype=FLOAT_DTYPE)
-        for time in query
-    ]
-    return np.stack(interpolated, axis=1).astype(FLOAT_DTYPE), query.copy()
+    latent_grid: np.ndarray,
+) -> np.ndarray:
+    latent_grid = _validate_latent_grid(latent_grid, "latent_grid")
+    source_times = np.asarray(promoter_node.time_grid[:-1], dtype=FLOAT_DTYPE)
+    if source_times.shape != latent_grid.shape or not np.allclose(source_times, latent_grid):
+        raise ValueError("promoter state posterior is not on the model latent grid.")
+    posterior = np.asarray(promoter_moments["posterior"], dtype=FLOAT_DTYPE)
+    return posterior[..., :-1, :].copy()
 
 
-def _loading_posterior_at_times(
+def _loading_posterior_on_latent_grid(
     polymerase_node,
     polymerase_moments: dict,
     key: str,
-    loading_times: np.ndarray | None,
-) -> tuple[np.ndarray | None, np.ndarray | None]:
+) -> np.ndarray | None:
     if polymerase_node is None or key not in polymerase_moments:
-        return None, None
+        return None
     values = np.asarray(polymerase_moments[key], dtype=FLOAT_DTYPE)
-    source_times = _loading_times_from_node(polymerase_node, values.shape[-1])
-    if loading_times is None:
-        return values.copy(), source_times.copy()
-    query = _validate_times_inside(loading_times, source_times, "loading_times")
-    return _resample_last_axis(values, source_times, query), query.copy()
+    _loading_times_from_node(polymerase_node, values.shape[-1])
+    return values.copy()
 
 
-def _loading_mask_at_times(
+def _loading_mask_on_latent_grid(
     polymerase_node,
     polymerase_moments: dict,
-    loading_times: np.ndarray | None,
 ) -> np.ndarray | None:
     if polymerase_node is None or "loading_mask" not in polymerase_moments:
         return None
     values = np.asarray(polymerase_moments["loading_mask"], dtype=bool)
-    source_times = _loading_times_from_node(polymerase_node, values.shape[-1])
-    if loading_times is None:
-        return values.copy()
-    query = _validate_times_inside(loading_times, source_times, "loading_times")
-    return _resample_bool_last_axis(values, source_times, query)
+    _loading_times_from_node(polymerase_node, values.shape[-1])
+    return values.copy()
 
 
 def _loading_times_from_node(polymerase_node, n_loadings: int) -> np.ndarray:
@@ -1435,39 +1488,6 @@ def _loading_times_from_node(polymerase_node, n_loadings: int) -> np.ndarray:
     if times.shape != (n_loadings,):
         raise ValueError("loading posterior times do not match the posterior length.")
     return times
-
-
-def _resample_last_axis(values: np.ndarray, source: np.ndarray, query: np.ndarray) -> np.ndarray:
-    flat = values.reshape((-1, values.shape[-1]))
-    out = np.stack(
-        [np.interp(query, source, row).astype(FLOAT_DTYPE) for row in flat],
-        axis=0,
-    )
-    return out.reshape(values.shape[:-1] + (query.size,)).astype(FLOAT_DTYPE)
-
-
-def _resample_bool_last_axis(
-    values: np.ndarray, source: np.ndarray, query: np.ndarray
-) -> np.ndarray:
-    indices = np.searchsorted(source, query, side="left")
-    indices = np.clip(indices, 0, source.size - 1)
-    left = np.clip(indices - 1, 0, source.size - 1)
-    use_left = np.abs(query - source[left]) <= np.abs(query - source[indices])
-    nearest = np.where(use_left, left, indices)
-    return np.take(values, nearest, axis=-1).astype(bool)
-
-
-def _loading_times_to_time_grid(loading_times: np.ndarray, name: str) -> np.ndarray:
-    loading_times = _validate_result_times(loading_times, name)
-    if loading_times.size < 2:
-        raise ValueError(f"{name} must contain at least two points.")
-    spacing = np.diff(loading_times)
-    if np.any(spacing <= 0):
-        raise ValueError(f"{name} must be strictly increasing.")
-    final_edge = loading_times[-1] + spacing[-1]
-    return np.concatenate([loading_times, np.asarray([final_edge], dtype=FLOAT_DTYPE)]).astype(
-        FLOAT_DTYPE
-    )
 
 
 def _optional_float_moment(moments: dict, key: str) -> np.ndarray | None:

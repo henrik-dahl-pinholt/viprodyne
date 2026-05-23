@@ -27,7 +27,7 @@ def test_getting_started_public_workflow_smoke():
     assert posterior.observed.shape == (1, 3)
     assert posterior.finite_mask.tolist() == [[True, False, True]]
     assert posterior.time_grid.dtype == np.float32
-    assert posterior.state_posterior.shape == (1, 4, 2)
+    assert posterior.state_posterior.shape == (1, 3, 2)
     assert posterior.loading_posterior.shape == (1, 3)
     assert posterior.predicted_signal.shape == (1, 3)
     assert posterior.initial_probabilities.shape == (2,)

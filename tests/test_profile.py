@@ -108,7 +108,7 @@ def test_profile_contact_threshold_uses_dataset_ordered_score_inputs():
         profile.best_fit.datasets["toy"].contact_probability,
         np.array([1.0, 0.0], dtype=np.float32),
     )
-    assert profile.best_fit.datasets["toy"].state_posterior.shape == (1, 3, 2)
+    assert profile.best_fit.datasets["toy"].state_posterior.shape == (1, 2, 2)
 
 
 def test_profile_contact_threshold_accepts_probability_function():
@@ -240,9 +240,9 @@ def test_profile_contact_threshold_accepts_sampling_times_without_time_grid():
     fit = profile.best_fit.datasets["toy"]
     np.testing.assert_allclose(
         fit.time_grid,
-        np.array([-0.25, 0.25, 0.75, 1.25], dtype=np.float32),
+        np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
     )
-    assert fit.state_posterior.shape == (1, 4, 2)
+    assert fit.state_posterior.shape == (1, 3, 2)
     assert fit.loading_posterior.shape == (1, 3)
 
 
@@ -386,10 +386,10 @@ def test_profile_contact_threshold_recovers_latent_statistics_from_synthetic_dat
     assert _correlation(direct_loading_mean, truth["loading_probability"]) > 0.93
     assert np.mean(np.abs(posterior_loading_mean - truth["loading_probability"])) < 0.05
     assert np.mean(np.abs(direct_loading_mean - truth["loading_probability"])) < 0.05
-    assert _correlation(posterior_state_mean[:, 1], truth["state_probability"][:, 1]) > 0.95
-    assert _correlation(direct_state_mean[:, 1], truth["state_probability"][:, 1]) > 0.95
-    assert np.mean(np.abs(posterior_state_mean - truth["state_probability"])) < 0.18
-    assert np.mean(np.abs(direct_state_mean - truth["state_probability"])) < 0.18
+    assert _correlation(posterior_state_mean[:, 1], truth["state_probability"][:-1, 1]) > 0.95
+    assert _correlation(direct_state_mean[:, 1], truth["state_probability"][:-1, 1]) > 0.95
+    assert np.mean(np.abs(posterior_state_mean - truth["state_probability"][:-1])) < 0.18
+    assert np.mean(np.abs(direct_state_mean - truth["state_probability"][:-1])) < 0.18
 
 
 def _contact_threshold_truth(contact_probability: np.ndarray, dt: np.float32) -> dict[str, np.ndarray]:
