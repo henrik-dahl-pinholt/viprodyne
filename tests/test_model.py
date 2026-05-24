@@ -589,6 +589,34 @@ def test_sampler_accepts_float32_measurement_grid_jitter():
     assert polymerase.fine_grid.shape == sampling_times.shape
 
 
+def test_sampler_accepts_long_float32_fine_grid_lattice_jitter():
+    fine_grid = np.arange(0.0, 300.0 + 0.05, 0.05, dtype=np.float64)
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.zeros((1, 601), dtype=np.float32),
+        noise_std=np.float32(1.0),
+        sampling_times=np.linspace(0.0, 300.0, 601, dtype=np.float32),
+    )
+
+    model = ViprodyneModel(
+        datasets=(dataset,),
+        config=ModelConfig(
+            n_states=2,
+            pol2_mode="sampler",
+            t_rise=np.float32(3.0),
+            t_plateau=np.float32(3.0),
+            sampler_iterations=12,
+            sampler_repeats=1,
+            sampler_compute_elbo=False,
+            latent_grid=fine_grid,
+        ),
+    )
+
+    polymerase = model.graph.nodes["d0:tau"]
+    assert polymerase.mode == "sampler"
+    assert polymerase.fine_grid.shape == fine_grid.shape
+
+
 def test_transfer_rejects_explicit_latent_grid():
     dataset = MS2Dataset(
         name="d0",

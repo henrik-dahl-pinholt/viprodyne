@@ -1522,10 +1522,17 @@ def _validate_sampler_fine_grid(fine_grid: np.ndarray) -> np.ndarray:
     dt = np.diff(fine_grid)
     if np.any(dt <= 0):
         raise ValueError("fine_grid must be strictly increasing.")
-    reference_dt = np.median(dt).astype(FLOAT_DTYPE)
-    if not np.allclose(dt, reference_dt, rtol=1e-4, atol=1e-6):
+    index = np.arange(fine_grid.size, dtype=FLOAT_DTYPE)
+    reference_dt = ((fine_grid[-1] - fine_grid[0]) / (fine_grid.size - 1)).astype(
+        FLOAT_DTYPE
+    )
+    uniform_grid = (fine_grid[0] + reference_dt * index).astype(FLOAT_DTYPE)
+    max_abs_time = np.max(np.abs(fine_grid)).astype(FLOAT_DTYPE)
+    spacing_tolerance = np.spacing(max(max_abs_time, np.float32(1.0))).astype(FLOAT_DTYPE)
+    absolute_tolerance = np.maximum(np.float32(1e-6), np.float32(4.0) * spacing_tolerance)
+    if not np.allclose(fine_grid, uniform_grid, rtol=1e-6, atol=absolute_tolerance):
         raise ValueError("latent_grid must be uniformly spaced for sampler Pol2 mode.")
-    return fine_grid
+    return uniform_grid
 
 
 def _broadcast_parameter_over_intervals(
