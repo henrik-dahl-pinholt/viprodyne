@@ -21,6 +21,7 @@ fit_config = CAVIConfig(
     max_iterations=200,
     min_iterations=5,
     tolerance=1e-5,
+    initialization_sweeps=1,
     progress=True,
     compute_elbo=True,
 )
@@ -106,3 +107,19 @@ config = ModelConfig(
 This does not change the sampler posterior or its messages to the rest of the
 graph. It only changes the local Pol2 term reported in the final ELBO to the
 mean-field diagnostic value.
+
+Mean-field Pol2 optimizations warm-start from the previous compatible MF solve.
+The first start is controlled by `pol2_mf_initialization` on
+{class}`viprodyne.ModelConfig`:
+
+```python
+config = ModelConfig(
+    n_states=2,
+    pol2_mode="mean_field",
+    pol2_mf_initialization="prior",  # "prior", "midpoint", or "signal"
+)
+```
+
+The default `"prior"` initializer uses the current loading prior. `"signal"` is
+a simple MS2-informed initializer and is useful as a diagnostic when MF fits
+appear initialization-sensitive.

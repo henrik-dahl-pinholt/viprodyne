@@ -334,8 +334,35 @@ class PromoterState(VariationalNode):
             initial = np.asarray(self.initial_probabilities, dtype=FLOAT_DTYPE)
             if initial.ndim == 1:
                 initial = initial[None, :]
+            interval_durations = np.diff(self.time_grid).astype(FLOAT_DTYPE)
+            posterior = np.broadcast_to(
+                initial[:, None, :],
+                (initial.shape[0], self.time_grid.size, self.n_states),
+            ).astype(FLOAT_DTYPE)
+            interval_state_probabilities = np.broadcast_to(
+                initial[:, None, :],
+                (initial.shape[0], interval_durations.size, self.n_states),
+            ).astype(FLOAT_DTYPE)
+            occupancy = (
+                interval_state_probabilities * interval_durations[None, :, None]
+            ).astype(FLOAT_DTYPE)
+            jumps = np.zeros(
+                (
+                    initial.shape[0],
+                    interval_durations.size,
+                    self.n_states,
+                    self.n_states,
+                ),
+                dtype=FLOAT_DTYPE,
+            )
             return {
-                "posterior": initial[:, None, :],
+                "posterior": posterior,
+                "expected_occupancy": occupancy,
+                "interval_durations": interval_durations,
+                "interval_state_probabilities": interval_state_probabilities,
+                "expected_jumps": jumps,
+                "transition_counts": np.sum(jumps, axis=1, dtype=FLOAT_DTYPE),
+                "transition_exposure": np.sum(occupancy, axis=1, dtype=FLOAT_DTYPE),
                 "initial_state_counts": initial,
             }
         posterior = np.asarray(self.solution.posterior, dtype=FLOAT_DTYPE)
@@ -514,6 +541,7 @@ class PolymeraseLoadings(VariationalNode):
     finite_mask: np.ndarray | None = None
     mode: Literal["mean_field", "exact", "transfer", "sampler"] = "mean_field"
     elbo_mode: Literal["native", "mean_field"] = "native"
+    mf_initialization: Literal["prior", "midpoint", "signal"] = "prior"
     window_weights: np.ndarray | None = None
     observation_starts: np.ndarray | None = None
     loading_times: np.ndarray | None = None
@@ -541,6 +569,8 @@ class PolymeraseLoadings(VariationalNode):
     configurations: np.ndarray | None = field(default=None, init=False)
     sampler_result: Pol2SamplerResult | None = field(default=None, init=False)
     sampler_log_z_result: ThermodynamicIntegrationResult | None = field(default=None, init=False)
+    mf_warm_start_logits: np.ndarray | None = field(default=None, init=False)
+    mf_elbo_warm_start_logits: np.ndarray | None = field(default=None, init=False)
     loading_mask: np.ndarray | None = field(default=None, init=False)
     loading_counts_by_rate: dict[str, np.ndarray] = field(default_factory=dict, init=False)
     loading_exposure_by_rate: dict[str, np.ndarray] = field(default_factory=dict, init=False)
@@ -584,6 +614,8 @@ class PolymeraseLoadings(VariationalNode):
             self.elbo_design_matrix = np.asarray(self.elbo_design_matrix, dtype=FLOAT_DTYPE)
         if self.elbo_mode not in {"native", "mean_field"}:
             raise ValueError("elbo_mode must be 'native' or 'mean_field'.")
+        if self.mf_initialization not in {"prior", "midpoint", "signal"}:
+            raise ValueError("mf_initialization must be 'prior', 'midpoint', or 'signal'.")
         if self.sampler_rates_on_grid is not None:
             self.sampler_rates_on_grid = np.asarray(self.sampler_rates_on_grid, dtype=FLOAT_DTYPE)
         if self.loading_times is not None and self.loading_times.shape != (
@@ -767,14 +799,22 @@ class PolymeraseLoadings(VariationalNode):
     def _update_mean_field(self) -> None:
         if self.design_matrix is None:
             raise ValueError("design_matrix is required for mean-field Pol2 loading updates.")
-        results = self._run_mean_field(self.design_matrix)
+        results = self._run_mean_field(
+            self.design_matrix,
+            initial_logits=self._mean_field_initial_logits(
+                self.design_matrix,
+                prefer_current_posterior=False,
+            ),
+        )
         load_probabilities = np.stack(
             [result.load_probabilities for result in results],
             axis=0,
         )
+        logits = np.stack([result.logits for result in results], axis=0)
         predicted_signal = np.stack([result.predicted_signal for result in results], axis=0)
         objective_value = np.sum([result.elbo for result in results], dtype=FLOAT_DTYPE)
         self.load_probabilities = np.asarray(load_probabilities, dtype=FLOAT_DTYPE)
+        self.mf_warm_start_logits = np.asarray(logits, dtype=FLOAT_DTYPE)
         self.predicted_signal = np.asarray(predicted_signal, dtype=FLOAT_DTYPE)
         self.objective_value = np.asarray(objective_value, dtype=FLOAT_DTYPE)
         self.posterior_probabilities = None
@@ -861,9 +901,18 @@ class PolymeraseLoadings(VariationalNode):
             "window_weights/observation_starts, or sampler fine_grid define the loading grid."
         )
 
-    def _run_mean_field(self, design_matrix: np.ndarray):
+    def _run_mean_field(
+        self,
+        design_matrix: np.ndarray,
+        *,
+        initial_logits: np.ndarray | None = None,
+    ):
         prior = _batch_loading_prior(self.prior_probabilities, self.observed.shape[0])
         noise = _batch_noise(self.noise_std, self.observed.shape)
+        if initial_logits is not None:
+            initial_logits = np.asarray(initial_logits, dtype=FLOAT_DTYPE)
+            if initial_logits.shape != prior.shape:
+                raise ValueError("initial_logits must have shape (n_traces, n_loadings).")
         return [
             fit_mean_field_bernoulli(
                 observed=observed,
@@ -871,14 +920,61 @@ class PolymeraseLoadings(VariationalNode):
                 design_matrix=design_matrix,
                 noise_std=float(np.ravel(noise_trace)[0]),
                 mask=mask,
+                initial_logits=(
+                    None if initial_logits is None else initial_logits[trace_index]
+                ),
             )
-            for observed, prior_trace, noise_trace, mask in zip(
-                self.observed,
-                prior,
-                noise,
-                self.finite_mask,
+            for trace_index, (observed, prior_trace, noise_trace, mask) in enumerate(
+                zip(
+                    self.observed,
+                    prior,
+                    noise,
+                    self.finite_mask,
+                )
             )
         ]
+
+    def _mean_field_initial_logits(
+        self,
+        design_matrix: np.ndarray,
+        *,
+        prefer_current_posterior: bool,
+    ) -> np.ndarray:
+        target_shape = (
+            self.observed.shape[0],
+            int(np.asarray(self.prior_probabilities).shape[-1]),
+        )
+        if prefer_current_posterior:
+            logits = _logits_from_probabilities_if_compatible(
+                self.load_probabilities,
+                target_shape,
+            )
+            if logits is not None:
+                return logits
+            logits = _logits_from_probabilities_if_compatible(
+                self.expected_loading_counts,
+                target_shape,
+                counts_to_probabilities=True,
+            )
+            if logits is not None:
+                return logits
+            logits = _logits_if_compatible(self.mf_elbo_warm_start_logits, target_shape)
+            if logits is not None:
+                return logits
+        logits = _logits_if_compatible(self.mf_warm_start_logits, target_shape)
+        if logits is not None:
+            return logits
+        prior = _batch_loading_prior(self.prior_probabilities, self.observed.shape[0])
+        if self.mf_initialization == "midpoint":
+            return np.zeros(target_shape, dtype=FLOAT_DTYPE)
+        if self.mf_initialization == "signal":
+            return _signal_initial_logits(
+                observed=self.observed,
+                finite_mask=self.finite_mask,
+                design_matrix=design_matrix,
+                fallback_probabilities=prior,
+            )
+        return _logit_clipped(prior)
 
     def _mean_field_elbo_design(self) -> np.ndarray:
         design = (
@@ -891,11 +987,20 @@ class PolymeraseLoadings(VariationalNode):
         return np.asarray(design, dtype=FLOAT_DTYPE)
 
     def _mean_field_elbo_value(self) -> np.float32:
-        return np.asarray(
-            np.sum(
-                [result.elbo for result in self._run_mean_field(self._mean_field_elbo_design())],
-                dtype=FLOAT_DTYPE,
+        design = self._mean_field_elbo_design()
+        results = self._run_mean_field(
+            design,
+            initial_logits=self._mean_field_initial_logits(
+                design,
+                prefer_current_posterior=True,
             ),
+        )
+        self.mf_elbo_warm_start_logits = np.stack(
+            [result.logits for result in results],
+            axis=0,
+        ).astype(FLOAT_DTYPE)
+        return np.asarray(
+            np.sum([result.elbo for result in results], dtype=FLOAT_DTYPE),
             dtype=FLOAT_DTYPE,
         )
 
@@ -1060,6 +1165,8 @@ def _batch_loading_prior(prior_probabilities: np.ndarray, n_traces: int) -> np.n
     prior = np.asarray(prior_probabilities, dtype=FLOAT_DTYPE)
     if prior.ndim == 1:
         return np.broadcast_to(prior[None, :], (n_traces, prior.shape[0])).astype(FLOAT_DTYPE)
+    if prior.ndim == 2 and prior.shape[0] == 1:
+        return np.broadcast_to(prior, (n_traces, prior.shape[1])).astype(FLOAT_DTYPE)
     if prior.ndim == 2 and prior.shape[0] == n_traces:
         return prior.astype(FLOAT_DTYPE)
     raise ValueError("batched prior_probabilities must have shape (n_traces, n_loadings).")
@@ -1073,6 +1180,64 @@ def _batch_noise(noise_std: np.ndarray, observed_shape: tuple[int, int]) -> np.n
         if noise.shape == (observed_shape[0],):
             return np.broadcast_to(noise[:, None], observed_shape).astype(FLOAT_DTYPE)
         raise ValueError("noise_std must broadcast to observed shape.") from exc
+
+
+def _logit_clipped(probabilities: np.ndarray) -> np.ndarray:
+    probabilities = np.clip(np.asarray(probabilities, dtype=FLOAT_DTYPE), 1e-6, 1.0 - 1e-6)
+    return (np.log(probabilities) - np.log1p(-probabilities)).astype(FLOAT_DTYPE)
+
+
+def _logits_if_compatible(
+    logits: np.ndarray | None,
+    target_shape: tuple[int, int],
+) -> np.ndarray | None:
+    if logits is None:
+        return None
+    logits = np.asarray(logits, dtype=FLOAT_DTYPE)
+    if logits.shape != target_shape or np.any(~np.isfinite(logits)):
+        return None
+    return logits.copy()
+
+
+def _logits_from_probabilities_if_compatible(
+    probabilities: np.ndarray | None,
+    target_shape: tuple[int, int],
+    *,
+    counts_to_probabilities: bool = False,
+) -> np.ndarray | None:
+    if probabilities is None:
+        return None
+    values = np.asarray(probabilities, dtype=FLOAT_DTYPE)
+    if values.shape != target_shape or np.any(~np.isfinite(values)):
+        return None
+    if counts_to_probabilities:
+        values = 1.0 - np.exp(-np.clip(values, 0.0, None))
+    return _logit_clipped(values)
+
+
+def _signal_initial_logits(
+    *,
+    observed: np.ndarray,
+    finite_mask: np.ndarray,
+    design_matrix: np.ndarray,
+    fallback_probabilities: np.ndarray,
+) -> np.ndarray:
+    observed = np.asarray(observed, dtype=FLOAT_DTYPE)
+    finite = np.asarray(finite_mask, dtype=bool)
+    design = np.asarray(design_matrix, dtype=FLOAT_DTYPE)
+    fallback = np.asarray(fallback_probabilities, dtype=FLOAT_DTYPE)
+    logits = _logit_clipped(fallback)
+    if design.ndim != 2 or observed.ndim != 2 or finite.shape != observed.shape:
+        return logits
+    if design.shape[0] != observed.shape[1] or design.shape[1] != fallback.shape[1]:
+        return logits
+    masked_design = design[None, :, :] * finite[:, :, None].astype(FLOAT_DTYPE)
+    safe_observed = np.where(finite, np.clip(observed, 0.0, None), 0.0).astype(FLOAT_DTYPE)
+    numerator = np.sum(masked_design * safe_observed[:, :, None], axis=1, dtype=FLOAT_DTYPE)
+    denominator = np.sum(masked_design * design[None, :, :], axis=1, dtype=FLOAT_DTYPE)
+    projected = numerator / np.maximum(denominator, np.float32(1e-6))
+    probabilities = np.where(denominator > 0.0, projected, fallback)
+    return _logit_clipped(probabilities)
 
 
 def _batch_loading_mask(

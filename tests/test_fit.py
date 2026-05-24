@@ -124,6 +124,56 @@ def test_cavi_progress_reports_pending_nodes(capsys):
     assert "pending" in captured.out or "all parameter nodes converged" in captured.out
 
 
+def test_cavi_runs_initialization_schedule_before_main_schedule():
+    model = make_model()
+    calls = []
+    original_run_schedule = model.graph.run_schedule
+
+    def recording_run_schedule(schedule, rho=1.0):
+        calls.append(tuple(schedule))
+        return original_run_schedule(schedule=schedule, rho=rho)
+
+    model.graph.run_schedule = recording_run_schedule
+
+    result = run_cavi(
+        model,
+        CAVIConfig(
+            max_iterations=1,
+            min_iterations=1,
+            compute_elbo=False,
+            initialization_sweeps=1,
+        ),
+    )
+
+    assert result.n_iterations == 1
+    assert calls[0] == model.cavi_initialization_schedule()
+    assert calls[1] == model.cavi_schedule()
+
+
+def test_cavi_initialization_sweeps_can_be_disabled():
+    model = make_model()
+    calls = []
+    original_run_schedule = model.graph.run_schedule
+
+    def recording_run_schedule(schedule, rho=1.0):
+        calls.append(tuple(schedule))
+        return original_run_schedule(schedule=schedule, rho=rho)
+
+    model.graph.run_schedule = recording_run_schedule
+
+    _ = run_cavi(
+        model,
+        CAVIConfig(
+            max_iterations=1,
+            min_iterations=1,
+            compute_elbo=False,
+            initialization_sweeps=0,
+        ),
+    )
+
+    assert calls == [model.cavi_schedule()]
+
+
 def test_model_fit_alias_runs_inference():
     model = make_model()
 

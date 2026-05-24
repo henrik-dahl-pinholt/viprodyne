@@ -233,6 +233,8 @@ class ModelConfig:
     - `pol2_elbo_mode`: local Pol2 ELBO backend. `"native"` uses the posterior
       backend's own contribution; `"mean_field"` keeps the posterior backend but
       computes a mean-field diagnostic contribution.
+    - `pol2_mf_initialization`: first-start initializer for mean-field Pol2
+      optimizations: `"prior"`, `"midpoint"`, or `"signal"`.
     - `transition_rate_scope` and `loading_rate_scope`: `"dataset"`, `"track"`,
       or `"global"` sharing.
     - `driven_transition_indices`: transition indices driven by contact. For
@@ -267,6 +269,7 @@ class ModelConfig:
     loading_rate_scopes: dict[int, RateScope] = field(default_factory=dict)
     pol2_mode: str = "auto"
     pol2_elbo_mode: Literal["native", "mean_field"] = "native"
+    pol2_mf_initialization: Literal["prior", "midpoint", "signal"] = "prior"
     ms2_kernel: ProximalKernel | str | Callable | None = "proximal"
     t_rise: np.ndarray | float = np.float32(1.0)
     t_plateau: np.ndarray | float = np.float32(0.0)
@@ -306,6 +309,10 @@ class ModelConfig:
             )
         if self.pol2_elbo_mode not in {"native", "mean_field"}:
             raise ValueError("pol2_elbo_mode must be 'native' or 'mean_field'.")
+        if self.pol2_mf_initialization not in {"prior", "midpoint", "signal"}:
+            raise ValueError(
+                "pol2_mf_initialization must be 'prior', 'midpoint', or 'signal'."
+            )
         if self.kernel_support_tolerance < 0:
             raise ValueError("kernel_support_tolerance must be non-negative.")
         for name in (
@@ -416,6 +423,7 @@ class ModelConfig:
                 "ModelConfig(",
                 f"  n_states={self.n_states}, pol2_mode={self.pol2_mode!r}, "
                 f"pol2_elbo_mode={self.pol2_elbo_mode!r},",
+                f"  pol2_mf_initialization={self.pol2_mf_initialization!r},",
                 f"  latent_grid={_grid_summary(self.latent_grid)},",
                 f"  ms2_kernel={_kernel_summary(self.ms2_kernel)},",
                 f"  transition_rate_scope={self.transition_rate_scope!r}, "
@@ -655,6 +663,20 @@ class ViprodyneModel:
                 parameters.append(nodes["contact_drive"])
         return tuple(dict.fromkeys(hidden + parameters))
 
+    def cavi_initialization_schedule(self) -> tuple[str, ...]:
+        """Return an MS2Posterior-style warmup sweep for CAVI initialization."""
+        schedule: list[str] = []
+        for nodes in self.dataset_nodes.values():
+            if nodes["polymerase"] is not None:
+                schedule.append(nodes["polymerase"])
+            schedule.extend(nodes["loading_rates"])
+            schedule.append(nodes["promoter"])
+            schedule.extend(nodes["transition_rates"])
+            schedule.append(nodes["initial"])
+            if nodes["contact_drive"] is not None:
+                schedule.append(nodes["contact_drive"])
+        return tuple(dict.fromkeys(schedule))
+
     def parameter_node_names(self) -> tuple[str, ...]:
         """Return names of nodes used for CAVI convergence monitoring."""
         names = [
@@ -759,6 +781,7 @@ class ViprodyneModel:
                 finite_mask=dataset.finite_mask,
                 mode=pol2_observation.mode,
                 elbo_mode=self.config.pol2_elbo_mode,
+                mf_initialization=self.config.pol2_mf_initialization,
                 window_weights=pol2_observation.window_weights,
                 observation_starts=pol2_observation.observation_starts,
                 loading_times=polymerase_loading_times,

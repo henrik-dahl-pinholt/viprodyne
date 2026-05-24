@@ -670,6 +670,31 @@ def test_sampler_pol2_mode_can_use_mean_field_elbo_contribution():
     assert abs(float(np.asarray(elbo))) > 0.0
 
 
+def test_model_configures_pol2_mean_field_initialization():
+    dataset = MS2Dataset(
+        name="d0",
+        observed=np.array([[0.1, 0.4]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+    )
+    model = ViprodyneModel(
+        datasets=(dataset,),
+        config=ModelConfig(
+            n_states=2,
+            time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+            pol2_mode="mean_field",
+            pol2_mf_initialization="midpoint",
+            t_rise=np.float32(0.5),
+            t_plateau=np.float32(0.0),
+        ),
+    )
+
+    assert model.graph.nodes["d0:tau"].mf_initialization == "midpoint"
+    assert "pol2_mf_initialization='midpoint'" in str(model.config)
+
+    with pytest.raises(ValueError, match="pol2_mf_initialization"):
+        ModelConfig(n_states=2, pol2_mf_initialization="bad")
+
+
 def test_model_accepts_explicit_kernel_function():
     def rectangular_kernel(offsets):
         return jnp.where((offsets >= 0.0) & (offsets < 0.75), 2.0, 0.0)

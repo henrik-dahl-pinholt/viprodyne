@@ -18,6 +18,8 @@ class CAVIModel(Protocol):
 
     def cavi_schedule(self) -> tuple[str, ...]: ...
 
+    def cavi_initialization_schedule(self) -> tuple[str, ...]: ...
+
     def parameter_node_names(self) -> tuple[str, ...]: ...
 
     def compute_elbo(self) -> np.float32: ...
@@ -28,7 +30,9 @@ class CAVIConfig:
     """Configuration for coordinate-ascent variational inference.
 
     `run_cavi` monitors convergence from parameter changes and computes the
-    ELBO only after the final sweep when `compute_elbo=True`.
+    ELBO only after the final sweep when `compute_elbo=True`. Initialization
+    sweeps warm-start hidden nodes and parameter sufficient statistics before
+    convergence monitoring begins.
     """
 
     max_iterations: int = 100
@@ -38,6 +42,7 @@ class CAVIConfig:
     rho: float = 1.0
     schedule: tuple[str, ...] | None = None
     parameter_nodes: tuple[str, ...] | None = None
+    initialization_sweeps: int = 1
     compute_elbo: bool = True
     progress: bool = False
     progress_every: int = 1
@@ -49,6 +54,8 @@ class CAVIConfig:
             raise ValueError("min_iterations must be non-negative.")
         if self.min_iterations > self.max_iterations:
             raise ValueError("min_iterations cannot exceed max_iterations.")
+        if self.initialization_sweeps < 0:
+            raise ValueError("initialization_sweeps must be non-negative.")
         if self.tolerance < 0:
             raise ValueError("tolerance must be non-negative.")
         if self.absolute_tolerance < 0:
@@ -123,11 +130,27 @@ def run_cavi(model: CAVIModel, config: CAVIConfig | None = None) -> CAVIResult:
         if config.parameter_nodes is not None
         else model.parameter_node_names()
     )
-    previous = _parameter_snapshot(model.graph, parameter_nodes)
     history: list[CAVIIteration] = []
     converged = False
     max_change = np.asarray(np.inf, dtype=FLOAT_DTYPE)
     start_time = perf_counter()
+    initialization_schedule = _initialization_schedule(model, schedule)
+    for sweep in range(1, config.initialization_sweeps + 1):
+        sweep_start = perf_counter()
+        model.graph.run_schedule(schedule=initialization_schedule, rho=config.rho)
+        if config.progress:
+            elapsed = perf_counter() - start_time
+            print(
+                "CAVI initialization "
+                f"{sweep}/{config.initialization_sweeps}; "
+                f"iter={_format_seconds(perf_counter() - sweep_start)}; "
+                f"elapsed={_format_seconds(elapsed)}",
+                end="\r",
+                flush=True,
+            )
+    if config.progress and config.initialization_sweeps > 0:
+        print()
+    previous = _parameter_snapshot(model.graph, parameter_nodes)
     for iteration in range(1, config.max_iterations + 1):
         iteration_start = perf_counter()
         model.graph.run_schedule(schedule=schedule, rho=config.rho)
@@ -214,6 +237,15 @@ def _parameter_snapshot(
             else np.empty(0, dtype=FLOAT_DTYPE)
         )
     return snapshot
+
+
+def _initialization_schedule(model: CAVIModel, fallback: tuple[str, ...]) -> tuple[str, ...]:
+    schedule_getter = getattr(model, "cavi_initialization_schedule", None)
+    if callable(schedule_getter):
+        schedule = tuple(schedule_getter())
+        if schedule:
+            return schedule
+    return fallback
 
 
 def _snapshot_changes(

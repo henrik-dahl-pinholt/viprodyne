@@ -2,8 +2,10 @@ import numpy as np
 import pytest
 from scipy.special import gammaln
 
+from viprodyne.core.mf_pol2_finder import MeanFieldBernoulliResult
 from viprodyne.core.contact_survival import ContactSurvivalStats
 from viprodyne.core.rate_edges import RateEdge
+import viprodyne.variational.nodes as node_module
 from viprodyne.variational import (
     DrivenRateMap,
     InitialStateProb,
@@ -1000,6 +1002,117 @@ def test_polymerase_loadings_exact_and_mean_field_match_independent_theory():
     assert exact.elbo_contribution() == pytest.approx(float(expected_logz), rel=1e-6)
     assert mean_field.elbo_contribution() == pytest.approx(float(expected_logz), rel=5e-6)
     assert transfer.elbo_contribution() == pytest.approx(float(expected_logz), rel=1e-6)
+
+
+def test_mean_field_polymerase_reuses_warm_start_logits(monkeypatch):
+    calls = []
+
+    def fake_fit_mean_field(
+        observed,
+        prior_probabilities,
+        design_matrix,
+        noise_std,
+        mask=None,
+        initial_logits=None,
+        maxiter=1000,
+        gtol=1e-5,
+    ):
+        del observed, design_matrix, noise_std, mask, maxiter, gtol
+        calls.append(None if initial_logits is None else np.asarray(initial_logits).copy())
+        logits = (
+            np.zeros_like(prior_probabilities, dtype=np.float32)
+            if initial_logits is None
+            else np.asarray(initial_logits, dtype=np.float32) + np.float32(0.25)
+        )
+        probabilities = 1.0 / (1.0 + np.exp(-logits))
+        return MeanFieldBernoulliResult(
+            load_probabilities=probabilities.astype(np.float32),
+            logits=logits.astype(np.float32),
+            elbo=1.0,
+            predicted_signal=np.zeros(1, dtype=np.float32),
+            success=True,
+            message="ok",
+            n_iterations=1,
+        )
+
+    monkeypatch.setattr(node_module, "fit_mean_field_bernoulli", fake_fit_mean_field)
+    prior = np.array([0.25, 0.75], dtype=np.float32)
+    node = PolymeraseLoadings(
+        name="tau_mf",
+        observed=np.array([[0.1]], dtype=np.float32),
+        prior_probabilities=prior,
+        design_matrix=np.array([[1.0, 0.5]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        mode="mean_field",
+    )
+    first_stored = np.asarray(node.mf_warm_start_logits, dtype=np.float32).copy()
+
+    node.update_from_current_inputs()
+
+    assert len(calls) == 2
+    expected_first = np.log(prior) - np.log1p(-prior)
+    np.testing.assert_allclose(calls[0], expected_first, rtol=1e-6)
+    np.testing.assert_allclose(calls[1], first_stored[0], rtol=1e-6)
+
+
+def test_mean_field_elbo_initializes_from_current_posterior(monkeypatch):
+    calls = []
+
+    def fake_fit_mean_field(
+        observed,
+        prior_probabilities,
+        design_matrix,
+        noise_std,
+        mask=None,
+        initial_logits=None,
+        maxiter=1000,
+        gtol=1e-5,
+    ):
+        del observed, design_matrix, noise_std, mask, maxiter, gtol
+        calls.append(np.asarray(initial_logits, dtype=np.float32).copy())
+        probabilities = 1.0 / (1.0 + np.exp(-initial_logits))
+        return MeanFieldBernoulliResult(
+            load_probabilities=probabilities.astype(np.float32),
+            logits=np.asarray(initial_logits, dtype=np.float32),
+            elbo=1.0,
+            predicted_signal=np.zeros(1, dtype=np.float32),
+            success=True,
+            message="ok",
+            n_iterations=1,
+        )
+
+    node = PolymeraseLoadings(
+        name="tau_exact",
+        observed=np.array([[0.8]], dtype=np.float32),
+        prior_probabilities=np.array([0.2, 0.6], dtype=np.float32),
+        design_matrix=np.array([[1.0, 0.5]], dtype=np.float32),
+        noise_std=np.float32(0.5),
+        mode="exact",
+        elbo_mode="mean_field",
+    )
+    posterior = np.asarray(node.load_probabilities, dtype=np.float32).copy()
+    monkeypatch.setattr(node_module, "fit_mean_field_bernoulli", fake_fit_mean_field)
+
+    assert node.elbo_contribution() == pytest.approx(1.0)
+
+    expected = np.log(posterior[0]) - np.log1p(-posterior[0])
+    np.testing.assert_allclose(calls[0], expected, rtol=1e-6)
+
+
+def test_promoter_initial_moments_cover_full_time_grid():
+    promoter = PromoterState(
+        name="s",
+        time_grid=np.array([0.0, 0.5, 1.0], dtype=np.float32),
+        n_states=2,
+        rate_edges=(),
+    )
+
+    moments = promoter.moments()
+
+    assert moments["posterior"].shape == (1, 3, 2)
+    assert moments["interval_state_probabilities"].shape == (1, 2, 2)
+    assert moments["expected_occupancy"].shape == (1, 2, 2)
+    np.testing.assert_allclose(moments["interval_state_probabilities"], 0.5)
 
 
 def test_exact_polymerase_entropy_matches_log_partition_identity():
