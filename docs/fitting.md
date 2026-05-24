@@ -9,7 +9,8 @@ fit = model.run_inference(max_iterations=100, tolerance=1e-4, progress=True)
 
 This runs coordinate-ascent variational inference. Convergence is monitored
 from parameter changes, and the ELBO is computed after the final sweep. The
-`progress` option prints the largest unconverged parameter nodes during fitting.
+`progress` option prints the iteration time, elapsed time, ETA, and largest
+unconverged parameter nodes during fitting.
 
 Use {class}`viprodyne.CAVIConfig` when you want explicit control:
 

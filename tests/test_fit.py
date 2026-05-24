@@ -55,9 +55,14 @@ def test_cavi_runs_schedule_and_computes_elbo_once():
     assert result.elbo.dtype == np.float32
     assert np.isfinite(result.elbo)
     assert result.max_parameter_change.dtype == np.float32
+    assert result.elapsed_seconds.dtype == np.float32
+    assert result.elapsed_seconds >= 0.0
+    assert result.history[-1].iteration_seconds.dtype == np.float32
+    assert result.history[-1].elapsed_seconds.dtype == np.float32
     assert "track_0:s" in result.schedule
     assert "track_0:r0" in result.parameter_nodes
     assert "CAVIResult(" in str(result)
+    assert "elapsed=" in str(result)
 
 
 def test_model_fit_cavi_updates_loading_rates_from_pol2_blanket_stats():
@@ -114,6 +119,8 @@ def test_cavi_progress_reports_pending_nodes(capsys):
 
     captured = capsys.readouterr()
     assert "CAVI [" in captured.out
+    assert "iter=" in captured.out
+    assert "elapsed=" in captured.out
     assert "pending" in captured.out or "all parameter nodes converged" in captured.out
 
 

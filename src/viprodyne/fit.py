@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Protocol
 
 import numpy as np
@@ -66,6 +67,8 @@ class CAVIIteration:
     max_parameter_change: np.float32
     converged: bool
     parameter_changes: dict[str, np.float32] = field(default_factory=dict)
+    iteration_seconds: np.float32 = np.float32(0.0)
+    elapsed_seconds: np.float32 = np.float32(0.0)
 
 
 @dataclass(frozen=True)
@@ -76,6 +79,7 @@ class CAVIResult:
     n_iterations: int
     max_parameter_change: np.float32
     elbo: np.float32 | None
+    elapsed_seconds: np.float32
     history: tuple[CAVIIteration, ...] = field(default_factory=tuple)
     schedule: tuple[str, ...] = field(default_factory=tuple)
     parameter_nodes: tuple[str, ...] = field(default_factory=tuple)
@@ -85,7 +89,8 @@ class CAVIResult:
         elbo = "not computed" if self.elbo is None else f"{float(self.elbo):.6g}"
         lines = [
             f"CAVIResult({status}, iterations={self.n_iterations}, "
-            f"max_change={float(self.max_parameter_change):.3g}, elbo={elbo})"
+            f"max_change={float(self.max_parameter_change):.3g}, "
+            f"elapsed={_format_seconds(float(self.elapsed_seconds))}, elbo={elbo})"
         ]
         if self.history:
             last = self.history[-1]
@@ -122,7 +127,9 @@ def run_cavi(model: CAVIModel, config: CAVIConfig | None = None) -> CAVIResult:
     history: list[CAVIIteration] = []
     converged = False
     max_change = np.asarray(np.inf, dtype=FLOAT_DTYPE)
+    start_time = perf_counter()
     for iteration in range(1, config.max_iterations + 1):
+        iteration_start = perf_counter()
         model.graph.run_schedule(schedule=schedule, rho=config.rho)
         current = _parameter_snapshot(model.graph, parameter_nodes)
         parameter_changes = _snapshot_changes(
@@ -131,6 +138,8 @@ def run_cavi(model: CAVIModel, config: CAVIConfig | None = None) -> CAVIResult:
             absolute_tolerance=config.absolute_tolerance,
         )
         max_change = _max_snapshot_change(parameter_changes)
+        iteration_seconds = np.asarray(perf_counter() - iteration_start, dtype=FLOAT_DTYPE)
+        elapsed_seconds = np.asarray(perf_counter() - start_time, dtype=FLOAT_DTYPE)
         converged = bool(
             iteration >= config.min_iterations
             and float(max_change) <= float(config.tolerance)
@@ -141,6 +150,8 @@ def run_cavi(model: CAVIModel, config: CAVIConfig | None = None) -> CAVIResult:
                 max_parameter_change=np.asarray(max_change, dtype=FLOAT_DTYPE),
                 converged=converged,
                 parameter_changes=parameter_changes,
+                iteration_seconds=iteration_seconds,
+                elapsed_seconds=elapsed_seconds,
             )
         )
         if config.progress and (
@@ -156,6 +167,8 @@ def run_cavi(model: CAVIModel, config: CAVIConfig | None = None) -> CAVIResult:
                 max_change=max_change,
                 changes=parameter_changes,
                 converged=converged,
+                elapsed_seconds=elapsed_seconds,
+                iteration_seconds=iteration_seconds,
             )
         previous = current
         if converged:
@@ -168,6 +181,11 @@ def run_cavi(model: CAVIModel, config: CAVIConfig | None = None) -> CAVIResult:
         n_iterations=len(history),
         max_parameter_change=np.asarray(max_change, dtype=FLOAT_DTYPE),
         elbo=None if elbo is None else np.asarray(elbo, dtype=FLOAT_DTYPE),
+        elapsed_seconds=(
+            history[-1].elapsed_seconds
+            if history
+            else np.asarray(perf_counter() - start_time, dtype=FLOAT_DTYPE)
+        ),
         history=tuple(history),
         schedule=schedule,
         parameter_nodes=parameter_nodes,
@@ -239,6 +257,8 @@ def _print_progress(
     max_change: np.float32,
     changes: dict[str, np.float32],
     converged: bool,
+    elapsed_seconds: np.float32,
+    iteration_seconds: np.float32,
 ) -> None:
     width = 24
     filled = int(round(width * iteration / max_iterations))
@@ -257,9 +277,30 @@ def _print_progress(
         if len(pending) > 4:
             pending_text += f", +{len(pending) - 4} more"
     status = "converged" if converged else "running"
+    eta_text = ""
+    if not converged and iteration < max_iterations:
+        remaining = max_iterations - iteration
+        eta_text = f"; eta={_format_seconds(float(iteration_seconds) * remaining)}"
     print(
         f"CAVI [{bar}] {iteration}/{max_iterations} {status}; "
-        f"max change={float(max_change):.3g}; {pending_text}",
+        f"max change={float(max_change):.3g}; "
+        f"iter={_format_seconds(float(iteration_seconds))}; "
+        f"elapsed={_format_seconds(float(elapsed_seconds))}{eta_text}; "
+        f"{pending_text}",
         end="\r",
         flush=True,
     )
+
+
+def _format_seconds(seconds: float) -> str:
+    if not np.isfinite(seconds) or seconds < 0.0:
+        return "unknown"
+    if seconds < 1.0:
+        return f"{seconds * 1000.0:.0f}ms"
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes, remainder = divmod(seconds, 60.0)
+    if minutes < 60.0:
+        return f"{int(minutes)}m{int(remainder):02d}s"
+    hours, minutes = divmod(minutes, 60.0)
+    return f"{int(hours)}h{int(minutes):02d}m"
